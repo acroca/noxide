@@ -1,0 +1,25 @@
+# The build only needs pyproject.toml, uv.lock, src/ and config.example.toml.
+# Everything else just slows the context upload down — and secrets and personal
+# notes have no business being sent to the daemon at all.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets and personal data
+state/
+vault/
+config.toml
+.env
+
+tests/
+Makefile
+
+# A user's own Compose/SearXNG files, copied out of docs/deployment.md
+compose.y*ml
+docker-compose.y*ml
+searxng/

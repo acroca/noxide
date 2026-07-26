@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# State (secrets)
+state/
+config.toml
+.env
+
+# A real vault holds personal notes — never commit one. The template lives in
+# ../vault.template/.
+vault/
+
+# Deployment is documented, not shipped: docs/deployment.md holds the Compose
+# and SearXNG config to copy. A local copy stays local.
+compose.yml
+compose.yaml
+docker-compose.yml
+docker-compose.yaml
+searxng/
+
+# Pytest
+.pytest_cache/
+.ruff_cache/
+
+# Docker
+*.log
+
+# Coverage
+.coverage
+htmlcov/

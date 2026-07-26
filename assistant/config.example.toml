@@ -1,0 +1,37 @@
+# config.example.toml — copy to config.toml and fill in your values
+
+[telegram]
+# From BotFather — or set TELEGRAM_BOT_TOKEN env var
+bot_token = "123456:ABC-DEF..."
+allowed_user_ids = [123456789]   # Your Telegram user IDs (find yours by messaging @userinfobot on Telegram)
+# Chat for proactive messages (startup notices, scheduled jobs) before the bot
+# has learned one from an incoming message — or set DEFAULT_CHAT_ID env var.
+# For a direct chat this is your own user ID.
+# default_chat_id = 123456789
+
+[copilot]
+# Alias of the model used by default (a key of [copilot.models]).
+# Switch at runtime from Telegram with /model <alias>.
+default_model = "sonnet"
+
+[copilot.models]
+sonnet = "claude-sonnet-5"
+# opus = "claude-opus-4.8"
+
+# Voice transcription (optional): set GITHUB_TOKEN env var to a fine-grained
+# PAT with the `models: read` permission to enable Telegram voice messages.
+
+[web]
+# Optional: base URL of a SearXNG instance (docs/deployment.md has a Compose
+# service to copy). When set, the assistant gains a `research` tool that runs
+# web searches in an isolated sub-agent. Leave unset to disable.
+# searxng_url = "http://searxng:8080"
+
+[assistant]
+timezone = "Europe/Madrid"
+history_size = 40
+# Where the vault and state directories live. Defaults are relative to the
+# working directory; the Docker image already points these at its own mounts,
+# so only set them for a non-container run or an unusual layout.
+# vault_path = "./vault"
+# state_dir  = "./state"
