@@ -46,8 +46,20 @@ vault/
 
 ### Conventions
 
+- **Every date in a vault file is ISO** — `2026-08-12`, or `2026-08-12 18:00`
+  with a time. Not `12 August`, not `12/08`, and never with a weekday name or a
+  relative date (`tomorrow`, `next Sunday`) beside it. The reason is search: the
+  wiki deliberately keeps the same fact on several pages, so when a date changes
+  the bot has to be able to *find* every copy, and one written as `12 August`
+  will not match a search for `2026-08-12`. A weekday label is also a second
+  fact that can be wrong on its own. The bot says dates naturally in chat —
+  that is where they are meant to read well. `now.md`'s **Upcoming** section is
+  the sole exception: within-7-days items are labelled by weekday alone, since
+  that file is always read whole and rebuilt nightly.
 - **Journal entries** are `- HH:MM prose` in local time, under a `# YYYY-MM-DD`
-  heading. Prose only — no checkboxes, no `TODO:` markers.
+  heading. Prose only — no checkboxes, no `TODO:` markers. The filename carries
+  the date, so entries need no date in the text; being append-only, old entries
+  keep whatever notation they were written with.
 - **Every project and area page** opens with `**Status:** …`, one always-current
   paragraph. That is what catch-up questions read first.
 - **Tasks** live only on project/area pages under `## Tasks`: `- [ ] thing (due

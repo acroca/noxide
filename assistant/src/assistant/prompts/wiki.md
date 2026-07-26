@@ -21,9 +21,28 @@ vault/
 
 The formats below are canonical in English, but a vault may localize any user-visible text — column headers, section titles, task markers, status labels. The vault's `AGENTS.md` declares the localized terms; always match what the existing files use, and never rename headings or markers back to the English defaults.
 
-## Time rule
+## Time and date rule
 
-Everything the user reads or writes — journal entries, wiki content (including "last done" in routines), replies — uses the user's **local time**, said plainly (never UTC, never naming the timezone). UTC is reserved for system plumbing where the timezone actually matters: `system/schedule.md` timestamps and cron expressions.
+**Which clock.** Everything the user reads or writes — journal entries, wiki content (including "last done" in routines), replies — uses the user's **local time**, said plainly (never UTC, never naming the timezone). UTC is reserved for system plumbing where the timezone actually matters: `system/schedule.md` timestamps and cron expressions.
+
+**Which notation.** The boundary is the vault, not the sentence: **every date written into a vault file is ISO**, and dates are spoken naturally only in replies. Prose dates (`12 August`), day/month forms (`12/08`) and weekday labels all name a day in a way `search` cannot match, so when a date changes the other copies of it cannot be found — that is how a corrected date survives on a page the correction was supposed to reach.
+
+| Case | Vault form |
+|---|---|
+| Date | `YYYY-MM-DD` |
+| Date and time | `YYYY-MM-DD HH:MM` — space, 24h, no comma |
+| Time inside a journal file | `HH:MM` — the filename already carries the date |
+| Approximate | `~YYYY-MM-DD` |
+| Range | `YYYY-MM-DD → YYYY-MM-DD` |
+| Either of two days | `YYYY-MM-DD or YYYY-MM-DD` |
+| Clock time unknown | `YYYY-MM-DD (afternoon)` — the qualifier follows the date |
+| Month or year alone | `YYYY-MM`, `YYYY` |
+
+Two things never go into a vault file: a **weekday name beside a date** (redundant, and it can be wrong on its own), and a date stated **relative to now** (`tomorrow`, `next Sunday`, `in two weeks`) — which is true on the day it is written and false forever after. Say the weekday in replies instead, where a mistake is cheap to correct. `raw/journal/` is append-only, so past entries keep whatever notation they already have; this governs what you write from now on.
+
+Where a weekday genuinely is required (the `now.md` header, and its **Upcoming** section), **never compute it by mental arithmetic.** Derive it by counting the exact day difference from a weekday already confirmed in the vault or in the current message timestamp — or write the date with no weekday at all. A guessed weekday next to a correct date reads as a contradiction and gets one of the two "corrected" into being wrong.
+
+**In replies**, never speak ISO — say the date as the user would (`Thursday the 30th at 18:00`).
 
 ## The two layers
 
@@ -60,6 +79,8 @@ One table of recurring activities: `| Routine | Frequency | Last done | Next due
 Fully materialized dashboard — no queries, just text. Sections: **Today** (events, due/overdue routines, tasks due today), **Upcoming** (dated events and routine due dates), **Waiting** (blocked on someone/something external), **Last 7 days** (one bullet per day, newest first, synthesizing that day's journal).
 
 Because it is a *copy* of state owned by other pages, it goes stale the moment one of them changes — an update to a routine, task, event or blocker is only half applied until the matching `now.md` lines are patched too. Rebuilt in full nightly; between rebuilds ingest keeps it current with `edit_file` line patches.
+
+**Upcoming** is the one place the vault's ISO rule relaxes, because this file is always read whole and never searched, and the nightly rebuild replaces it entirely — so nothing here has to stay findable. An item **within the next 7 days** is labelled by weekday alone (`Tuesday — …`, `Friday (evening) → Saturday (early hours) — …`), read against the `Today` header just above it as "the next Tuesday". Anything **further out keeps its ISO date**: a bare weekday three weeks away names four candidate days. The rest of the file stays ISO — the `Today` header (weekday *and* date, the anchor that makes the bare weekdays below it readable), **Waiting** deadlines, and the **Last 7 days** bullets, which are the searchable index of recent days.
 
 ### `wiki/log.md`
 
@@ -102,4 +123,5 @@ When one destination is clearly the best fit, file there without asking — corr
 - Tasks open 21+ days → surface them.
 - Contradictions between a page's status and recent journal entries; orphan pages; index drift; schedule jobs referencing missing files.
 - Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
+- Non-ISO dates in `wiki/` — day/month forms, month names, relative dates (`tomorrow`, `next Sunday`), weekday labels outside `now.md` → rewrite to `YYYY-MM-DD`. Skip `wiki/log.md`, which is append-only like the journal. Then check every weekday label that legitimately remains against the date beside it, and every relative date for having gone stale; both are how a wrong day survives in the wiki.
 - Apply safe fixes, append a lint entry to `wiki/log.md`, and message findings — stay silent if everything is clean.
