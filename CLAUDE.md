@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working style
+
+**No spec documents.** When a Superpowers skill (`brainstorming`, `writing-plans`, `executing-plans`, ...) calls for writing a spec or plan file, skip that step and go straight to implementation. Discussing the approach in the conversation first is still fine — writing it out as a document is not. This is a user instruction and overrides those skills' own workflow.
+
 ## What this is
 
 Noxide is a self-hosted personal assistant bot: **Telegram → GitHub Copilot API → markdown vault**. A long-polling Telegram bot runs an OpenAI-style tool-calling agent loop against the Copilot chat API. All durable memory is a directory of markdown files (the *vault*); conversation history is in-memory only and lost on restart — this is intentional. No LLM frameworks.
