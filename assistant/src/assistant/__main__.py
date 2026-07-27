@@ -110,6 +110,7 @@ async def _run(config_path: Path | None) -> None:
         extract_fn=extractor.extract,
         skills=skills,
         history_size=cfg.history_size,
+        tz_name=cfg.timezone,
     )
     bot._agent = agent  # wire back
 

@@ -350,3 +350,113 @@ async def test_drain_is_safe_before_start(tmp_path: Path) -> None:
     sched = Scheduler(vault_tools=VaultTools(tmp_path), run_job_fn=AsyncMock(), tz_name="UTC")
 
     assert await sched.drain(timeout=5) == 0
+
+
+# ------------------------------------------------------------------
+# A write must not lose what the read could not parse
+# ------------------------------------------------------------------
+
+_TABLE_HEAD = (
+    "# Schedule\n\n"
+    "| id | when | recurring | prompt | created |\n"
+    "|-----|------|-----------|--------|---------|\n"
+)
+
+
+def test_schedule_preserves_rows_it_could_not_parse(vault: VaultTools) -> None:
+    """Every mutation read-modify-writes the whole file, and the read drops rows
+    it cannot parse — so one malformed row used to erase the entire schedule."""
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD
+        + "| keep | 0 8 * * * | true | Weekly brief | 2024-01-01 |\n"
+        + "| oops | only-three-columns |\n",
+    )
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+
+    scheduler.schedule("2099-12-31T23:59:59+00:00", "New job", False)
+
+    text = vault.read_file("system/schedule.md")
+    assert "| oops | only-three-columns |" in text, "unparseable row was erased"
+    assert "| keep |" in text
+    assert "New job" in text
+
+
+def test_cancel_preserves_rows_it_could_not_parse(vault: VaultTools) -> None:
+    """cancel_scheduled() rewrites the file too, so it must not lose rows either."""
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD
+        + "| keep | 0 8 * * * | true | Weekly brief | 2024-01-01 |\n"
+        + "| oops | only-three-columns |\n",
+    )
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+
+    scheduler.cancel_scheduled("keep")
+
+    text = vault.read_file("system/schedule.md")
+    assert "| oops | only-three-columns |" in text, "unparseable row was erased"
+    assert "| keep |" not in text
+
+
+# ------------------------------------------------------------------
+# One bad cron must not take down the reload pass
+# ------------------------------------------------------------------
+
+def test_reload_survives_an_invalid_cron_expression(
+    vault: VaultTools, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`0 8 * * 7` is Sunday to crontab but out of range for APScheduler, which
+    raises. Unguarded, that aborted the whole pass — and crashed startup, where
+    reload() is called without a try."""
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD
+        + "| badcron | 0 8 * * 7 | true | Broken cron | 2024-01-01 |\n"
+        + "| later | 0 9 * * * | true | Row after the bad one | 2024-01-01 |\n",
+    )
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+
+    with caplog.at_level(logging.WARNING):
+        scheduler.reload()  # must not raise
+
+    assert "badcron" in caplog.text
+    assert "later" in scheduler._entries, "a bad row stopped the rows after it"
+
+
+# ------------------------------------------------------------------
+# A one-off must not fire twice
+# ------------------------------------------------------------------
+
+async def test_reload_skips_a_one_off_that_is_still_running(vault: VaultTools) -> None:
+    """_fire deletes the row only after the run finishes, so a poll landing
+    mid-run found a live row with no APScheduler job and re-registered it —
+    submitting a second execution of a job that had already fired."""
+    from unittest.mock import patch as mock_patch
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(prompt: str) -> None:
+        started.set()
+        await release.wait()
+
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=_slow, tz_name="UTC")
+    result = scheduler.schedule("2099-01-01T09:00:00+00:00", "One off", False)
+    job_id = result.split()[2]
+
+    fire = asyncio.create_task(scheduler._fire(job_id, "One off", recurring=False))
+    await started.wait()
+    # APScheduler drops a date job as soon as it has fired; production logs show
+    # "Removed job <id>" at the firing instant. Model that here.
+    job = scheduler._apscheduler.get_job(job_id)
+    if job is not None:
+        job.remove()
+
+    with mock_patch.object(scheduler, "_register", wraps=scheduler._register) as spy:
+        scheduler.reload()
+
+    assert spy.call_count == 0, "re-registered a one-off whose run was in flight"
+
+    release.set()
+    await fire

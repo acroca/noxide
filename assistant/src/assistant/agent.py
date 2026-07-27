@@ -11,6 +11,7 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from importlib.resources import files
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import copilot, usage
 from .skills import SkillLibrary
@@ -92,6 +93,7 @@ class Agent:
         extract_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         skills: SkillLibrary | None = None,
         history_size: int = 40,
+        tz_name: str = "UTC",
     ) -> None:
         self._vault = vault_tools
         self._schedule_dispatcher = schedule_dispatcher
@@ -103,6 +105,7 @@ class Agent:
         self._skills = skills
         self._histories: dict[tuple[int, int | None], ConversationHistory] = {}
         self._history_size = history_size
+        self._tz = ZoneInfo(tz_name)
 
     def _get_history(self, chat_id: int, thread_id: int | None = None) -> ConversationHistory:
         key = (chat_id, thread_id)
@@ -387,7 +390,10 @@ class Agent:
 
         # The send-time stamp is how the model knows the current time; it is
         # stored with the message so past turns never change retroactively.
-        stamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        # It is already the user's local time: stamping UTC left the model doing
+        # DST-aware arithmetic in its head, and UTC clock times leaked into vault
+        # fields (routines "last done", reminder notes) that must be local.
+        stamp = datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
         stamped_message = f"[{stamp}] {user_message}"
         user_entry: dict[str, Any] = {"role": "user", "content": stamped_message}
         history.append(user_entry)

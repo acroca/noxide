@@ -143,8 +143,15 @@ weekly **lint**.
 The file is the source of truth and is re-read every 60 seconds, so hand edits
 take effect within a minute. All five columns (`id`, `when`, `recurring`,
 `prompt`, `created`) are required; a row that does not parse is skipped with a
-warning in the log. Timestamps here are UTC — the one place in the vault that
-is not local time, because cron needs it unambiguous.
+warning in the log, and written back untouched when something else edits the
+table — otherwise one bad row would be erased by the next write.
+
+Times run on the local clock: a cron expression fires on your wall clock, and a
+`when` you write by hand is read as local unless it carries an offset. The one
+UTC form is what the `schedule` tool stores for one-off jobs — an absolute
+instant with `+00:00` — which is unambiguous precisely because the offset is
+there. Write cron weekdays as names (`SUN`); the numbering starts at Monday, so
+`0` means Monday.
 
 On restart, one-off jobs overdue by less than 12 hours fire once; older ones
 are dropped.

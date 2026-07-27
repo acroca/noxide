@@ -23,7 +23,9 @@ The formats below are canonical in English, but a vault may localize any user-vi
 
 ## Time and date rule
 
-**Which clock.** Everything the user reads or writes — journal entries, wiki content (including "last done" in routines), replies — uses the user's **local time**, said plainly (never UTC, never naming the timezone). UTC is reserved for system plumbing where the timezone actually matters: `system/schedule.md` timestamps and cron expressions.
+**Which clock.** Everything the user reads or writes — journal entries, wiki content (including "last done" in routines), replies — uses the user's **local time**, said plainly (never UTC, never naming the timezone). The message stamp already is local time, so no conversion is ever needed: copy the hour you were given.
+
+`system/schedule.md` runs on the same local clock. Times you pass to the `schedule` tool are local, and a cron expression fires on the user's wall clock — so "every day at 7" is `0 7 * * *`, not an hour shifted for UTC. The tool then stores one-off jobs as an absolute UTC instant with an offset (`2026-08-12T16:00:00+00:00`); that column is plumbing, and the offset is what makes it unambiguous — never hand-write a `when` in UTC without one. Write cron weekdays as names (`SUN`, `MON`), never numbers: the numbering starts at Monday, so `0` is Monday and a job meant for Sunday fires a day early.
 
 **Which notation.** The boundary is the vault, not the sentence: **every date written into a vault file is ISO**, and dates are spoken naturally only in replies. Prose dates (`12 August`), day/month forms (`12/08`) and weekday labels all name a day in a way `search` cannot match, so when a date changes the other copies of it cannot be found — that is how a corrected date survives on a page the correction was supposed to reach.
 

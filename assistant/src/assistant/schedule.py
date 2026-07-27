@@ -119,6 +119,10 @@ class Scheduler:
         # Jobs run outside the Telegram update queue, so shutdown has to wait
         # on them separately or a mid-run reminder dies with the process.
         self._inflight: set[asyncio.Task[None]] = set()
+        # Ids with a run in flight. A one-off's row is deleted only once its run
+        # finishes, so a poll in between finds a live row with no APScheduler job
+        # and would re-register — firing a job that already fired.
+        self._running: set[str] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,11 +153,18 @@ class Scheduler:
     # schedule.md I/O
     # ------------------------------------------------------------------
 
-    def _read_entries(self) -> list[ScheduleEntry]:
+    def _read_table(self) -> tuple[list[ScheduleEntry], list[str]]:
+        """Parse schedule.md into entries plus the raw rows that would not parse.
+
+        Callers that rewrite the file need both halves. Every mutation writes the
+        table back in full, so a row the parser skipped is a row the next write
+        erases — that is how a single malformed row cost an entire schedule.
+        """
         text = self._vault.read_file(_SCHEDULE_FILE)
         if text.startswith("[file not found"):
-            return []
+            return [], []
         entries = []
+        unparsed: list[str] = []
         in_table = False
         for line in text.splitlines():
             stripped = line.strip()
@@ -167,6 +178,7 @@ class Scheduler:
                 if entry:
                     entries.append(entry)
                 else:
+                    unparsed.append(stripped)
                     # The file is hand-editable, so a typo here is a job that
                     # silently never runs. Say so rather than dropping it mutely.
                     logger.warning(
@@ -177,9 +189,14 @@ class Scheduler:
                     )
             elif in_table and not stripped:
                 pass  # allow blank lines
-        return entries
+        return entries, unparsed
 
-    def _write_entries(self, entries: list[ScheduleEntry]) -> None:
+    def _read_entries(self) -> list[ScheduleEntry]:
+        return self._read_table()[0]
+
+    def _write_entries(
+        self, entries: list[ScheduleEntry], preserved: list[str] | None = None
+    ) -> None:
         lines = [
             "# Schedule\n",
             _TABLE_HEADER,
@@ -187,6 +204,10 @@ class Scheduler:
         ]
         for e in entries:
             lines.append(e.to_row())
+        # Rows the parser could not read go back verbatim, so a write never
+        # costs more than it was asked to change. They stay inside the table,
+        # where the next read keeps warning about them until a human fixes them.
+        lines.extend(preserved or [])
         lines.append("")  # trailing newline
         self._vault.write_file(_SCHEDULE_FILE, "\n".join(lines))
 
@@ -203,7 +224,17 @@ class Scheduler:
             existing.remove()
 
         if entry.recurring:
-            trigger = CronTrigger.from_crontab(entry.when, timezone=self._tz)
+            try:
+                trigger = CronTrigger.from_crontab(entry.when, timezone=self._tz)
+            except ValueError as exc:
+                # APScheduler numbers weekdays 0=Mon..6=Sun, so crontab's Sunday
+                # `7` is out of range and raises. Unguarded that aborted the rest
+                # of the reload pass and crashed startup, where reload() has no
+                # try around it — one typo took the whole schedule down.
+                logger.warning(
+                    "Invalid cron expression for job %s (%r): %s", job_id, entry.when, exc
+                )
+                return
         else:
             dt = parse_when(entry.when, self._tz)
             if dt is None:
@@ -231,20 +262,26 @@ class Scheduler:
         task = asyncio.current_task()
         if task is not None:
             self._inflight.add(task)
+        self._running.add(job_id)
         try:
-            await self._run_job(prompt)
-        except Exception:
-            logger.exception("Error in scheduled job %s", job_id)
+            try:
+                await self._run_job(prompt)
+            except Exception:
+                logger.exception("Error in scheduled job %s", job_id)
+            finally:
+                if task is not None:
+                    self._inflight.discard(task)
+            if not recurring:
+                self._remove_entry(job_id)
         finally:
-            if task is not None:
-                self._inflight.discard(task)
-        if not recurring:
-            self._remove_entry(job_id)
+            # Released only after the row is gone, so no poll can see a live row
+            # for a run that has already happened.
+            self._running.discard(job_id)
 
     def _remove_entry(self, job_id: str) -> None:
-        entries = self._read_entries()
+        entries, preserved = self._read_table()
         entries = [e for e in entries if e.id != job_id]
-        self._write_entries(entries)
+        self._write_entries(entries, preserved)
         self._entries.pop(job_id, None)
 
     # ------------------------------------------------------------------
@@ -257,6 +294,8 @@ class Scheduler:
         seen_ids: set[str] = set()
         for entry in entries:
             seen_ids.add(entry.id)
+            if entry.id in self._running:
+                continue  # mid-run; its row is still on disk by design
             prev = self._entries.get(entry.id)
             unchanged = prev is not None and (
                 (prev.when, prev.recurring, prev.prompt)
@@ -299,9 +338,9 @@ class Scheduler:
             prompt=prompt,
             created=now_iso,
         )
-        entries = self._read_entries()
+        entries, preserved = self._read_table()
         entries.append(entry)
-        self._write_entries(entries)
+        self._write_entries(entries, preserved)
         self._entries[job_id] = entry
         self._register(entry)
         return f"Scheduled job {job_id} at {when_stored}"
@@ -314,12 +353,12 @@ class Scheduler:
         return "\n".join(lines)
 
     def cancel_scheduled(self, job_id: str) -> str:
-        entries = self._read_entries()
+        entries, preserved = self._read_table()
         original_count = len(entries)
         entries = [e for e in entries if e.id != job_id]
         if len(entries) == original_count:
             return f"[job {job_id!r} not found]"
-        self._write_entries(entries)
+        self._write_entries(entries, preserved)
         job = self._apscheduler.get_job(job_id)
         if job:
             job.remove()

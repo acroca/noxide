@@ -241,7 +241,7 @@ async def test_user_message_is_stamped_with_send_time(agent: Agent) -> None:
     assert messages[0]["role"] == "system"
     assert "Current datetime" not in messages[0]["content"]
     user_msg = [m for m in messages if m["role"] == "user"][-1]
-    assert re.fullmatch(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\] Hi", user_msg["content"])
+    assert re.fullmatch(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} local\] Hi", user_msg["content"])
 
 
 @pytest.mark.asyncio
@@ -260,7 +260,25 @@ async def test_stamps_are_frozen_in_history_across_runs(agent: Agent) -> None:
 
     messages = mock_client.chat.call_args.args[0]
     users = [m["content"] for m in messages if m["role"] == "user"]
-    assert users == ["[2026-07-24 10:00 UTC] first", "[2026-07-24 10:07 UTC] second"]
+    assert users == ["[2026-07-24 10:00 local] first", "[2026-07-24 10:07 local] second"]
+
+
+@pytest.mark.asyncio
+async def test_stamp_is_in_the_configured_timezone(vault: VaultTools) -> None:
+    """The stamp is the only clock the model gets. Handing it UTC and asking it
+    to convert in its head is how UTC times got written into vault fields that
+    are supposed to be local."""
+    agent = Agent(vault_tools=vault, tz_name="Europe/Madrid")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("ok"))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        with patch("assistant.agent.datetime") as dt:
+            dt.now.return_value = datetime(2026, 7, 27, 6, 57, tzinfo=UTC)
+            await agent.run(chat_id=1, user_message="hola")
+
+    user_msg = [m for m in mock_client.chat.call_args.args[0] if m["role"] == "user"][-1]
+    assert user_msg["content"] == "[2026-07-27 08:57 local] hola"  # CEST = UTC+2
 
 
 def test_wiki_schema_always_in_base_prompt(vault: VaultTools) -> None:
@@ -921,7 +939,7 @@ async def test_image_is_sent_as_multimodal_content(agent: Agent) -> None:
     images = [p for p in user_msg["content"] if p["type"] == "image_url"]
     assert len(texts) == 1
     assert re.fullmatch(
-        r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\] what plant is this\?", texts[0]
+        r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} local\] what plant is this\?", texts[0]
     )
     assert images == [{"type": "image_url", "image_url": {"url": _DATA_URL}}]
 
