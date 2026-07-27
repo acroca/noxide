@@ -63,7 +63,7 @@ vault.template/     ← seed users copy; never a real vault
 docs/               ← this
 ```
 
-[CLAUDE.md](../CLAUDE.md) at the repo root is the detailed architecture
+[AGENTS.md](../AGENTS.md) at the repo root is the detailed architecture
 reference — what each module does and, more usefully, why the non-obvious parts
 are the way they are (why streaming is mandatory, why the shutdown ordering
 matters, why the system prompt must stay byte-stable). Read it before changing

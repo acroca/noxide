@@ -141,7 +141,7 @@ Setup: **[docs/deployment.md](docs/deployment.md#web-research)**.
 | [vault.md](docs/vault.md) | The vault design, conventions, operations, scheduling, skills, rooms |
 | [development.md](docs/development.md) | Dev setup, running locally, layout, adding a tool |
 | [ideas/](docs/ideas/) | Feature backlog, and what was considered and rejected |
-| [CLAUDE.md](CLAUDE.md) | Detailed architecture reference — what each module does and why |
+| [AGENTS.md](AGENTS.md) | Detailed architecture reference — what each module does and why |
 
 ## Stack
 

@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (opencode, Claude Code, ...) when working with code in this repository.
 
 ## Working style
 
@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Noxide is a self-hosted personal assistant bot: **Telegram → GitHub Copilot API → markdown vault**. A long-polling Telegram bot runs an OpenAI-style tool-calling agent loop against the Copilot chat API. All durable memory is a directory of markdown files (the *vault*); conversation history is in-memory only and lost on restart — this is intentional. No LLM frameworks.
 
-All Python code lives in `assistant/`; `vault.template/` at the repo root is the seed a user copies to start their own vault — its `AGENTS.md` is a skeleton of the bot's runtime system prompt, not instructions for Claude Code. A real vault never lives in the repo (`/vault/` and `assistant/vault/` are gitignored).
+All Python code lives in `assistant/`; `vault.template/` at the repo root is the seed a user copies to start their own vault — its `AGENTS.md` is a skeleton of the bot's runtime system prompt, not instructions for the coding agent (that's this file, at the repo root). A real vault never lives in the repo (`/vault/` and `assistant/vault/` are gitignored).
 
 ## Commands
 
