@@ -24,6 +24,12 @@ to act on and no way to reach you. Raw page content never enters the main
 agent's context — only the sub-agent's summary crosses back. The only thing
 that crosses outward is a ≤400-character question, which is logged.
 
+Bulk fan-out workers follow the same pattern: each processes one item in a
+fresh context and is **read-only** — vault read/list/search, skill loading,
+and `research`. A worker cannot write files, schedule jobs, or message you,
+and its only path to the web is the same quarantined `Researcher`, so a batch
+job widens throughput without widening what a single misbehaving run can do.
+
 **Server-side request forgery.** `fetch_page` refuses non-HTTP schemes and any
 host resolving to a non-global address (private ranges, loopback, link-local
 and cloud metadata endpoints). Redirects are followed manually so every hop is

@@ -53,8 +53,9 @@ not a product. There is no multi-tenancy and no web UI.
 | **Voice notes** | Transcribed via GitHub Models; optional, needs a free PAT |
 | **Photos** | Sent to the vision model and filed in the vault, driven by your caption |
 | **Documents** | PDFs, scans and text files stored and read on demand — digital PDFs parsed locally, scans transcribed via vision |
-| **Rooms** | Telegram forum topics become separate rooms with their own history and prompt, sharing one vault |
+| **Rooms** | Telegram forum topics become separate rooms with their own history and prompt, handled in parallel, sharing one vault |
 | **Skills** | Stored procedures in markdown that the bot consults — and refines — as it works |
+| **Bulk fan-out** | One instruction over up to 50 items, processed in parallel by read-only worker sub-agents |
 | **Model switching** | `/model` picker, with the active model shown in the group title |
 | **Usage tracking** | Rolling 7-day token report written to `system/usage.md` |
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sys
@@ -117,10 +118,10 @@ async def test_agent_tool_read_file(agent: Agent, vault: VaultTools, tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_write_file(agent: Agent, vault: VaultTools) -> None:
-    """Agent calls write_file then returns confirmation."""
+async def test_agent_tool_create_file(agent: Agent, vault: VaultTools) -> None:
+    """Agent calls create_file then returns confirmation."""
     responses = [
-        _make_tool_call_response("write_file", {"path": "note.md", "content": "Important note"}),
+        _make_tool_call_response("create_file", {"path": "note.md", "content": "Important note"}),
         _make_text_response("Saved to note.md"),
     ]
     mock_client = MagicMock()
@@ -189,7 +190,7 @@ async def test_agent_executes_tool_calls_despite_stop_finish_reason(
     """
     responses = [
         _make_tool_call_response(
-            "write_file",
+            "create_file",
             {"path": "note.md", "content": "reminder set"},
             finish_reason="stop",
             content="¡Claro!",
@@ -534,7 +535,7 @@ async def test_agent_handles_legacy_function_call_shape(
                     "role": "assistant",
                     "content": None,
                     "function_call": {
-                        "name": "write_file",
+                        "name": "create_file",
                         "arguments": json.dumps({"path": "note.md", "content": "legacy"}),
                     },
                 },
@@ -1147,3 +1148,82 @@ async def test_agent_dispatches_load_skill(vault: VaultTools, tmp_path: Path) ->
     ][-1]
     assert "read now.md" in tool_result["content"]
     assert reply == "Done"
+
+
+# ------------------------------------------------------------------
+# Concurrency: per-conversation serialization
+# ------------------------------------------------------------------
+
+async def test_same_conversation_runs_are_serialized(agent: Agent) -> None:
+    """Two runs for one (chat_id, thread_id) must never interleave: concurrent
+    appends into one history produce tool orderings the API rejects."""
+    active = {"now": 0, "max": 0}
+
+    async def chat(messages, tools, **kwargs):
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        await asyncio.sleep(0.02)
+        active["now"] -= 1
+        return _make_text_response("ok")
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=chat)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await asyncio.gather(
+            agent.run(chat_id=1, user_message="first"),
+            agent.run(chat_id=1, user_message="second"),
+        )
+
+    assert active["max"] == 1
+    msgs = agent._get_history(1).messages()
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant"]
+    users = [m["content"] for m in msgs if m["role"] == "user"]
+    assert "first" in users[0]
+    assert "second" in users[1]
+
+
+async def test_different_conversations_run_in_parallel(agent: Agent) -> None:
+    """A long run in one topic must not block a message in another topic."""
+    active = {"now": 0, "max": 0}
+
+    async def chat(messages, tools, **kwargs):
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        await asyncio.sleep(0.02)
+        active["now"] -= 1
+        return _make_text_response("ok")
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=chat)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await asyncio.gather(
+            agent.run(chat_id=1, user_message="topic one", thread_id=11),
+            agent.run(chat_id=1, user_message="topic two", thread_id=22),
+        )
+
+    assert active["max"] == 2
+
+
+async def test_scheduled_job_runs_in_parallel_with_user_chat(agent: Agent) -> None:
+    """Scheduled jobs (chat_id 0) must not queue behind a user conversation."""
+    active = {"now": 0, "max": 0}
+
+    async def chat(messages, tools, **kwargs):
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        await asyncio.sleep(0.02)
+        active["now"] -= 1
+        return _make_text_response("ok")
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=chat)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await asyncio.gather(
+            agent.run(chat_id=1, user_message="user turn"),
+            agent.run(chat_id=0, user_message="job prompt"),
+        )
+
+    assert active["max"] == 2

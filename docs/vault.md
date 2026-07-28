@@ -189,6 +189,14 @@ prefixed with the slug (`- 09:30 [gaming] …`), and `system/topics/index.md` ma
 topic id ↔ slug ↔ name. Ask the bot to *"create a topic called Health"* and it
 makes the Telegram topic, the vault directories and the index entry in one go.
 
+Rooms run in parallel: a long-running request in one room does not hold up a
+message in another, while messages within one room stay strictly ordered.
+Writes to the shared vault are guarded against collisions — a full-file
+rewrite is accepted only if the file still matches what that conversation last
+read, and refused otherwise so the bot re-reads and redoes the change instead
+of overwriting someone else's. The same guard protects your own hand edits
+made while the bot is mid-conversation.
+
 ## Attachments
 
 Photos and files are saved under `attachments/` before the model sees anything.

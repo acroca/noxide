@@ -29,7 +29,8 @@ section empty. Never guess a name, a birthday, or a location.
 
 ## 3. Write `AGENTS.md`
 
-Rewrite the file with `write_file`, keeping the existing `##` headings and the
+Rewrite the file with `rewrite_file` (read it first — the version token in the
+read output is required), keeping the existing `##` headings and the
 explanatory paragraph at the top. Replace each comment block with real prose:
 
 - **Language** — state the reply language plainly. Delete the whole section if

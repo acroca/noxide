@@ -21,9 +21,15 @@ logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 20
 _TOOL_TIMEOUT = 60.0
-# These tools make their own model calls (research sub-agent, vision extraction)
-_SLOW_TOOLS = {"research", "extract_attachment"}
-_SLOW_TOOL_TIMEOUT = 300.0
+# Tools that make their own model calls get longer budgets: research and
+# extraction run one sub-agent/vision call, fan_out runs a whole batch of
+# concurrent workers (its own per-worker timeouts keep one stuck item from
+# consuming the budget alone).
+_TOOL_TIMEOUTS = {
+    "research": 300.0,
+    "extract_attachment": 300.0,
+    "fan_out": 1800.0,
+}
 
 # A scheduled run replies with this sentinel (prompts/schedule.md) when it
 # finds its purpose already met; run_job then delivers nothing.
@@ -32,6 +38,28 @@ _SILENT_SENTINEL = "[silent]"
 _TOPIC_INDEX_FILE = "system/topics/index.md"
 _TOPIC_INDEX_HEADER = "| topic_id | slug | name |"
 _TOPIC_INDEX_SEP = "|----------|------|------|"
+
+# Shared with fanout.py: workers expose the same research tool to their model.
+RESEARCH_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "research",
+        "description": (
+            "Research a question on the public web via an isolated research "
+            "sub-agent that runs searches, reads pages, and returns a summary "
+            "with source URLs. Pass one self-contained question of at most "
+            "400 characters. Use it whenever current or external information "
+            "is needed. Never include personal or vault content in the question."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+            },
+            "required": ["question"],
+        },
+    },
+}
 
 
 def _read_prompt(name: str) -> str:
@@ -91,6 +119,7 @@ class Agent:
         create_forum_topic_fn: Callable[[str], Coroutine[Any, Any, dict[str, Any]]] | None = None,
         research_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         extract_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
+        fan_out_fn: Callable[[str, list[str]], Coroutine[Any, Any, str]] | None = None,
         skills: SkillLibrary | None = None,
         history_size: int = 40,
         tz_name: str = "UTC",
@@ -102,8 +131,14 @@ class Agent:
         self._create_forum_topic_fn = create_forum_topic_fn
         self._research_fn = research_fn
         self._extract_fn = extract_fn
+        self._fan_out_fn = fan_out_fn
         self._skills = skills
         self._histories: dict[tuple[int, int | None], ConversationHistory] = {}
+        # One lock per conversation: concurrent runs for the same
+        # (chat_id, thread_id) would interleave appends into one history and
+        # produce tool messages the API rejects. Different conversations
+        # (other topics, scheduled jobs on chat 0) run in parallel.
+        self._run_locks: dict[tuple[int, int | None], asyncio.Lock] = {}
         self._history_size = history_size
         self._tz = ZoneInfo(tz_name)
 
@@ -126,6 +161,8 @@ class Agent:
             sections.append(_read_prompt("research.md"))
         if self._extract_fn:
             sections.append(_read_prompt("extract.md"))
+        if self._fan_out_fn:
+            sections.append(_read_prompt("fanout.md"))
         if self._create_forum_topic_fn:
             sections.append(_read_prompt("topics.md"))
         if self._skills:
@@ -245,26 +282,7 @@ class Agent:
                 },
             })
         if self._research_fn:
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "research",
-                    "description": (
-                        "Research a question on the public web via an isolated research "
-                        "sub-agent that runs searches, reads pages, and returns a summary "
-                        "with source URLs. Pass one self-contained question of at most "
-                        "400 characters. Use it whenever current or external information "
-                        "is needed. Never include personal or vault content in the question."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question": {"type": "string"},
-                        },
-                        "required": ["question"],
-                    },
-                },
-            })
+            tools.append(RESEARCH_TOOL_SCHEMA)
         if self._extract_fn:
             tools.append({
                 "type": "function",
@@ -286,6 +304,40 @@ class Agent:
                             },
                         },
                         "required": ["path"],
+                    },
+                },
+            })
+        if self._fan_out_fn:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "fan_out",
+                    "description": (
+                        "Apply one instruction to many independent items in parallel. "
+                        "Concurrent worker sub-agents each process one item with a "
+                        "fresh context and return one result per item. Workers are "
+                        "read-only: they can read/search the vault, load skills, and "
+                        "research the web, but cannot write files, schedule jobs, or "
+                        "send messages. The instruction must be fully self-contained — "
+                        "workers see nothing of this conversation."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "instruction": {
+                                "type": "string",
+                                "description": (
+                                    "Task to apply to every item, including any file "
+                                    "paths, skill names, and the expected result format."
+                                ),
+                            },
+                            "items": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Independent items, one worker each (max 50).",
+                            },
+                        },
+                        "required": ["instruction", "items"],
                     },
                 },
             })
@@ -320,7 +372,15 @@ class Agent:
         send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
     ) -> str:
         # File tools
-        if name in ("read_file", "write_file", "edit_file", "append_file", "list_files", "search"):
+        if name in (
+            "read_file",
+            "create_file",
+            "rewrite_file",
+            "edit_file",
+            "append_file",
+            "list_files",
+            "search",
+        ):
             return self._vault.dispatch(name, args)
         # Skills (stored procedures; bodies live in the package or the vault)
         if name == "load_skill" and self._skills:
@@ -340,6 +400,9 @@ class Agent:
         # Attachment content extraction (local parse, vision fallback)
         if name == "extract_attachment" and self._extract_fn:
             return await self._extract_fn(args["path"])
+        # Fan-out bulk processing (concurrent quarantined workers)
+        if name == "fan_out" and self._fan_out_fn:
+            return await self._fan_out_fn(args["instruction"], args.get("items") or [])
         # Create forum topic
         if name == "create_forum_topic" and self._create_forum_topic_fn:
             topic_name: str = args["name"]
@@ -371,11 +434,39 @@ class Agent:
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
 
+        Runs for the same ``(chat_id, thread_id)`` are serialized on a lock —
+        interleaved appends into one history would produce orphaned tool
+        messages the API rejects. Runs for different conversations (other
+        topics, scheduled jobs) proceed in parallel; the lock queue is FIFO,
+        so same-conversation messages are handled in arrival order.
+
         ``on_research`` is awaited once, best-effort, the first time this run
         dispatches the ``research`` tool (e.g. to react to the Telegram message).
         ``send_message_fn`` overrides the constructor-injected sender for this
         run only (used by ``run_job`` to observe deliveries).
         """
+        lock = self._run_locks.setdefault((chat_id, thread_id), asyncio.Lock())
+        async with lock:
+            return await self._run_locked(
+                chat_id,
+                user_message,
+                thread_id=thread_id,
+                extra_context=extra_context,
+                image_data_url=image_data_url,
+                on_research=on_research,
+                send_message_fn=send_message_fn,
+            )
+
+    async def _run_locked(
+        self,
+        chat_id: int,
+        user_message: str,
+        thread_id: int | None = None,
+        extra_context: str | None = None,
+        image_data_url: str | None = None,
+        on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
+        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+    ) -> str:
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
 
@@ -476,7 +567,7 @@ class Agent:
                         logger.warning("on_research callback failed", exc_info=True)
                     on_research = None  # notify at most once per run
                 try:
-                    timeout = _SLOW_TOOL_TIMEOUT if fn_name in _SLOW_TOOLS else _TOOL_TIMEOUT
+                    timeout = _TOOL_TIMEOUTS.get(fn_name, _TOOL_TIMEOUT)
                     result = await asyncio.wait_for(
                         self._dispatch_tool(fn_name, fn_args, send_message_fn),
                         timeout=timeout,

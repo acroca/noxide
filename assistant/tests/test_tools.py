@@ -323,3 +323,150 @@ def test_save_attachment_sanitizes_extension(vault: VaultTools, tmp_path: Path) 
     resolved = (tmp_path / rel).resolve()
     assert str(resolved).startswith(str(tmp_path.resolve()))
     assert "/attachments/" in str(resolved)
+
+
+# ------------------------------------------------------------------
+# create_file / rewrite_file (optimistic concurrency for full writes)
+# ------------------------------------------------------------------
+
+def test_create_file_creates_new_file(vault: VaultTools) -> None:
+    result = vault.create_file("wiki/people/anna.md", "# Anna\n")
+
+    assert result.startswith("Created wiki/people/anna.md")
+    assert "version" in result
+    assert vault.read_file("wiki/people/anna.md") == "# Anna\n"
+
+
+def test_create_file_refuses_existing_file(vault: VaultTools) -> None:
+    vault.write_file("note.md", "original")
+
+    result = vault.create_file("note.md", "clobber attempt")
+
+    assert result.startswith("[create error:")
+    assert vault.read_file("note.md") == "original"
+
+
+def test_create_file_path_jail(vault: VaultTools) -> None:
+    with pytest.raises(PermissionError):
+        vault.create_file("../outside.md", "x")
+
+
+def test_rewrite_file_with_current_version(vault: VaultTools) -> None:
+    vault.write_file("note.md", "old content")
+    version = vault.version("note.md")
+
+    result = vault.rewrite_file("note.md", "new content", version)
+
+    assert result.startswith("Rewrote note.md")
+    assert vault.read_file("note.md") == "new content"
+
+
+def test_rewrite_file_refuses_stale_version(vault: VaultTools) -> None:
+    """The lost-update guard: a rewrite based on a read that another run has
+    since overwritten must fail instead of clobbering the newer content."""
+    vault.write_file("note.md", "state A")
+    stale = vault.version("note.md")
+    vault.write_file("note.md", "state B")  # concurrent run wrote in between
+
+    result = vault.rewrite_file("note.md", "based on state A", stale)
+
+    assert result.startswith("[rewrite error:")
+    assert "changed since you read it" in result
+    assert vault.read_file("note.md") == "state B"
+
+
+def test_rewrite_file_missing_file_points_at_create(vault: VaultTools) -> None:
+    result = vault.rewrite_file("nope.md", "content", "deadbeef")
+
+    assert result.startswith("[rewrite error:")
+    assert "create_file" in result
+
+
+def test_rewrite_file_path_jail(vault: VaultTools) -> None:
+    with pytest.raises(PermissionError):
+        vault.rewrite_file("../outside.md", "x", "deadbeef")
+
+
+def test_version_changes_with_content(vault: VaultTools) -> None:
+    vault.write_file("note.md", "one")
+    v1 = vault.version("note.md")
+    vault.write_file("note.md", "two")
+    v2 = vault.version("note.md")
+    vault.write_file("note.md", "one")
+
+    assert v1 != v2
+    assert vault.version("note.md") == v1  # deterministic across writes
+
+
+def test_mutating_tools_report_the_new_version(vault: VaultTools) -> None:
+    """Every write reports the resulting version so the model can chain a
+    later rewrite_file without re-reading."""
+    created = vault.create_file("note.md", "line1\n")
+    appended = vault.append_file("note.md", "line2\n")
+    edited = vault.edit_file("note.md", "line2", "line-two")
+
+    current = vault.version("note.md")
+    assert f"version {current}" in edited
+    for report in (created, appended):
+        assert "version " in report
+
+
+# ------------------------------------------------------------------
+# Tool surface: dispatch and schemas
+# ------------------------------------------------------------------
+
+def test_read_file_dispatch_appends_version_token(vault: VaultTools) -> None:
+    vault.write_file("note.md", "content here")
+
+    out = vault.dispatch("read_file", {"path": "note.md"})
+
+    assert out.startswith("content here")
+    assert f"[version: {vault.version('note.md')}]" in out
+
+
+def test_read_file_dispatch_missing_file_has_no_version(vault: VaultTools) -> None:
+    out = vault.dispatch("read_file", {"path": "nope.md"})
+
+    assert out == "[file not found: nope.md]"
+
+
+def test_read_file_method_stays_bare(vault: VaultTools) -> None:
+    """Internal callers (system prompt assembly, index parsing) must see the
+    file's exact content, without the tool-facing version token."""
+    vault.write_file("note.md", "content here")
+
+    assert vault.read_file("note.md") == "content here"
+
+
+def test_create_and_rewrite_dispatch(vault: VaultTools) -> None:
+    vault.dispatch("create_file", {"path": "n.md", "content": "v1"})
+    version = vault.version("n.md")
+    vault.dispatch(
+        "rewrite_file", {"path": "n.md", "content": "v2", "expected_version": version}
+    )
+
+    assert vault.read_file("n.md") == "v2"
+
+
+def test_write_file_is_not_a_tool(vault: VaultTools) -> None:
+    """write_file stays a Python method for internal writes; the model only
+    gets the guarded create_file/rewrite_file pair."""
+    names = {s["function"]["name"] for s in vault.tool_schemas()}
+    assert "write_file" not in names
+    assert {"create_file", "rewrite_file"} <= names
+
+    out = vault.dispatch("write_file", {"path": "x.md", "content": "boo"})
+    assert out == "[unknown tool: write_file]"
+    assert vault.read_file("x.md").startswith("[file not found")
+
+
+def test_rewrite_file_accepts_full_version_marker(vault: VaultTools) -> None:
+    """Models echo tokens with their surrounding syntax; only a content
+    mismatch should fail a rewrite, never formatting."""
+    vault.write_file("note.md", "old")
+    version = vault.version("note.md")
+
+    result = vault.rewrite_file("note.md", "new", f"[version: {version}]")
+
+    assert result.startswith("Rewrote note.md")
+    assert vault.read_file("note.md") == "new"

@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 _MAX_MSG_LEN = 4000
 # Telegram's Bot API refuses file downloads above 20 MB anyway
 _MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+# Updates are handled concurrently up to this cap, so a long agent run in one
+# forum topic does not block messages arriving in another. Runs within one
+# conversation stay sequential — Agent.run serializes per (chat_id, thread_id).
+_CONCURRENT_UPDATES = 8
 _CHAT_ID_FILENAME = "chat_id"
 _MODEL_CB_PREFIX = "model:"
 # Bots may only react with Telegram's fixed emoji set (🔎 isn't in it),
@@ -119,6 +123,10 @@ class TelegramBot:
         # Monotonic deadline while Telegram flood-limits group-title changes
         self._title_flood_until: float = 0.0
         self._app: Application | None = None
+        # Message updates currently inside _handle_message. With concurrent
+        # updates the queue drains into tasks immediately, so qsize alone
+        # undercounts what a shutdown drain still has to finish.
+        self._inflight_updates = 0
         # chat_id used for proactive sends: restored from state_dir when available,
         # falling back to the configured default until one is learned from an
         # incoming allowed message
@@ -336,7 +344,15 @@ class TelegramBot:
     async def _handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_allowed(update):
             return
+        self._inflight_updates += 1
+        try:
+            await self._handle_message_inner(update, ctx)
+        finally:
+            self._inflight_updates -= 1
 
+    async def _handle_message_inner(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         msg = update.message
         self._remember_chat_id(msg.chat_id)
 
@@ -554,7 +570,12 @@ class TelegramBot:
     # ------------------------------------------------------------------
 
     def build(self) -> Application:
-        app = Application.builder().token(self._token).build()
+        app = (
+            Application.builder()
+            .token(self._token)
+            .concurrent_updates(_CONCURRENT_UPDATES)
+            .build()
+        )
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(CommandHandler("model", self._model_cmd))
         app.add_handler(CommandHandler("clear", self._clear_cmd))
@@ -598,10 +619,14 @@ class TelegramBot:
         await self.notify_lifecycle("Started")
 
     def pending_updates(self) -> int:
-        """Updates fetched but not yet handled. Zero once the queue is drained."""
+        """Updates fetched but not yet handled. Zero once the queue is drained.
+
+        Counts both queued updates and ones already picked up by a concurrent
+        handler task that has not finished yet.
+        """
         if self._app is None:
             return 0
-        return self._app.update_queue.qsize()
+        return self._app.update_queue.qsize() + self._inflight_updates
 
     async def stop_polling(self) -> None:
         """Stop fetching. Also the ack point — see lifecycle.graceful_shutdown."""

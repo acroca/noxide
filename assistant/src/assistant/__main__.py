@@ -92,6 +92,15 @@ async def _run(config_path: Path | None) -> None:
 
     skills = SkillLibrary(cfg.vault_path)
 
+    # Fan-out: bulk parallel processing via read-only worker sub-agents
+    from .fanout import FanOut
+
+    fan_out = FanOut(
+        vault_tools=vault,
+        skills=skills,
+        research_fn=researcher.research if researcher else None,
+    )
+
     # Init scheduler (needs agent for job firing; closure resolves the
     # agent name late — it is constructed below)
     async def run_job(prompt: str) -> None:
@@ -108,6 +117,7 @@ async def _run(config_path: Path | None) -> None:
         create_forum_topic_fn=bot.create_forum_topic,
         research_fn=researcher.research if researcher else None,
         extract_fn=extractor.extract,
+        fan_out_fn=fan_out.run,
         skills=skills,
         history_size=cfg.history_size,
         tz_name=cfg.timezone,

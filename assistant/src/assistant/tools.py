@@ -6,6 +6,7 @@ outside the vault raises a PermissionError.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from datetime import UTC, datetime
@@ -17,6 +18,16 @@ from typing import Any
 _MAX_READ_CHARS = 100_000
 # Matches beyond this are dropped from a search result
 _MAX_SEARCH_RESULTS = 200
+
+
+def _version_of(text: str) -> str:
+    """Short content hash used as an optimistic-concurrency token.
+
+    ``read_file`` (via dispatch) hands it to the model; ``rewrite_file``
+    requires it back and refuses when the file changed in between — the
+    full-rewrite analogue of ``edit_file``'s exact-match requirement.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
 
 
 def slug_from_name(name: str) -> str:
@@ -84,20 +95,68 @@ class VaultTools:
         return text
 
     def write_file(self, path: str, content: str) -> str:
-        """Write (create or overwrite) *content* to *path*."""
+        """Write (create or overwrite) *content* to *path*.
+
+        Internal (Python-side) writes only — not exposed as a tool. The model
+        gets ``create_file`` (refuses to overwrite) and ``rewrite_file``
+        (version-checked) instead, so concurrent agent runs cannot blindly
+        clobber each other's changes.
+        """
         p = self._safe_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"Written {len(content)} bytes to {path}"
 
+    def version(self, path: str) -> str:
+        """Current version token of *path* (must exist)."""
+        return _version_of(self._safe_path(path).read_text(encoding="utf-8"))
+
+    def create_file(self, path: str, content: str) -> str:
+        """Create *path* with *content*; refuse if it already exists."""
+        p = self._safe_path(path)
+        if p.exists():
+            return (
+                f"[create error: {path} already exists — read it, then use "
+                "edit_file or rewrite_file to change it]"
+            )
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return f"Created {path} ({len(content)} bytes, version {_version_of(content)})"
+
+    def rewrite_file(self, path: str, content: str, expected_version: str) -> str:
+        """Replace *path*'s entire content iff its version still matches.
+
+        *expected_version* comes from the model's most recent ``read_file``
+        (or the version reported by a previous write). A mismatch means
+        another run changed the file since — the caller must re-read and
+        redo its changes on the current content, exactly like a failed
+        ``edit_file`` match.
+        """
+        p = self._safe_path(path)
+        if not p.exists():
+            return f"[rewrite error: file not found: {path} — use create_file for new files]"
+        current = _version_of(p.read_text(encoding="utf-8"))
+        # Accept the token as the model saw it: "abc123", "version: abc123",
+        # or the full "[version: abc123]" marker. Only a real content
+        # mismatch should fail the rewrite, never formatting.
+        expected = expected_version.strip().strip("[]").removeprefix("version:").strip()
+        if current != expected:
+            return (
+                f"[rewrite error: {path} has changed since you read it "
+                f"(version is now {current}, you passed {expected_version}) — "
+                "read it again and redo your changes on the current content]"
+            )
+        p.write_text(content, encoding="utf-8")
+        return f"Rewrote {path} ({len(content)} bytes, version {_version_of(content)})"
+
     def edit_file(self, path: str, old_string: str, new_string: str) -> str:
         """Replace the single occurrence of *old_string* in *path* with *new_string*.
 
-        Surgical alternative to ``write_file`` for the wiki's line patches: the
-        rest of the file stays byte-identical, so keeping ``now.md`` current
-        costs one line instead of re-emitting the whole dashboard. Refuses
-        ambiguous edits (0 or >1 matches) rather than guessing which line the
-        caller meant.
+        Surgical alternative to ``rewrite_file`` for the wiki's line patches:
+        the rest of the file stays byte-identical, so keeping ``now.md``
+        current costs one line instead of re-emitting the whole dashboard.
+        Refuses ambiguous edits (0 or >1 matches) rather than guessing which
+        line the caller meant.
         """
         p = self._safe_path(path)
         if not p.exists():
@@ -111,8 +170,9 @@ class VaultTools:
                 f"[edit error: old_string appears {occurrences} times in {path}; "
                 "include surrounding lines to identify a single one]"
             )
-        p.write_text(content.replace(old_string, new_string), encoding="utf-8")
-        return f"Edited {path}"
+        new_content = content.replace(old_string, new_string)
+        p.write_text(new_content, encoding="utf-8")
+        return f"Edited {path} (version {_version_of(new_content)})"
 
     def append_file(self, path: str, content: str) -> str:
         """Append *content* to *path*, creating it if absent."""
@@ -120,7 +180,10 @@ class VaultTools:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(content)
-        return f"Appended {len(content)} bytes to {path}"
+        return (
+            f"Appended {len(content)} bytes to {path} "
+            f"(version {_version_of(p.read_text(encoding='utf-8'))})"
+        )
 
     def list_files(self, glob: str) -> str:
         """Return newline-separated list of vault-relative paths matching *glob*."""
@@ -189,7 +252,11 @@ class VaultTools:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read text content of a file in the vault.",
+                    "description": (
+                        "Read text content of a file in the vault. The output ends "
+                        "with a [version: ...] token identifying the content you saw; "
+                        "rewrite_file requires it."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -202,8 +269,11 @@ class VaultTools:
             {
                 "type": "function",
                 "function": {
-                    "name": "write_file",
-                    "description": "Write (create or overwrite) a file in the vault.",
+                    "name": "create_file",
+                    "description": (
+                        "Create a new file in the vault. Fails if the file already "
+                        "exists — read it and use edit_file or rewrite_file instead."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -217,10 +287,35 @@ class VaultTools:
             {
                 "type": "function",
                 "function": {
+                    "name": "rewrite_file",
+                    "description": (
+                        "Replace the entire content of an existing vault file. "
+                        "Requires the [version: ...] token from your most recent "
+                        "read of the file; fails if the file changed since, in "
+                        "which case read it again and redo your changes. Prefer "
+                        "edit_file for changing a line or two."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "expected_version": {
+                                "type": "string",
+                                "description": "Version token from your latest read_file of this file",
+                            },
+                        },
+                        "required": ["path", "content", "expected_version"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "edit_file",
                     "description": (
                         "Replace one exact snippet in a vault file, leaving the rest "
-                        "untouched. Preferred over write_file for changing a line or "
+                        "untouched. Preferred over rewrite_file for changing a line or "
                         "two (e.g. patching a wiki/now.md line). old_string must match "
                         "exactly and appear exactly once — include surrounding lines if "
                         "the text repeats. Pass an empty new_string to delete."
@@ -288,11 +383,25 @@ class VaultTools:
         ]
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
-        """Dispatch a tool call by name."""
+        """Dispatch a tool call by name.
+
+        ``read_file`` results gain the ``[version: ...]`` token here rather
+        than in the method, so internal callers (system prompt assembly,
+        topic index parsing) keep seeing the file's bare content.
+        """
         if name == "read_file":
-            return self.read_file(args["path"])
-        elif name == "write_file":
-            return self.write_file(args["path"], args["content"])
+            content = self.read_file(args["path"])
+            if content.startswith("[file not found"):
+                return content
+            # Hash the file, not the (possibly truncated) returned text: the
+            # token must identify the on-disk state a rewrite would replace.
+            return f"{content}\n[version: {self.version(args['path'])}]"
+        elif name == "create_file":
+            return self.create_file(args["path"], args["content"])
+        elif name == "rewrite_file":
+            return self.rewrite_file(
+                args["path"], args["content"], args["expected_version"]
+            )
         elif name == "edit_file":
             return self.edit_file(args["path"], args["old_string"], args["new_string"])
         elif name == "append_file":

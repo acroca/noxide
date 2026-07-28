@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -1028,3 +1029,44 @@ def test_build_registers_clear_command() -> None:
         for cmd in handler.commands
     }
     assert "clear" in commands
+
+
+# ------------------------------------------------------------------
+# Concurrent update processing
+# ------------------------------------------------------------------
+
+def test_build_enables_concurrent_updates() -> None:
+    """Updates run concurrently so one topic's long agent run does not block
+    another topic; per-conversation ordering is Agent.run's job."""
+    bot, _ = _bot()
+
+    app = bot.build()
+
+    assert app.concurrent_updates == 8
+
+
+async def test_pending_updates_counts_inflight_handlers() -> None:
+    """With concurrent updates the queue drains into tasks immediately, so the
+    shutdown drain report must include handlers still running."""
+    bot, agent = _bot()
+    app = MagicMock()
+    app.update_queue.qsize = MagicMock(return_value=1)
+    bot._app = app
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_run(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "done"
+
+    agent.run = AsyncMock(side_effect=slow_run)
+    update, ctx = _update(text="hi")
+
+    task = asyncio.create_task(bot._handle_message(update, ctx))
+    await started.wait()
+    assert bot.pending_updates() == 2  # 1 still queued + 1 in flight
+
+    release.set()
+    await task
+    assert bot.pending_updates() == 1  # only the queued one remains

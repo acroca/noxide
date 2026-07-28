@@ -51,6 +51,7 @@ assistant/
     schedule.py     ← APScheduler over system/schedule.md
     skills.py       ← skill discovery and loading
     web.py          ← quarantined research sub-agent
+    fanout.py       ← concurrent read-only worker sub-agents
     extract.py      ← PDF/image content extraction
     transcribe.py   ← voice notes via GitHub Models
     usage.py        ← token accounting

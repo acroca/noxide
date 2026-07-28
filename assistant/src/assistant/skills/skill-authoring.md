@@ -59,7 +59,9 @@ When following a skill reveals a wrong, missing, or out-of-order step, fix it
 in the same run — that is the normal way skills improve, and it needs no
 permission.
 
-- Rewrite the file with `write_file`; keep the trigger line unless the
+- Write the full corrected file to `system/skills/<slug>.md` — `create_file`
+  when no vault copy exists yet (the usual case for a shipped skill),
+  `rewrite_file` when one does; keep the trigger line unless the
   situation it describes has genuinely changed. A file without a valid
   `**Use when:**` line is invisible in the list, so for a shipped skill the
   original shipped copy silently keeps being used instead.
