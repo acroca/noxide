@@ -35,6 +35,8 @@ start one.
 | `assistant.vault_path` | `VAULT_PATH` | `./vault` | Vault directory. The Docker image sets this to `/data/vault` |
 | `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, usage JSONL. The image sets this to `/data/state` |
 | `assistant.history_size` | `HISTORY_SIZE` | `40` | Messages kept in memory per chat/topic. Bigger means more context and more tokens per turn |
+| `backup.enabled` | `BACKUP_ENABLED` | `false` | Local-only git history of the vault: one commit per interaction that changed it, plus a periodic sweep for edits arriving from outside the bot. Nothing is ever pushed. See [deployment.md](deployment.md#backups) |
+| `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
 
 Paths are expanded and resolved, so `~/vault` and relative paths both work.
 
@@ -48,6 +50,8 @@ at once rather than failing on the first:
 - `timezone` is a valid IANA name
 - `default_model` is a key of `copilot.models`
 - `state_dir/oauth_token` exists — run `assistant auth` if not
+- with `backup.enabled`: a `git` binary is on `PATH` and `backup.git_dir` is
+  not inside the vault
 
 A malformed `ALLOWED_USER_IDS` (non-numeric entry) fails the same way rather
 than raising a traceback.

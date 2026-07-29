@@ -210,13 +210,81 @@ tag instead: `ghcr.io/acroca/noxide:v1.0.0`.
 
 Everything that matters is in two directories:
 
-- `vault/` — your notes. Plain markdown; a git repo here gives you history and
-  an undo for anything the model gets wrong.
+- `vault/` — your notes. Plain markdown. The built-in backup below gives it a
+  full git history — and an undo for anything the model gets wrong.
 - `state/` — the OAuth token, the remembered chat id, and usage JSONL. Losing
   it costs you a re-auth, not data.
 
 Conversation history is deliberately **not** persisted; it lives in memory and
 is gone on restart. That is by design — see the README.
+
+#### Vault git backup
+
+Set `[backup] enabled = true` (or `BACKUP_ENABLED=true`) and the bot keeps a
+**local-only** git history of the vault:
+
+- Every interaction that changes the vault becomes one commit. The commit
+  message carries the exchange — your message and the bot's reply (or the job
+  prompt and its close, for scheduled runs) — so `git log` doubles as a record
+  of what happened and how it affected the vault. (One known blur: two rooms
+  writing the *same file* at nearly the same moment can land both edits in
+  the first room's commit — content is never lost, only the attribution; see
+  [ideas/backup-attribution-race.md](ideas/backup-attribution-race.md).)
+- A sweep every few minutes (and one at startup) commits changes no run made:
+  edits synced in from other devices, or writes orphaned by a crash.
+- Nothing is ever pushed. There is no remote, no credentials, and private
+  vault content never leaves the machine.
+
+The repository lives **outside** the vault — by default `state/vault.git`,
+configurable with `backup.git_dir`. The vault itself carries no `.git` at all,
+which is what makes this safe for a vault inside iCloud Drive or Dropbox:
+sync engines corrupt git internals (partial syncs, conflicted ref copies,
+evicted packfiles), so the git dir must never sync. For the same reason the
+sweep refuses to run while iCloud eviction placeholders (`*.icloud`) are
+present, so an evicted file is never committed as a deletion — keep the vault
+folder pinned ("Keep Downloaded" in Finder) if you use Optimize Mac Storage.
+
+#### Inspecting history
+
+A git dir alone is a complete repository; point git at it from anywhere:
+
+```bash
+alias vgit='git --git-dir="$HOME/path/to/state/vault.git"'
+
+vgit log --stat                    # what changed, when, and why
+vgit show HEAD~3:wiki/now.md       # a file as it was three commits ago
+vgit diff HEAD~5 HEAD              # everything from the last five interactions
+```
+
+To also diff against the *live* vault files (`vgit status`, `vgit diff`), tell
+the repo where your work tree is — this config lives outside the vault, so a
+host-specific path is fine:
+
+```bash
+vgit config core.worktree "$HOME/path/to/vault"
+```
+
+Avoid running your own `git commit` against this repo while the bot is up; a
+held `index.lock` makes the bot skip that backup cycle (the next sweep picks
+the changes up).
+
+#### Restoring
+
+To roll back a single file, write the old version back and let the bot's next
+sweep commit the revert:
+
+```bash
+vgit show HEAD~2:wiki/now.md > /path/to/vault/wiki/now.md
+```
+
+For a full restore into a fresh or emptied vault directory:
+
+```bash
+git --git-dir=/path/to/state/vault.git --work-tree=/path/to/vault checkout -f main
+```
+
+Then restart the bot. `state/` needs no restore ceremony — losing it only
+costs a re-auth.
 
 ### Graceful restarts
 

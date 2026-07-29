@@ -22,6 +22,11 @@ FROM python:3.13-slim
 # tree (libLLVM, Mesa, codec libs) adds ~400MB.
 COPY --from=mwader/static-ffmpeg:7.1 /ffmpeg /usr/local/bin/ffmpeg
 
+# git powers the optional vault backup (local-only commit history)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 # Non-root user
 RUN useradd -m -u 1000 assistant
 WORKDIR /app

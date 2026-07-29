@@ -1396,3 +1396,101 @@ async def test_scheduled_job_runs_in_parallel_with_user_chat(agent: Agent) -> No
         )
 
     assert active["max"] == 2
+
+
+# ------------------------------------------------------------------
+# Vault backup integration
+# ------------------------------------------------------------------
+
+class _StubBackup:
+    """Captures schedule_commit calls; lock mirrors VaultBackup's."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.commits: list[tuple[set[str], str, str]] = []
+
+    def schedule_commit(self, paths, trigger: str, response: str) -> None:
+        self.commits.append((set(paths), trigger, response))
+
+
+@pytest.mark.asyncio
+async def test_run_schedules_backup_commit_with_touched_paths(vault: VaultTools) -> None:
+    backup = _StubBackup()
+    agent = Agent(vault_tools=vault, backup=backup)
+    responses = [
+        _make_tool_call_response("create_file", {"path": "notes/x.md", "content": "hi"}),
+        _make_text_response("Done"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="make a note")
+
+    assert backup.commits == [({"notes/x.md"}, "make a note", "Done")]
+
+
+@pytest.mark.asyncio
+async def test_run_without_vault_writes_schedules_no_commit(vault: VaultTools) -> None:
+    backup = _StubBackup()
+    agent = Agent(vault_tools=vault, backup=backup)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("Just chatting"))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="hi")
+
+    assert backup.commits == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_tool_attributes_the_schedule_file(vault: VaultTools) -> None:
+    backup = _StubBackup()
+    agent = Agent(
+        vault_tools=vault,
+        schedule_dispatcher=lambda name, args: "Scheduled.",
+        schedule_schemas=[],
+        backup=backup,
+    )
+    responses = [
+        _make_tool_call_response("schedule", {"prompt": "water plants", "when": "tomorrow"}),
+        _make_text_response("Will do"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="remind me")
+
+    assert backup.commits == [({"system/schedule.md"}, "remind me", "Will do")]
+
+
+@pytest.mark.asyncio
+async def test_mutating_tool_waits_for_backup_lock(vault: VaultTools, tmp_path: Path) -> None:
+    backup = _StubBackup()
+    agent = Agent(vault_tools=vault, backup=backup)
+    responses = [
+        _make_tool_call_response("create_file", {"path": "x.md", "content": "hi"}),
+        _make_text_response("Done"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    async with backup.lock:
+        with patch("assistant.copilot.get_client", return_value=mock_client):
+            run = asyncio.create_task(agent.run(chat_id=1, user_message="write"))
+            await asyncio.sleep(0.05)
+            assert not (tmp_path / "x.md").exists()
+        # Lock released here; the pending write may now proceed.
+    await run
+
+    assert (tmp_path / "x.md").exists()
+
+
+def test_paths_touched_maps_forum_topic_writes() -> None:
+    from assistant.agent import _paths_touched
+
+    assert _paths_touched("create_forum_topic", {"name": "Health & Fitness"}) == {
+        "system/topics/health-fitness/AGENTS.md",
+        "system/topics/index.md",
+    }

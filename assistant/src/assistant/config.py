@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tomllib
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -44,10 +45,20 @@ class Config(BaseSettings):
     state_dir: Path = Path("state")
     history_size: int = 40
 
-    @field_validator("vault_path", "state_dir", mode="before")
+    # Vault backup (optional) — local-only git history of the vault, kept in a
+    # git dir outside it. None means <state_dir>/vault.git.
+    backup_enabled: bool = False
+    backup_git_dir: Path | None = None
+
+    @field_validator("vault_path", "state_dir", "backup_git_dir", mode="before")
     @classmethod
-    def expand_path(cls, v: str | Path) -> Path:
+    def expand_path(cls, v: str | Path | None) -> Path | None:
+        if v is None:
+            return None
         return Path(v).expanduser().resolve()
+
+    def resolved_backup_git_dir(self) -> Path:
+        return self.backup_git_dir or self.state_dir / "vault.git"
 
     def validate_for_run(self) -> None:
         """Check everything the service needs before starting; raise ConfigError listing all problems."""
@@ -84,6 +95,20 @@ class Config(BaseSettings):
                 f"no GitHub OAuth token at {oauth_token} — run `assistant auth` first"
             )
 
+        if self.backup_enabled:
+            if shutil.which("git") is None:
+                problems.append(
+                    "backup.enabled is set but no `git` binary is on PATH — "
+                    "install git or disable the backup"
+                )
+            git_dir = self.resolved_backup_git_dir()
+            if git_dir == self.vault_path or self.vault_path in git_dir.parents:
+                problems.append(
+                    f"backup.git_dir {git_dir} is inside the vault — the git dir "
+                    "must live outside it (a synced vault would corrupt the repo); "
+                    "leave it unset to use <state_dir>/vault.git"
+                )
+
         if problems:
             raise ConfigError(
                 "Not ready to run:\n" + "\n".join(f"  - {p}" for p in problems)
@@ -102,6 +127,8 @@ _TOML_FIELDS = (
     ("assistant", "vault_path", "vault_path"),
     ("assistant", "state_dir", "state_dir"),
     ("assistant", "history_size", "history_size"),
+    ("backup", "enabled", "backup_enabled"),
+    ("backup", "git_dir", "backup_git_dir"),
 )
 
 # Env var → Config field name. Applied after the TOML file so env always wins.
@@ -114,6 +141,8 @@ _ENV_FIELDS = {
     "VAULT_PATH": "vault_path",
     "STATE_DIR": "state_dir",
     "HISTORY_SIZE": "history_size",
+    "BACKUP_ENABLED": "backup_enabled",
+    "BACKUP_GIT_DIR": "backup_git_dir",
 }
 
 

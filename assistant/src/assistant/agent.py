@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import copilot, usage
+from .backup import VaultBackup
 from .skills import SkillLibrary
 from .tools import VaultTools, slug_from_name
 
@@ -87,6 +88,37 @@ def _parse_job_close(reply: str) -> dict[str, Any] | None:
 _TOPIC_INDEX_FILE = "system/topics/index.md"
 _TOPIC_INDEX_HEADER = "| topic_id | slug | name |"
 _TOPIC_INDEX_SEP = "|----------|------|------|"
+
+# Tools that mutate the vault. Their dispatch holds the backup lock (a commit
+# must not snapshot a file mid-write) and their paths are attributed to the
+# run's backup commit.
+_VAULT_MUTATING_TOOLS = frozenset({
+    "create_file",
+    "rewrite_file",
+    "edit_file",
+    "append_file",
+    "schedule",
+    "cancel_scheduled",
+    "create_forum_topic",
+})
+
+
+def _paths_touched(name: str, args: dict[str, Any]) -> set[str]:
+    """Vault paths a tool call may have written, for backup commit attribution.
+
+    Over-reporting is safe — staging an unchanged path is a no-op — so this
+    records what the call *could* touch without checking whether it succeeded.
+    """
+    if name in ("create_file", "rewrite_file", "edit_file", "append_file"):
+        path = args.get("path")
+        return {path} if path else set()
+    if name in ("schedule", "cancel_scheduled"):
+        return {"system/schedule.md"}
+    if name == "create_forum_topic":
+        slug = slug_from_name(args.get("name") or "")
+        if slug:
+            return {f"system/topics/{slug}/AGENTS.md", _TOPIC_INDEX_FILE}
+    return set()
 
 # Shared with fanout.py: workers expose the same research tool to their model.
 RESEARCH_TOOL_SCHEMA: dict[str, Any] = {
@@ -170,6 +202,7 @@ class Agent:
         extract_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         fan_out_fn: Callable[[str, list[str]], Coroutine[Any, Any, str]] | None = None,
         skills: SkillLibrary | None = None,
+        backup: VaultBackup | None = None,
         history_size: int = 40,
         tz_name: str = "UTC",
     ) -> None:
@@ -182,6 +215,7 @@ class Agent:
         self._extract_fn = extract_fn
         self._fan_out_fn = fan_out_fn
         self._skills = skills
+        self._backup = backup
         self._histories: dict[tuple[int, int | None], ConversationHistory] = {}
         # One lock per conversation: concurrent runs for the same
         # (chat_id, thread_id) would interleave appends into one history and
@@ -420,6 +454,19 @@ class Agent:
         args: dict[str, Any],
         send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
     ) -> str:
+        # Vault mutations wait for any in-flight backup commit, so a commit
+        # never snapshots a file mid-write.
+        if self._backup is not None and name in _VAULT_MUTATING_TOOLS:
+            async with self._backup.lock:
+                return await self._dispatch_tool_unlocked(name, args, send_message_fn)
+        return await self._dispatch_tool_unlocked(name, args, send_message_fn)
+
+    async def _dispatch_tool_unlocked(
+        self,
+        name: str,
+        args: dict[str, Any],
+        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+    ) -> str:
         # File tools
         if name in (
             "read_file",
@@ -497,7 +544,7 @@ class Agent:
         """
         lock = self._run_locks.setdefault((chat_id, thread_id), asyncio.Lock())
         async with lock:
-            return await self._run_locked(
+            reply, touched = await self._run_locked(
                 chat_id,
                 user_message,
                 thread_id=thread_id,
@@ -507,6 +554,11 @@ class Agent:
                 send_message_fn=send_message_fn,
                 response_format=response_format,
             )
+        # One commit per interaction, in the background: the reply is not
+        # delayed by git, and the commit message carries the full exchange.
+        if self._backup is not None and touched:
+            self._backup.schedule_commit(touched, trigger=user_message, response=reply)
+        return reply
 
     async def _run_locked(
         self,
@@ -518,9 +570,11 @@ class Agent:
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
         response_format: dict[str, Any] | None = None,
-    ) -> str:
+    ) -> tuple[str, set[str]]:
+        """Returns the final text reply and the vault paths this run touched."""
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
+        touched: set[str] = set()
 
         # Resolve topic slug for thread-specific prompt (if in a forum topic)
         topic_slug: str | None = None
@@ -602,7 +656,7 @@ class Agent:
                         finish_reason,
                         json.dumps(msg, ensure_ascii=False)[:4000],
                     )
-                return msg.get("content") or ""
+                return msg.get("content") or "", touched
 
             # Execute tool calls
             for tc in tool_calls_in_turn:
@@ -612,6 +666,7 @@ class Agent:
                 except json.JSONDecodeError:
                     fn_args = {}
                 total_tool_calls += 1
+                touched |= _paths_touched(fn_name, fn_args)
                 if fn_name == "research" and on_research is not None:
                     try:
                         await on_research()
@@ -639,7 +694,7 @@ class Agent:
 
         # Hit iteration cap
         logger.warning("Agent hit max iterations (%d) for chat_id=%d", _MAX_ITERATIONS, chat_id)
-        return "[Reached maximum tool-call iterations. Please rephrase your request.]"
+        return "[Reached maximum tool-call iterations. Please rephrase your request.]", touched
 
     async def run_job(self, prompt: str) -> None:
         """Run a scheduled-job prompt (chat_id 0, no thread).

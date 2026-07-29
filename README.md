@@ -58,6 +58,7 @@ not a product. There is no multi-tenancy and no web UI.
 | **Bulk fan-out** | One instruction over up to 50 items, processed in parallel by read-only worker sub-agents |
 | **Model switching** | `/model` picker, with the active model shown in the group title |
 | **Usage tracking** | Rolling 7-day token report written to `system/usage.md` |
+| **Vault backup** | Optional local git history: one commit per interaction that changed the vault, with the exchange as the commit message. Never pushes |
 
 ---
 

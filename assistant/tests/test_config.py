@@ -285,3 +285,62 @@ def test_validate_reports_all_problems_at_once(state_dir: Path) -> None:
     assert "allowed_user_ids" in message
     assert "timezone" in message
     assert "assistant auth" in message
+
+
+# ------------------------------------------------------------------
+# Backup
+# ------------------------------------------------------------------
+
+def test_backup_is_disabled_by_default(state_dir: Path) -> None:
+    cfg = _config(state_dir)
+
+    assert cfg.backup_enabled is False
+    assert cfg.backup_git_dir is None
+
+
+def test_backup_toml_section(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        f'[backup]\nenabled = true\ngit_dir = "{tmp_path}/backups/vault.git"\n'
+    )
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.backup_enabled is True
+    assert cfg.backup_git_dir == tmp_path / "backups" / "vault.git"
+
+
+def test_backup_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text("[backup]\nenabled = false\n")
+    monkeypatch.setenv("BACKUP_ENABLED", "true")
+    monkeypatch.setenv("BACKUP_GIT_DIR", str(tmp_path / "elsewhere"))
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.backup_enabled is True
+    assert cfg.backup_git_dir == tmp_path / "elsewhere"
+
+
+def test_validate_rejects_backup_git_dir_inside_the_vault(state_dir: Path) -> None:
+    _write_oauth_token(state_dir)
+    vault = state_dir.parent / "vault"
+    cfg = _config(
+        state_dir,
+        backup_enabled=True,
+        backup_git_dir=vault / ".git",
+    )
+
+    with pytest.raises(ConfigError, match="inside the vault"):
+        cfg.validate_for_run()
+
+
+def test_validate_requires_git_binary_when_backup_enabled(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_oauth_token(state_dir)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    cfg = _config(state_dir, backup_enabled=True)
+
+    with pytest.raises(ConfigError, match="git"):
+        cfg.validate_for_run()

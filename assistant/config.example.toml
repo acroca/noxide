@@ -27,6 +27,15 @@ sonnet = "claude-sonnet-5"
 # web searches in an isolated sub-agent. Leave unset to disable.
 # searxng_url = "http://searxng:8080"
 
+[backup]
+# Optional: local-only git history of the vault. Every interaction that
+# changes the vault becomes one commit whose message carries the exchange;
+# nothing is ever pushed anywhere. The repo lives OUTSIDE the vault (safe for
+# an iCloud/Dropbox-synced vault) — by default in <state_dir>/vault.git.
+# See docs/deployment.md for inspecting history and restoring.
+# enabled = true
+# git_dir = "/path/outside/the/vault/vault.git"
+
 [assistant]
 timezone = "Europe/Madrid"
 history_size = 40

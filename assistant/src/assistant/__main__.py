@@ -50,6 +50,21 @@ async def _run(config_path: Path | None) -> None:
     # Init vault tools
     vault = VaultTools(cfg.vault_path)
 
+    # Vault backup (optional) — local-only git history of the vault, in a git
+    # dir outside it. The startup sweep commits anything from before this boot.
+    backup = None
+    backup_task: asyncio.Task[None] | None = None
+    if cfg.backup_enabled:
+        from .backup import VaultBackup
+
+        backup = VaultBackup(cfg.vault_path, cfg.resolved_backup_git_dir())
+        await backup.init_repo()
+        backup_task = asyncio.create_task(backup.run())
+    else:
+        logging.getLogger(__name__).info(
+            "backup.enabled not set — vault git backup disabled"
+        )
+
     # Voice transcription is optional — enabled when GITHUB_TOKEN is set
     transcriber = Transcriber(cfg.github_token) if cfg.github_token.strip() else None
     if transcriber is None:
@@ -119,6 +134,7 @@ async def _run(config_path: Path | None) -> None:
         extract_fn=extractor.extract,
         fan_out_fn=fan_out.run,
         skills=skills,
+        backup=backup,
         history_size=cfg.history_size,
         tz_name=cfg.timezone,
     )
@@ -148,6 +164,11 @@ async def _run(config_path: Path | None) -> None:
         await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force)
         usage_task.cancel()
         await tracker.drain()
+        # After the drain: every finished run has scheduled its commit by now.
+        if backup is not None:
+            if backup_task is not None:
+                backup_task.cancel()
+            await backup.drain()
 
 
 async def _poll_schedule(scheduler: Any) -> None:

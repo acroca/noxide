@@ -99,6 +99,11 @@ orphan pages, index drift, and scheduled jobs referencing missing files.
 Compile and lint are ordinary scheduled jobs, not built-in machinery — see
 [scheduling](#scheduling) below.
 
+**Backup** — optional but recommended: with `[backup] enabled` the bot keeps a
+local git history of the vault, one commit per interaction that changed it,
+with the exchange in the commit message. History, undo, and disaster recovery
+in one mechanism — see [deployment.md](deployment.md#backups).
+
 ## Starting a vault
 
 `vault.template/` in the repo is a seed, not a working vault: an empty
