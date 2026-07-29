@@ -373,6 +373,104 @@ async def test_chat_response_includes_model(auth: CopilotAuth, state_dir: Path) 
     assert result["model"] == "test-model"  # _chat_client constructs with model="test-model"
 
 
+# ------------------------------------------------------------------
+# response_format gating on /models capability
+# ------------------------------------------------------------------
+
+_TEXT_CHUNKS = [
+    {"choices": [{"delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]},
+]
+
+_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "job_close", "strict": True, "schema": {"type": "object"}},
+}
+
+
+def _models_payload(structured_outputs: bool | None) -> dict:
+    return {"data": [{
+        "id": "test-model",
+        "capabilities": {"supports": {"structured_outputs": structured_outputs}},
+    }]}
+
+
+@pytest.mark.asyncio
+async def test_chat_sends_response_format_when_model_supports_it(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """Capabilities are fetched once and cached; the schema rides the payload."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(200, _models_payload(True)))
+    mock_client.stream = MagicMock(
+        side_effect=lambda *a, **k: _stream_cm(200, _sse_lines(_TEXT_CHUNKS))
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        client = _chat_client(auth)
+        await client.chat(
+            [{"role": "user", "content": "hi"}], response_format=_RESPONSE_FORMAT
+        )
+        await client.chat(
+            [{"role": "user", "content": "hi"}], response_format=_RESPONSE_FORMAT
+        )
+
+    for call in mock_client.stream.call_args_list:
+        assert call.kwargs["json"]["response_format"] == _RESPONSE_FORMAT
+    assert mock_client.get.await_count == 1  # capability map cached
+
+
+@pytest.mark.asyncio
+async def test_chat_drops_response_format_when_model_lacks_support(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(200, _models_payload(None)))
+    mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(_TEXT_CHUNKS)))
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await _chat_client(auth).chat(
+            [{"role": "user", "content": "hi"}], response_format=_RESPONSE_FORMAT
+        )
+
+    assert "response_format" not in mock_client.stream.call_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_chat_drops_response_format_when_capability_fetch_fails(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """A broken /models endpoint must degrade to prompt-only, not break chat."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(500))
+    mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(_TEXT_CHUNKS)))
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        result = await _chat_client(auth).chat(
+            [{"role": "user", "content": "hi"}], response_format=_RESPONSE_FORMAT
+        )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert "response_format" not in mock_client.stream.call_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_chat_skips_capability_fetch_without_response_format(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """Plain chat runs must not pay a /models round-trip."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(_TEXT_CHUNKS)))
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+
+    mock_client.get.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_chat_marks_user_initiated_requests(auth: CopilotAuth, state_dir: Path) -> None:
     """A request ending with a user message is user-initiated (counts as a premium request)."""

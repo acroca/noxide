@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Coroutine
@@ -34,6 +35,54 @@ _TOOL_TIMEOUTS = {
 # A scheduled run replies with this sentinel (prompts/schedule.md) when it
 # finds its purpose already met; run_job then delivers nothing.
 _SILENT_SENTINEL = "[silent]"
+
+# Scheduled runs close with a JSON object matching this schema (the contract
+# in prompts/schedule.md). It also rides job-run requests as response_format:
+# Copilot currently ignores it (verified 2026-07-29 — accepted, not enforced,
+# for every model the bot can use), so the tolerant parse in run_job is the
+# real mechanism; if the endpoint ever starts enforcing it, conformance
+# arrives with no code change here.
+_JOB_CLOSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "silent": {"type": "boolean"},
+        "message": {"type": ["string", "null"]},
+    },
+    "required": ["silent", "message"],
+    "additionalProperties": False,
+}
+_JOB_CLOSE_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {"name": "job_close", "strict": True, "schema": _JOB_CLOSE_SCHEMA},
+}
+
+
+def _parse_job_close(reply: str) -> dict[str, Any] | None:
+    """Parse a scheduled run's closing reply against ``_JOB_CLOSE_SCHEMA``.
+
+    Tolerant on purpose — without API enforcement the object may arrive
+    fenced or wrapped in prose. A missing ``message`` is treated as null.
+    Returns None when no conforming object is found; run_job then falls back
+    to the legacy sentinel rules.
+    """
+    text = reply.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
+    candidates = [text]
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("silent"), bool):
+            continue
+        message = data.get("message")
+        if message is None or isinstance(message, str):
+            return {"silent": data["silent"], "message": message}
+    return None
 
 _TOPIC_INDEX_FILE = "system/topics/index.md"
 _TOPIC_INDEX_HEADER = "| topic_id | slug | name |"
@@ -431,6 +480,7 @@ class Agent:
         image_data_url: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
 
@@ -455,6 +505,7 @@ class Agent:
                 image_data_url=image_data_url,
                 on_research=on_research,
                 send_message_fn=send_message_fn,
+                response_format=response_format,
             )
 
     async def _run_locked(
@@ -466,6 +517,7 @@ class Agent:
         image_data_url: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
@@ -512,7 +564,7 @@ class Agent:
                     multimodal_entry if m is user_entry else m for m in turn_messages
                 ]
             messages = [{"role": "system", "content": system_prompt}] + turn_messages
-            response = await client.chat(messages, tools)
+            response = await client.chat(messages, tools, response_format=response_format)
 
             choice = response["choices"][0]
             msg = choice["message"]
@@ -592,12 +644,14 @@ class Agent:
     async def run_job(self, prompt: str) -> None:
         """Run a scheduled-job prompt (chat_id 0, no thread).
 
-        The model normally delivers the result itself via the send_message
-        tool and then closes its turn with a short confirmation; forwarding
-        that closing text would duplicate the message. The final reply is
-        sent only when the run delivered nothing — unless it starts with the
-        [silent] sentinel, which is how a job whose purpose turned out to be
-        already met stands down without messaging the user.
+        The prompt reaches the model tagged ``[scheduled run]``, and the run
+        closes with a JSON object matching ``_JOB_CLOSE_SCHEMA`` (the contract
+        in prompts/schedule.md): silent runs deliver nothing, otherwise the
+        ``message`` field is delivered — unless the run already spoke via the
+        send_message tool, whose messages must not be repeated. A reply that
+        doesn't parse falls back to the legacy rules: a [silent] anywhere in
+        it stands down (models misplace the sentinel), anything else is
+        delivered raw so a reminder is never lost.
         """
         base_send = self._send_message_fn
         delivered = 0
@@ -608,8 +662,20 @@ class Agent:
                 await base_send(text, thread_id)
             delivered += 1
 
-        reply = await self.run(chat_id=0, user_message=prompt, send_message_fn=counting_send)
-        if reply.strip().lower().startswith(_SILENT_SENTINEL):
+        reply = await self.run(
+            chat_id=0,
+            user_message=f"[scheduled run] {prompt}",
+            send_message_fn=counting_send,
+            response_format=_JOB_CLOSE_RESPONSE_FORMAT,
+        )
+        close = _parse_job_close(reply)
+        if close is not None:
+            if close["silent"] or delivered or not close["message"] or base_send is None:
+                return
+            await base_send(close["message"], None)
+            return
+        if _SILENT_SENTINEL in reply.lower():
             return
         if not delivered and reply and base_send:
+            logger.warning("Scheduled run closed without job-close JSON; delivering raw reply")
             await base_send(reply, None)

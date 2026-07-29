@@ -27,6 +27,7 @@ _DEVICE_CODE_URL = "https://github.com/login/device/code"
 _OAUTH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 _COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
 _CHAT_URL = "https://api.githubcopilot.com/chat/completions"
+_MODELS_URL = "https://api.githubcopilot.com/models"
 
 OAUTH_TOKEN_FILENAME = "oauth_token"
 
@@ -287,6 +288,9 @@ class CopilotClient:
     def __init__(self, auth: CopilotAuth, model: str) -> None:
         self._auth = auth
         self._model = model
+        # model id -> whether /models reports structured-output support;
+        # fetched lazily on first use, None until then.
+        self._structured_outputs: dict[str, bool] | None = None
 
     @property
     def model(self) -> str:
@@ -301,6 +305,7 @@ class CopilotClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         initiator: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """POST to chat/completions (streaming); returns an aggregated response dict.
 
@@ -310,6 +315,11 @@ class CopilotClient:
         ``initiator`` overrides the X-Initiator inference — sub-agents whose
         payload ends with a user message but which serve an ongoing user turn
         (research, vision) pass ``"agent"`` explicitly.
+
+        ``response_format`` is included only when /models reports the current
+        model supports structured outputs; callers must not rely on it being
+        enforced (the endpoint accepts and ignores it today) and always parse
+        the reply tolerantly.
         """
         payload: dict[str, Any] = {
             "model": self._model,
@@ -319,6 +329,8 @@ class CopilotClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if response_format and await self._supports_structured_outputs(payload["model"]):
+            payload["response_format"] = response_format
 
         # Copilot bills premium requests only for user-initiated calls; the
         # X-Initiator header marks agent-loop follow-ups (tool results) so
@@ -343,6 +355,42 @@ class CopilotClient:
                 )
                 await asyncio.sleep(delay)
         raise AssertionError("unreachable")
+
+    async def _supports_structured_outputs(self, model: str) -> bool:
+        """Whether /models reports structured-output support for ``model``.
+
+        The capability map is fetched once and cached for the process. A
+        failed fetch caches an empty map: response_format is advisory today,
+        so degrading to prompt-only beats re-hitting a broken endpoint on
+        every request.
+        """
+        if self._structured_outputs is None:
+            self._structured_outputs = await self._fetch_structured_outputs()
+        return self._structured_outputs.get(model, False)
+
+    async def _fetch_structured_outputs(self) -> dict[str, bool]:
+        try:
+            bearer = await self._auth.get_bearer()
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    _MODELS_URL,
+                    headers={**_COPILOT_HEADERS, "Authorization": "Bearer " + bearer},
+                    timeout=15,
+                )
+                r.raise_for_status()
+                data = r.json()
+        except Exception:
+            logger.warning(
+                "Model capability fetch failed; response_format disabled", exc_info=True
+            )
+            return {}
+        return {
+            m["id"]: bool(
+                ((m.get("capabilities") or {}).get("supports") or {}).get("structured_outputs")
+            )
+            for m in data.get("data", [])
+            if m.get("id")
+        }
 
     async def _chat_once(self, payload: dict[str, Any], initiator: str) -> dict[str, Any]:
         bearer = await self._auth.get_bearer()

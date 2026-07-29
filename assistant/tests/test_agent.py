@@ -14,7 +14,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from assistant.agent import Agent, ConversationHistory
+from assistant.agent import (
+    _JOB_CLOSE_RESPONSE_FORMAT,
+    Agent,
+    ConversationHistory,
+    _parse_job_close,
+)
 from assistant.skills import SkillLibrary
 from assistant.tools import VaultTools
 
@@ -1086,6 +1091,170 @@ async def test_run_job_sends_nothing_for_empty_reply(vault: VaultTools) -> None:
         await agent.run_job("Log the weather silently")
 
     assert captured == []
+
+
+# ------------------------------------------------------------------
+# Job-close JSON contract
+# ------------------------------------------------------------------
+
+def test_parse_job_close_plain_object() -> None:
+    assert _parse_job_close('{"silent": true, "message": null}') == {
+        "silent": True, "message": None,
+    }
+
+
+def test_parse_job_close_fenced_object() -> None:
+    reply = '```json\n{"silent": false, "message": "Toma la pastilla"}\n```'
+    assert _parse_job_close(reply) == {"silent": False, "message": "Toma la pastilla"}
+
+
+def test_parse_job_close_object_wrapped_in_prose() -> None:
+    reply = 'Run complete.\n{"silent": true, "message": null}\nBye.'
+    assert _parse_job_close(reply) == {"silent": True, "message": None}
+
+
+def test_parse_job_close_rejects_garbage() -> None:
+    assert _parse_job_close("Ya está registrada (08:19). Reminder resuelto.") is None
+
+
+def test_parse_job_close_rejects_wrong_types() -> None:
+    assert _parse_job_close('{"silent": "yes", "message": null}') is None
+    assert _parse_job_close('{"silent": true, "message": 42}') is None
+    assert _parse_job_close('{"message": "no silent field"}') is None
+
+
+@pytest.mark.asyncio
+async def test_run_job_json_close_silent_suppresses(vault: VaultTools) -> None:
+    captured: list[tuple[str, int | None]] = []
+    agent = _job_agent(vault, captured)
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=_make_text_response('{"silent": true, "message": null}')
+    )
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_run_job_json_close_delivers_message(vault: VaultTools) -> None:
+    """The delivered text is the schema's message field, not the raw reply."""
+    captured: list[tuple[str, int | None]] = []
+    agent = _job_agent(vault, captured)
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=_make_text_response('{"silent": false, "message": "Toma la pastilla"}')
+    )
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+
+    assert captured == [("Toma la pastilla", None)]
+
+
+@pytest.mark.asyncio
+async def test_run_job_json_close_message_dropped_after_send_message(
+    vault: VaultTools,
+) -> None:
+    """A run that already delivered via send_message must not repeat itself."""
+    captured: list[tuple[str, int | None]] = []
+    agent = _job_agent(vault, captured)
+
+    responses = [
+        _make_tool_call_response("send_message", {"text": "Toma la pastilla"}),
+        _make_text_response('{"silent": false, "message": "Toma la pastilla"}'),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+
+    assert captured == [("Toma la pastilla", None)]
+
+
+@pytest.mark.asyncio
+async def test_run_job_sentinel_anywhere_suppresses(vault: VaultTools) -> None:
+    """Legacy fallback: a misplaced [silent] still means stand down (the
+    2026-07-29 bug: 'Ya está registrada (08:19). Reminder resuelto.\\n\\n[silent]'
+    was delivered verbatim because only the prefix was checked)."""
+    captured: list[tuple[str, int | None]] = []
+    agent = _job_agent(vault, captured)
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=_make_text_response(
+            "Ya está registrada (08:19). Reminder resuelto.\n\n[silent]"
+        )
+    )
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_run_job_prefixes_scheduled_run_marker(vault: VaultTools) -> None:
+    """The job prompt reaches the model tagged so the closing contract applies."""
+    captured: list[tuple[str, int | None]] = []
+    agent = _job_agent(vault, captured)
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=_make_text_response('{"silent": true, "message": null}')
+    )
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Log the weather")
+
+    messages = mock_client.chat.call_args.args[0]
+    assert "[scheduled run] Log the weather" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_job_requests_job_close_response_format(vault: VaultTools) -> None:
+    """Job runs ask the API for the schema; enforcement is a no-op today but
+    activates by itself the day Copilot honors response_format."""
+    captured: list[tuple[str, int | None]] = []
+    agent = _job_agent(vault, captured)
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=_make_text_response('{"silent": true, "message": null}')
+    )
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Log the weather")
+
+    assert mock_client.chat.call_args.kwargs["response_format"] == _JOB_CLOSE_RESPONSE_FORMAT
+
+
+@pytest.mark.asyncio
+async def test_run_without_response_format_passes_none(agent: Agent) -> None:
+    """Chat runs are plain text: no response_format on their requests."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("Hola"))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=42, user_message="hi")
+
+    assert mock_client.chat.call_args.kwargs.get("response_format") is None
+
+
+def test_schedule_prompt_states_job_close_contract() -> None:
+    """Drift guard: the prompt must describe the same fields the parser expects
+    and the [scheduled run] marker run_job prepends."""
+    prompt = (
+        Path(__file__).parent.parent / "src" / "assistant" / "prompts" / "schedule.md"
+    ).read_text()
+    assert '"silent"' in prompt
+    assert '"message"' in prompt
+    assert "[scheduled run]" in prompt
 
 
 # ------------------------------------------------------------------
