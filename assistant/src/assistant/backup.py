@@ -100,6 +100,11 @@ class VaultBackup:
         await self._git("config", "user.name", "noxide")
         await self._git("config", "user.email", "noxide@localhost")
         await self._git("config", "commit.gpgsign", "false")
+        # --bare left core.bare=true, which git rejects in combination with
+        # core.worktree — and persisting core.worktree is the documented way
+        # for the user to inspect history without --work-tree on every call.
+        # The bot itself is unaffected either way: it always passes the flag.
+        await self._git("config", "core.bare", "false")
         exclude = self._git_dir / "info" / "exclude"
         exclude.parent.mkdir(exist_ok=True)
         exclude.write_text("".join(f"/{path}\n" for path in _EXCLUDED), encoding="utf-8")

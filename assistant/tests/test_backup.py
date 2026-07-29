@@ -246,3 +246,21 @@ async def test_usage_view_is_excluded_from_backup(
     await backup.sweep()
 
     assert len(_log_messages(git_dir, vault)) == 0
+
+
+async def test_init_repo_supports_persisted_core_worktree_inspection(
+    backup: VaultBackup, vault: Path, git_dir: Path
+) -> None:
+    """The documented Mac-side recipe: set core.worktree once, then plain status works."""
+    (vault / "note.md").write_text("x\n")
+
+    config = _git(git_dir, vault, "config", "core.worktree", str(vault))
+    status = subprocess.run(
+        ["git", "--git-dir", str(git_dir), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert config.returncode == 0
+    assert status.returncode == 0, status.stderr
+    assert "note.md" in status.stdout
