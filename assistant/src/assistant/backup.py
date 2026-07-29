@@ -105,9 +105,17 @@ class VaultBackup:
         # for the user to inspect history without --work-tree on every call.
         # The bot itself is unaffected either way: it always passes the flag.
         await self._git("config", "core.bare", "false")
+        # Append-only: the user may add their own patterns (editor metadata,
+        # Obsidian workspace files, ...) and a restart must not clobber them.
         exclude = self._git_dir / "info" / "exclude"
         exclude.parent.mkdir(exist_ok=True)
-        exclude.write_text("".join(f"/{path}\n" for path in _EXCLUDED), encoding="utf-8")
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        lines = existing.splitlines()
+        missing = [f"/{path}" for path in _EXCLUDED if f"/{path}" not in lines]
+        if missing:
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            exclude.write_text(existing + "".join(f"{m}\n" for m in missing), encoding="utf-8")
         await self.sweep(reason="startup")
 
     async def commit_run(self, paths: Iterable[str], trigger: str, response: str) -> None:

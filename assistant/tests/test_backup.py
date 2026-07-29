@@ -264,3 +264,18 @@ async def test_init_repo_supports_persisted_core_worktree_inspection(
     assert config.returncode == 0
     assert status.returncode == 0, status.stderr
     assert "note.md" in status.stdout
+
+
+async def test_init_repo_preserves_user_added_exclude_lines(
+    vault: Path, git_dir: Path
+) -> None:
+    b = VaultBackup(vault, git_dir)
+    await b.init_repo()
+    exclude = git_dir / "info" / "exclude"
+    exclude.write_text(exclude.read_text() + ".obsidian/workspace*\n")
+
+    await b.init_repo()  # a restart must not clobber the user's line
+
+    text = exclude.read_text()
+    assert ".obsidian/workspace*" in text
+    assert text.count("/system/usage.md") == 1

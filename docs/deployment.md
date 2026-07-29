@@ -264,6 +264,16 @@ host-specific path is fine:
 vgit config core.worktree "$HOME/path/to/vault"
 ```
 
+To keep noisy files out of history (say, Obsidian's ever-churning workspace
+state), add patterns to `vault.git/info/exclude` — same syntax as
+`.gitignore`, but it lives in the git dir so the vault stays free of git
+artifacts. The bot appends its own entries there and preserves yours across
+restarts:
+
+```text
+.obsidian/workspace*
+```
+
 Avoid running your own `git commit` against this repo while the bot is up; a
 held `index.lock` makes the bot skip that backup cycle (the next sweep picks
 the changes up).
