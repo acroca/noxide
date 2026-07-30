@@ -402,8 +402,14 @@ class Scheduler:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "when": {"type": "string"},
-                            "prompt": {"type": "string", "description": "The agent prompt to run at that time"},
+                            "when": {
+                                "type": "string",
+                                "description": "Single-line time expression or cron expression.",
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Single-line agent prompt to run at that time.",
+                            },
                             "recurring": {"type": "boolean", "description": "True for cron, False for one-off"},
                         },
                         "required": ["when", "prompt", "recurring"],
