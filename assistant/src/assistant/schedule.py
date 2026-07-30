@@ -36,22 +36,19 @@ _TABLE_SEP = "|-----|------|-----------|--------|---------|"
 _MISFIRE_GRACE = 12 * 3600  # 12 hours in seconds
 # Cell boundaries are bare pipes; an escaped \| belongs to the prompt text.
 _CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
-_CELL_ESCAPE_RE = re.compile(r"\\([\\|nr])")
 
 
 def _escape_cell(value: str) -> str:
-    """Encode table metacharacters so one value always occupies one cell and row."""
-    return (
-        value.replace("\\", "\\\\")
-        .replace("|", "\\|")
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
-    )
+    """Escape cell delimiters and refuse values that could create another row."""
+    if "\r" in value or "\n" in value:
+        raise ValueError("schedule table cells must be single-line")
+    return value.replace("|", "\\|")
 
 
 def _unescape_cell(value: str) -> str:
-    replacements = {"\\": "\\", "|": "|", "n": "\n", "r": "\r"}
-    return _CELL_ESCAPE_RE.sub(lambda match: replacements[match.group(1)], value)
+    # Pipe escaping predates the strict writer; preserve every other backslash
+    # sequence verbatim so existing prompts such as C:\notes are not corrupted.
+    return value.replace("\\|", "|")
 
 
 class ScheduleEntry:
@@ -332,6 +329,11 @@ class Scheduler:
 
     def schedule(self, when: str, prompt: str, recurring: bool) -> str:
         """Create a new scheduled job. Returns the job id."""
+        if "\r" in when or "\n" in when:
+            return "[error: schedule time must be a single line]"
+        if "\r" in prompt or "\n" in prompt:
+            return "[error: schedule prompt must be a single line]"
+
         job_id = _generate_id()
         now_iso = datetime.now(tz=UTC).isoformat()
 

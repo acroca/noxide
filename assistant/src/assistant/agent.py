@@ -89,21 +89,16 @@ _TOPIC_INDEX_FILE = "system/topics/index.md"
 _TOPIC_INDEX_HEADER = "| topic_id | slug | name |"
 _TOPIC_INDEX_SEP = "|----------|------|------|"
 _TOPIC_CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
-_TOPIC_CELL_ESCAPE_RE = re.compile(r"\\([\\|nr])")
 
 
 def _escape_topic_cell(value: str) -> str:
-    return (
-        value.replace("\\", "\\\\")
-        .replace("|", "\\|")
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
-    )
+    if "\r" in value or "\n" in value:
+        raise ValueError("topic index cells must be single-line")
+    return value.replace("|", "\\|")
 
 
 def _unescape_topic_cell(value: str) -> str:
-    replacements = {"\\": "\\", "|": "|", "n": "\n", "r": "\r"}
-    return _TOPIC_CELL_ESCAPE_RE.sub(lambda match: replacements[match.group(1)], value)
+    return value.replace("\\|", "|")
 
 
 def _topic_row(topic_id: int, slug: str, name: str) -> str:
@@ -470,7 +465,10 @@ class Agent:
                         "properties": {
                             "name": {
                                 "type": "string",
-                                "description": "Display name for the new topic, e.g. 'Health & Fitness'.",
+                                "description": (
+                                    "Single-line display name for the new topic, "
+                                    "e.g. 'Health & Fitness'."
+                                ),
                             },
                         },
                         "required": ["name"],
@@ -533,6 +531,8 @@ class Agent:
         # Create forum topic
         if name == "create_forum_topic" and self._create_forum_topic_fn:
             topic_name: str = args["name"]
+            if "\r" in topic_name or "\n" in topic_name:
+                return "[tool error: topic name must be a single line]"
             forum_topic = await self._create_forum_topic_fn(topic_name)
             thread_id = forum_topic["message_thread_id"]
             slug = slug_from_name(topic_name)

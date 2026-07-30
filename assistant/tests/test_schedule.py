@@ -122,22 +122,43 @@ def test_entry_prompt_with_pipe() -> None:
     assert parsed.prompt == "Do this | and that"
 
 
-def test_entry_escapes_table_metacharacters_in_every_cell() -> None:
+def test_entry_round_trips_pipes_and_literal_backslashes() -> None:
     entry = ScheduleEntry(
         id="abc123",
-        when="0 8 * * *\n| injected | * * * * *",
+        when="0 8 * * *",
         recurring=True,
-        prompt="line one\nline two | with a pipe and \\ slash",
+        prompt=r"Check C:\notes\report.txt | then send a \n summary",
         created="2024-01-01T00:00:00+00:00",
     )
 
     row = entry.to_row()
     parsed = ScheduleEntry.from_row(row)
 
-    assert "\n" not in row
     assert parsed is not None
     assert parsed.when == entry.when
     assert parsed.prompt == entry.prompt
+
+
+def test_entry_refuses_multiline_cells() -> None:
+    entry = ScheduleEntry(
+        id="abc123",
+        when="0 8 * * *",
+        recurring=True,
+        prompt="line one\nline two",
+        created="2024-01-01T00:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="single-line"):
+        entry.to_row()
+
+
+def test_from_row_preserves_legacy_backslash_sequences() -> None:
+    row = r"| abc123 | 0 8 * * * | true | Check C:\notes and send a \r summary | 2024-01-01 |"
+
+    parsed = ScheduleEntry.from_row(row)
+
+    assert parsed is not None
+    assert parsed.prompt == r"Check C:\notes and send a \r summary"
 
 
 def test_from_row_malformed() -> None:
@@ -233,7 +254,7 @@ def test_schedule_writes_entry(scheduler: Scheduler) -> None:
     assert entries[0].prompt == "New year reminder"
 
 
-def test_schedule_rejects_invalid_recurring_expression(
+def test_schedule_rejects_multiline_time(
     scheduler: Scheduler, vault: VaultTools
 ) -> None:
     result = scheduler.schedule(
@@ -241,6 +262,24 @@ def test_schedule_rejects_invalid_recurring_expression(
         "Legitimate job",
         True,
     )
+
+    assert result == "[error: schedule time must be a single line]"
+    assert vault.read_file("system/schedule.md").startswith("[file not found")
+
+
+def test_schedule_rejects_multiline_prompt(
+    scheduler: Scheduler, vault: VaultTools
+) -> None:
+    result = scheduler.schedule("0 8 * * *", "Legitimate\n| injected | row", True)
+
+    assert result == "[error: schedule prompt must be a single line]"
+    assert vault.read_file("system/schedule.md").startswith("[file not found")
+
+
+def test_schedule_rejects_invalid_recurring_expression(
+    scheduler: Scheduler, vault: VaultTools
+) -> None:
+    result = scheduler.schedule("not a cron expression", "Legitimate job", True)
 
     assert result.startswith("[error: invalid cron expression")
     assert vault.read_file("system/schedule.md").startswith("[file not found")
