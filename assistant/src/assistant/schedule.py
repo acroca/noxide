@@ -36,6 +36,22 @@ _TABLE_SEP = "|-----|------|-----------|--------|---------|"
 _MISFIRE_GRACE = 12 * 3600  # 12 hours in seconds
 # Cell boundaries are bare pipes; an escaped \| belongs to the prompt text.
 _CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+_CELL_ESCAPE_RE = re.compile(r"\\([\\|nr])")
+
+
+def _escape_cell(value: str) -> str:
+    """Encode table metacharacters so one value always occupies one cell and row."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+
+
+def _unescape_cell(value: str) -> str:
+    replacements = {"\\": "\\", "|": "|", "n": "\n", "r": "\r"}
+    return _CELL_ESCAPE_RE.sub(lambda match: replacements[match.group(1)], value)
 
 
 class ScheduleEntry:
@@ -57,9 +73,8 @@ class ScheduleEntry:
 
     def to_row(self) -> str:
         rec = "true" if self.recurring else "false"
-        # Escape pipes in prompt
-        prompt_safe = self.prompt.replace("|", "\\|")
-        return f"| {self.id} | {self.when} | {rec} | {prompt_safe} | {self.created} |"
+        cells = (self.id, self.when, rec, self.prompt, self.created)
+        return "| " + " | ".join(_escape_cell(cell) for cell in cells) + " |"
 
     @classmethod
     def from_row(cls, row: str) -> ScheduleEntry | None:
@@ -73,13 +88,11 @@ class ScheduleEntry:
         if cols and not cols[-1]:
             cols.pop()
 
-        if len(cols) < 5:
+        if len(cols) != 5:
             return None
-        id_, when, rec, prompt, created = cols[:5]
+        id_, when, rec, prompt, created = (_unescape_cell(col) for col in cols)
         if not id_ or not when:
             return None
-        # Unescape pipes
-        prompt = prompt.replace("\\|", "|")
         return cls(id=id_, when=when, recurring=(rec.lower() == "true"), prompt=prompt, created=created)
 
 
@@ -329,6 +342,10 @@ class Scheduler:
                 return f"[error: could not parse time: {when!r}]"
             when_stored = dt.isoformat()
         else:
+            try:
+                CronTrigger.from_crontab(when, timezone=self._tz)
+            except ValueError as exc:
+                return f"[error: invalid cron expression {when!r}: {exc}]"
             when_stored = when  # store cron expression as-is
 
         entry = ScheduleEntry(

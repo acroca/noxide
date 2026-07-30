@@ -260,6 +260,16 @@ def test_search_case_insensitive(vault: VaultTools) -> None:
     assert "Hello World" in result
 
 
+def test_search_does_not_follow_symlink_outside_vault(
+    vault: VaultTools, tmp_path: Path
+) -> None:
+    outside = tmp_path.parent / "secret.md"
+    outside.write_text("outside secret")
+    (tmp_path / "linked.md").symlink_to(outside)
+
+    assert vault.search("outside secret") == "[no matches]"
+
+
 # ------------------------------------------------------------------
 # slug_from_name
 # ------------------------------------------------------------------

@@ -215,10 +215,14 @@ class VaultTools:
         results: list[str] = []
         for p in sorted(self._root.rglob("*.md")):
             try:
-                lines = p.read_text(encoding="utf-8").splitlines()
+                resolved = p.resolve()
+                rel = str(resolved.relative_to(self._root))
+            except (OSError, RuntimeError, ValueError):
+                continue
+            try:
+                lines = resolved.read_text(encoding="utf-8").splitlines()
             except OSError:
                 continue
-            rel = str(p.relative_to(self._root))
             for i, line in enumerate(lines, 1):
                 if rx.search(line):
                     results.append(f"{rel}:{i}:{line}")

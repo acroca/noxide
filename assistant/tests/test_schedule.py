@@ -122,8 +122,34 @@ def test_entry_prompt_with_pipe() -> None:
     assert parsed.prompt == "Do this | and that"
 
 
+def test_entry_escapes_table_metacharacters_in_every_cell() -> None:
+    entry = ScheduleEntry(
+        id="abc123",
+        when="0 8 * * *\n| injected | * * * * *",
+        recurring=True,
+        prompt="line one\nline two | with a pipe and \\ slash",
+        created="2024-01-01T00:00:00+00:00",
+    )
+
+    row = entry.to_row()
+    parsed = ScheduleEntry.from_row(row)
+
+    assert "\n" not in row
+    assert parsed is not None
+    assert parsed.when == entry.when
+    assert parsed.prompt == entry.prompt
+
+
 def test_from_row_malformed() -> None:
     result = ScheduleEntry.from_row("| not enough |")
+    assert result is None
+
+
+def test_from_row_rejects_extra_columns() -> None:
+    result = ScheduleEntry.from_row(
+        "| abc123 | 0 8 * * * | true | Brief | 2024-01-01 | injected |"
+    )
+
     assert result is None
 
 
@@ -205,6 +231,19 @@ def test_schedule_writes_entry(scheduler: Scheduler) -> None:
     entries = scheduler._read_entries()
     assert len(entries) == 1
     assert entries[0].prompt == "New year reminder"
+
+
+def test_schedule_rejects_invalid_recurring_expression(
+    scheduler: Scheduler, vault: VaultTools
+) -> None:
+    result = scheduler.schedule(
+        "0 8 * * *\n| injected | * * * * * | true | hidden job | 2024-01-01",
+        "Legitimate job",
+        True,
+    )
+
+    assert result.startswith("[error: invalid cron expression")
+    assert vault.read_file("system/schedule.md").startswith("[file not found")
 
 
 def test_schedule_roundtrip_multiple(scheduler: Scheduler) -> None:

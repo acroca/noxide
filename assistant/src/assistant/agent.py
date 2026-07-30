@@ -88,6 +88,42 @@ def _parse_job_close(reply: str) -> dict[str, Any] | None:
 _TOPIC_INDEX_FILE = "system/topics/index.md"
 _TOPIC_INDEX_HEADER = "| topic_id | slug | name |"
 _TOPIC_INDEX_SEP = "|----------|------|------|"
+_TOPIC_CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+_TOPIC_CELL_ESCAPE_RE = re.compile(r"\\([\\|nr])")
+
+
+def _escape_topic_cell(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+
+
+def _unescape_topic_cell(value: str) -> str:
+    replacements = {"\\": "\\", "|": "|", "n": "\n", "r": "\r"}
+    return _TOPIC_CELL_ESCAPE_RE.sub(lambda match: replacements[match.group(1)], value)
+
+
+def _topic_row(topic_id: int, slug: str, name: str) -> str:
+    cells = (str(topic_id), slug, name)
+    return "| " + " | ".join(_escape_topic_cell(cell) for cell in cells) + " |"
+
+
+def _parse_topic_row(row: str) -> tuple[int, str, str] | None:
+    cols = [col.strip() for col in _TOPIC_CELL_SPLIT_RE.split(row.strip())]
+    if cols and not cols[0]:
+        cols.pop(0)
+    if cols and not cols[-1]:
+        cols.pop()
+    if len(cols) < 3:
+        return None
+    topic_id, slug, name = (_unescape_topic_cell(col) for col in cols[:3])
+    try:
+        return int(topic_id), slug, name
+    except ValueError:
+        return None
 
 # Tools that mutate the vault. Their dispatch holds the backup lock (a commit
 # must not snapshot a file mid-write) and their paths are attributed to the
@@ -292,14 +328,9 @@ class Agent:
             stripped = line.strip()
             if not stripped.startswith("|") or stripped.startswith("| topic_id") or stripped.startswith("|---"):
                 continue
-            parts = [p.strip() for p in stripped.strip("|").split("|")]
-            if len(parts) >= 3:
-                try:
-                    tid = int(parts[0])
-                except ValueError:
-                    continue
-                if tid == thread_id:
-                    return parts[1], parts[2]
+            parsed = _parse_topic_row(stripped)
+            if parsed and parsed[0] == thread_id:
+                return parsed[1], parsed[2]
         return None, None
 
     def _register_topic(self, topic_id: int, slug: str, name: str) -> None:
@@ -311,7 +342,7 @@ class Agent:
                 "# Topic Index\n",
                 _TOPIC_INDEX_HEADER,
                 _TOPIC_INDEX_SEP,
-                f"| {topic_id} | {slug} | {name} |",
+                _topic_row(topic_id, slug, name),
                 "",
             ]
             self._vault.write_file(_TOPIC_INDEX_FILE, "\n".join(lines))
@@ -323,16 +354,16 @@ class Agent:
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("|") and not stripped.startswith("| topic_id") and not stripped.startswith("|---"):
-                parts = [p.strip() for p in stripped.strip("|").split("|")]
-                if parts and parts[0].isdigit() and int(parts[0]) == topic_id:
+                parsed = _parse_topic_row(stripped)
+                if parsed and parsed[0] == topic_id:
                     found = True
-                    new_rows.append(f"| {topic_id} | {slug} | {name} |")
+                    new_rows.append(_topic_row(topic_id, slug, name))
                     continue
             new_rows.append(line)
 
         if not found:
             # Find last data row and append after it
-            new_rows.append(f"| {topic_id} | {slug} | {name} |")
+            new_rows.append(_topic_row(topic_id, slug, name))
 
         self._vault.write_file(_TOPIC_INDEX_FILE, "\n".join(new_rows) + "\n")
 

@@ -716,6 +716,18 @@ async def test_agent_register_topic_appends_to_existing_index(vault: VaultTools)
     assert "second" in index
 
 
+def test_agent_register_topic_escapes_table_metacharacters(vault: VaultTools) -> None:
+    agent = Agent(vault_tools=vault)
+    name = "Plans | Notes\n2026"
+
+    agent._register_topic(123, "plans-notes-2026", name)
+
+    index = vault.read_file("system/topics/index.md")
+    data_rows = [line for line in index.splitlines() if line.startswith("| 123")]
+    assert len(data_rows) == 1
+    assert agent._resolve_topic_slug(123) == ("plans-notes-2026", name)
+
+
 @pytest.mark.asyncio
 async def test_agent_create_forum_topic_tool(vault: VaultTools) -> None:
     """create_forum_topic tool creates vault dirs and registers topic."""
