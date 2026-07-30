@@ -30,6 +30,7 @@ them.
 ```
 vault/
   AGENTS.md                    ← who you are, what language to use, local conventions
+  inbox.md                     ← offline capture: write here while the bot is down
   attachments/                 ← incoming photos and files, saved as-is
   raw/
     journal/YYYY-MM-DD.md      ← append-only event log, one file per day
@@ -103,6 +104,17 @@ Compile and lint are ordinary scheduled jobs, not built-in machinery — see
 local git history of the vault, one commit per interaction that changed it,
 with the exchange in the commit message. History, undo, and disaster recovery
 in one mechanism — see [deployment.md](deployment.md#backups).
+
+**Offline capture** — when the bot is down but the vault is reachable (on the
+host, or through your sync), write into `inbox.md` at the vault root:
+free-form entries, one per paragraph or bullet, an ISO date/time up front when
+the timing matters. At the next startup the bot processes every entry as if
+you had texted it — notes journaled and filed, reminders scheduled, questions
+answered — then clears the processed content and messages you what it did.
+Entries added while it was ingesting are kept for the next round, a failed run
+leaves the file untouched so nothing is lost, and with backup enabled the raw
+file is committed to history before anything clears it. While the bot is
+running, "process the inbox" in chat does the same on demand.
 
 ## Starting a vault
 

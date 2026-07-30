@@ -155,10 +155,23 @@ async def _run(config_path: Path | None) -> None:
     lifecycle = Lifecycle()
     lifecycle.install()
     await bot.start()
+
+    # Ingest offline captures from inbox.md. Ordering matters: the backup's
+    # startup sweep (init_repo above) has already committed the pre-boot file,
+    # the scheduler is up so entries can create reminders, and the bot is up
+    # so the summary can be delivered. Cancelled mid-run, the file is left
+    # untouched and the next startup retries.
+    from .inbox import ingest as ingest_inbox
+
+    inbox_task = asyncio.create_task(
+        ingest_inbox(cfg.vault_path, run_job, lock=backup.lock if backup else None)
+    )
+
     try:
         await lifecycle.wait()
     finally:
         lifecycle.remove()
+        inbox_task.cancel()
         # Stop reloading schedule.md so it cannot register jobs mid-shutdown
         poll_task.cancel()
         await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force)

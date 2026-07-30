@@ -23,6 +23,8 @@ The caption drives intent. If an attachment is worth keeping, link it from the r
 
 Use plain markdown only in vault files: no HTML, no LaTeX, relative links only.
 
+`inbox.md` at the vault root is the user's offline capture file: entries written there while you were unreachable are ingested automatically at the next startup. When the user asks you to process the inbox, read `inbox.md`, handle each entry as if it had just been sent as a message, then empty the file.
+
 ## Chat discipline
 
 Replies are read on a phone: quick feedback, low reading.

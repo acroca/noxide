@@ -59,6 +59,7 @@ not a product. There is no multi-tenancy and no web UI.
 | **Model switching** | `/model` picker, with the active model shown in the group title |
 | **Usage tracking** | Rolling 7-day token report written to `system/usage.md` |
 | **Vault backup** | Optional local git history: one commit per interaction that changed the vault, with the exchange as the commit message. Never pushes |
+| **Offline inbox** | Bot down? Write into `inbox.md` in the vault; at the next startup every entry is processed as if you had texted it |
 
 ---
 
