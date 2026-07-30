@@ -84,6 +84,8 @@ def _update(
     msg.video = video
     msg.chat_id = 777
     msg.message_thread_id = None
+    msg.migrate_to_chat_id = None
+    msg.migrate_from_chat_id = None
     msg.reply_to_message = reply_to
     msg.quote = quote
     msg.reply_text = AsyncMock()
@@ -700,6 +702,69 @@ async def test_chat_id_is_persisted_after_message(tmp_path: Path) -> None:
     await bot._handle_message(update, ctx)
 
     assert (tmp_path / "chat_id").read_text() == "777"
+
+
+async def test_pinned_chat_id_is_not_retargeted_by_later_messages(tmp_path: Path) -> None:
+    (tmp_path / "chat_id").write_text("555")
+    agent = MagicMock()
+    agent.run = AsyncMock(return_value="agent reply")
+    bot = TelegramBot(
+        token="tg-token",
+        allowed_user_ids=[_USER_ID],
+        agent=agent,
+        state_dir=tmp_path,
+    )
+    update, ctx = _update(text="hello from another chat")
+
+    await bot._handle_message(update, ctx)
+
+    assert bot._chat_id == 555
+    assert (tmp_path / "chat_id").read_text() == "555"
+    agent.run.assert_awaited_once_with(
+        777, "hello from another chat", thread_id=None, on_research=ANY
+    )
+    assert _replies(update.message) == ["agent reply"]
+
+
+async def test_pinned_chat_id_follows_telegram_migration(tmp_path: Path) -> None:
+    (tmp_path / "chat_id").write_text("777")
+    agent = MagicMock()
+    agent.run = AsyncMock()
+    bot = TelegramBot(
+        token="tg-token",
+        allowed_user_ids=[_USER_ID],
+        agent=agent,
+        state_dir=tmp_path,
+    )
+    update, ctx = _update()
+    update.effective_user = None
+    update.message.migrate_to_chat_id = 888
+
+    await bot._handle_message(update, ctx)
+
+    assert bot._chat_id == 888
+    assert (tmp_path / "chat_id").read_text() == "888"
+    agent.run.assert_not_awaited()
+
+
+async def test_unrelated_telegram_migration_cannot_retarget_home_chat(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "chat_id").write_text("555")
+    bot = TelegramBot(
+        token="tg-token",
+        allowed_user_ids=[_USER_ID],
+        agent=MagicMock(),
+        state_dir=tmp_path,
+    )
+    update, ctx = _update()
+    update.effective_user = None
+    update.message.migrate_to_chat_id = 888
+
+    await bot._handle_message(update, ctx)
+
+    assert bot._chat_id == 555
+    assert (tmp_path / "chat_id").read_text() == "555"
 
 
 def test_chat_id_is_restored_from_state_dir(tmp_path: Path) -> None:

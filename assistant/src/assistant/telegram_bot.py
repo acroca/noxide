@@ -185,14 +185,38 @@ class TelegramBot:
             return None
 
     def _remember_chat_id(self, chat_id: int) -> None:
-        if chat_id == self._chat_id:
+        if self._chat_id is not None:
+            if chat_id != self._chat_id:
+                logger.warning(
+                    "Ignoring chat_id=%d for proactive delivery; home chat_id=%d is pinned",
+                    chat_id,
+                    self._chat_id,
+                )
             return
         self._chat_id = chat_id
+        self._persist_chat_id()
+        logger.info("Pinned proactive delivery to chat_id=%d", chat_id)
+
+    def _migrate_chat_id(self, old_chat_id: int, new_chat_id: int) -> None:
+        """Accept a Telegram-declared migration only for the pinned home chat."""
+        if self._chat_id != old_chat_id:
+            logger.warning(
+                "Ignoring unrelated chat migration %d -> %d; home chat_id=%s",
+                old_chat_id,
+                new_chat_id,
+                self._chat_id,
+            )
+            return
+        self._chat_id = new_chat_id
+        self._persist_chat_id()
+        logger.info("Migrated proactive delivery from chat_id=%d to %d", old_chat_id, new_chat_id)
+
+    def _persist_chat_id(self) -> None:
         if self._state_dir is None:
             return
         path = self._state_dir / _CHAT_ID_FILENAME
         try:
-            path.write_text(str(chat_id))
+            path.write_text(str(self._chat_id))
         except OSError:
             logger.warning("Could not persist chat_id to %s", path, exc_info=True)
 
@@ -342,6 +366,13 @@ class TelegramBot:
         await query.edit_message_text(reply)
 
     async def _handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        if msg.migrate_to_chat_id is not None:
+            self._migrate_chat_id(msg.chat_id, msg.migrate_to_chat_id)
+            return
+        if msg.migrate_from_chat_id is not None:
+            self._migrate_chat_id(msg.migrate_from_chat_id, msg.chat_id)
+            return
         if not self._is_allowed(update):
             return
         self._inflight_updates += 1
