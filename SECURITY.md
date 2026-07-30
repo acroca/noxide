@@ -43,9 +43,12 @@ absolute path. `list_files` re-checks each glob match for the same reason.
 Model-supplied skill slugs are validated against `[a-z0-9-]+` before any path
 join.
 
-**Unauthorized users.** Telegram updates from user ids outside
-`allowed_user_ids` are dropped before any processing, including callback
-queries from inline keyboards.
+**Unauthorized users.** User-generated Telegram updates from ids outside
+`allowed_user_ids` are dropped before processing, including callback queries
+from inline keyboards. The configured or first-learned home chat is pinned, so
+messages in another chat cannot redirect scheduled or proactive output.
+Telegram-declared group migration events are accepted only when they migrate
+that pinned chat.
 
 **Credential exposure in logs.** `httpx` request logging is turned down to
 WARNING at startup, because at INFO it logs full URLs — which for Telegram

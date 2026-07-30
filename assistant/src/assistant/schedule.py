@@ -38,6 +38,19 @@ _MISFIRE_GRACE = 12 * 3600  # 12 hours in seconds
 _CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
 
+def _escape_cell(value: str) -> str:
+    """Escape cell delimiters and refuse values that could create another row."""
+    if "\r" in value or "\n" in value:
+        raise ValueError("schedule table cells must be single-line")
+    return value.replace("|", "\\|")
+
+
+def _unescape_cell(value: str) -> str:
+    # Pipe escaping predates the strict writer; preserve every other backslash
+    # sequence verbatim so existing prompts such as C:\notes are not corrupted.
+    return value.replace("\\|", "|")
+
+
 class ScheduleEntry:
     __slots__ = ("id", "when", "recurring", "prompt", "created")
 
@@ -57,9 +70,8 @@ class ScheduleEntry:
 
     def to_row(self) -> str:
         rec = "true" if self.recurring else "false"
-        # Escape pipes in prompt
-        prompt_safe = self.prompt.replace("|", "\\|")
-        return f"| {self.id} | {self.when} | {rec} | {prompt_safe} | {self.created} |"
+        cells = (self.id, self.when, rec, self.prompt, self.created)
+        return "| " + " | ".join(_escape_cell(cell) for cell in cells) + " |"
 
     @classmethod
     def from_row(cls, row: str) -> ScheduleEntry | None:
@@ -73,13 +85,11 @@ class ScheduleEntry:
         if cols and not cols[-1]:
             cols.pop()
 
-        if len(cols) < 5:
+        if len(cols) != 5:
             return None
-        id_, when, rec, prompt, created = cols[:5]
+        id_, when, rec, prompt, created = (_unescape_cell(col) for col in cols)
         if not id_ or not when:
             return None
-        # Unescape pipes
-        prompt = prompt.replace("\\|", "|")
         return cls(id=id_, when=when, recurring=(rec.lower() == "true"), prompt=prompt, created=created)
 
 
@@ -319,6 +329,11 @@ class Scheduler:
 
     def schedule(self, when: str, prompt: str, recurring: bool) -> str:
         """Create a new scheduled job. Returns the job id."""
+        if "\r" in when or "\n" in when:
+            return "[error: schedule time must be a single line]"
+        if "\r" in prompt or "\n" in prompt:
+            return "[error: schedule prompt must be a single line]"
+
         job_id = _generate_id()
         now_iso = datetime.now(tz=UTC).isoformat()
 
@@ -329,6 +344,10 @@ class Scheduler:
                 return f"[error: could not parse time: {when!r}]"
             when_stored = dt.isoformat()
         else:
+            try:
+                CronTrigger.from_crontab(when, timezone=self._tz)
+            except ValueError as exc:
+                return f"[error: invalid cron expression {when!r}: {exc}]"
             when_stored = when  # store cron expression as-is
 
         entry = ScheduleEntry(
@@ -383,8 +402,14 @@ class Scheduler:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "when": {"type": "string"},
-                            "prompt": {"type": "string", "description": "The agent prompt to run at that time"},
+                            "when": {
+                                "type": "string",
+                                "description": "Single-line time expression or cron expression.",
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Single-line agent prompt to run at that time.",
+                            },
                             "recurring": {"type": "boolean", "description": "True for cron, False for one-off"},
                         },
                         "required": ["when", "prompt", "recurring"],

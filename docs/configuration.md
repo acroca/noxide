@@ -26,7 +26,7 @@ start one.
 |---|---|---|---|
 | `telegram.bot_token` | `TELEGRAM_BOT_TOKEN` | — | **Required.** From [@BotFather](https://t.me/BotFather) |
 | `telegram.allowed_user_ids` | `ALLOWED_USER_IDS` | — | **Required.** Telegram user ids allowed to talk to the bot. TOML takes an array (`[123, 456]`), the env var a comma-separated list (`123,456`). Everyone else is silently ignored |
-| `telegram.default_chat_id` | `DEFAULT_CHAT_ID` | unset | Chat for proactive sends (startup notices, scheduled jobs) before the bot has learned one from an incoming message. For a direct chat this is your own user id. Once a message arrives, the learned id is persisted to `state/chat_id` and wins |
+| `telegram.default_chat_id` | `DEFAULT_CHAT_ID` | unset | Home chat for proactive sends (startup notices, scheduled jobs). Persisted state, then this value, then the first incoming message establishes it; messages in other chats cannot retarget it. For a direct chat this is your own user id |
 | `copilot.default_model` | `DEFAULT_MODEL` | `sonnet` | Which alias from `copilot.models` to start with. Must be a key of that table |
 | `copilot.models` | — | `{sonnet = "claude-sonnet-5"}` | Alias → model id map, offered by `/model`. File-only: defining extra models needs a mounted `config.toml` |
 | — | `GITHUB_TOKEN` | unset | Fine-grained PAT with `models: read`, enabling voice transcription. Env-only, deliberately: it is a credential, not configuration |
@@ -39,6 +39,8 @@ start one.
 | `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
 
 Paths are expanded and resolved, so `~/vault` and relative paths both work.
+To intentionally move proactive delivery, stop the bot, delete
+`state_dir/chat_id`, update `default_chat_id` if it is set, and restart.
 
 ## Startup validation
 

@@ -716,6 +716,58 @@ async def test_agent_register_topic_appends_to_existing_index(vault: VaultTools)
     assert "second" in index
 
 
+def test_agent_register_topic_escapes_pipes_and_preserves_backslashes(
+    vault: VaultTools,
+) -> None:
+    agent = Agent(vault_tools=vault)
+    name = r"Plans | C:\notes"
+
+    agent._register_topic(123, "plans-notes", name)
+
+    index = vault.read_file("system/topics/index.md")
+    data_rows = [line for line in index.splitlines() if line.startswith("| 123")]
+    assert len(data_rows) == 1
+    assert agent._resolve_topic_slug(123) == ("plans-notes", name)
+
+
+def test_agent_register_topic_refuses_multiline_name(vault: VaultTools) -> None:
+    agent = Agent(vault_tools=vault)
+
+    with pytest.raises(ValueError, match="single-line"):
+        agent._register_topic(123, "plans", "Plans\n| 999 | injected | row")
+
+    assert vault.read_file("system/topics/index.md").startswith("[file not found")
+
+
+def test_resolve_topic_slug_preserves_legacy_backslashes(vault: VaultTools) -> None:
+    vault.write_file(
+        "system/topics/index.md",
+        "# Topic Index\n\n"
+        "| topic_id | slug | name |\n"
+        "|----------|------|------|\n"
+        r"| 123 | plans | Plans C:\notes |" + "\n",
+    )
+
+    assert Agent(vault_tools=vault)._resolve_topic_slug(123) == (
+        "plans",
+        r"Plans C:\notes",
+    )
+
+
+async def test_create_forum_topic_rejects_multiline_name_before_api_call(
+    vault: VaultTools,
+) -> None:
+    create_fn = AsyncMock()
+    agent = Agent(vault_tools=vault, create_forum_topic_fn=create_fn)
+
+    result = await agent._dispatch_tool(
+        "create_forum_topic", {"name": "Plans\n| 999 | injected | row"}
+    )
+
+    assert result == "[tool error: topic name must be a single line]"
+    create_fn.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_agent_create_forum_topic_tool(vault: VaultTools) -> None:
     """create_forum_topic tool creates vault dirs and registers topic."""
