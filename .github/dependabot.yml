@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # Python dependencies of the assistant (uv-managed: pyproject.toml + uv.lock)
+  - package-ecosystem: "uv"
+    directory: "/assistant"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # One weekly PR for all minor/patch bumps; majors arrive as separate PRs
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # SHA-pinned actions in .github/workflows (Dependabot keeps the version comments in sync)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+
+  # Base image of the assistant's Dockerfile
+  - package-ecosystem: "docker"
+    directory: "/assistant"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
