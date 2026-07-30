@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +12,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from assistant.agent import MAX_ITERATIONS_REPLY
+from assistant.backup import VaultBackup
 from assistant.inbox import INBOX_FILENAME, clear_processed, ingest, read_inbox
 
 
@@ -147,16 +150,97 @@ async def test_ingest_leaves_file_untouched_when_the_run_fails(vault: Path) -> N
     assert _inbox(vault).read_text(encoding="utf-8") == "entry\n"
 
 
-async def test_ingest_clears_only_under_the_lock(vault: Path) -> None:
+async def test_ingest_leaves_file_when_the_run_hits_the_iteration_cap(vault: Path) -> None:
     _inbox(vault).write_text("entry\n", encoding="utf-8")
-    lock = asyncio.Lock()
-    await lock.acquire()
 
-    task = asyncio.create_task(ingest(vault, RecordingJob(), lock=lock))
+    async def capped_job(prompt: str) -> str:
+        return MAX_ITERATIONS_REPLY
+
+    await ingest(vault, capped_job)
+
+    assert _inbox(vault).read_text(encoding="utf-8") == "entry\n"
+
+
+async def test_ingest_survives_an_unreadable_inbox(vault: Path) -> None:
+    _inbox(vault).write_bytes(b"\xff\xfe not utf-8")
+    job = RecordingJob()
+
+    await ingest(vault, job)  # must not raise out of the background task
+
+    assert job.prompts == []
+    assert _inbox(vault).read_bytes() == b"\xff\xfe not utf-8"
+
+
+async def test_ingest_cancelled_mid_run_leaves_the_file(vault: Path) -> None:
+    _inbox(vault).write_text("entry\n", encoding="utf-8")
+    started = asyncio.Event()
+
+    async def hanging_job(prompt: str) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(ingest(vault, hanging_job))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _inbox(vault).read_text(encoding="utf-8") == "entry\n"
+
+
+async def test_ingest_leaves_a_rewritten_file_for_the_next_startup(vault: Path) -> None:
+    _inbox(vault).write_text("entry\n", encoding="utf-8")
+
+    def rewrite() -> None:
+        _inbox(vault).write_text("rewritten while running\n", encoding="utf-8")
+
+    await ingest(vault, RecordingJob(side_effect=rewrite))
+
+    assert _inbox(vault).read_text(encoding="utf-8") == "rewritten while running\n"
+
+
+@pytest.fixture
+async def backup(vault: Path, tmp_path: Path) -> VaultBackup:
+    b = VaultBackup(vault, tmp_path / "state" / "vault.git")
+    await b.init_repo()
+    return b
+
+
+def _head_inbox(backup_git_dir: Path, vault: Path) -> str:
+    """Content of inbox.md in the backup repo's HEAD commit."""
+    result = subprocess.run(
+        ["git", "--git-dir", str(backup_git_dir), "--work-tree", str(vault),
+         "show", f"HEAD:{INBOX_FILENAME}"],
+        capture_output=True,
+        text=True,
+        cwd=vault,
+    )
+    return result.stdout
+
+
+async def test_ingest_commits_the_snapshot_to_backup_before_clearing(
+    vault: Path, backup: VaultBackup, tmp_path: Path
+) -> None:
+    # Written after init_repo's startup sweep, so only ingest can preserve it.
+    _inbox(vault).write_text("entry\n", encoding="utf-8")
+
+    await ingest(vault, RecordingJob(), backup=backup)
+
+    assert _inbox(vault).read_text(encoding="utf-8") == ""
+    assert _head_inbox(tmp_path / "state" / "vault.git", vault) == "entry\n"
+
+
+async def test_ingest_clears_only_under_the_backup_lock(
+    vault: Path, backup: VaultBackup
+) -> None:
+    _inbox(vault).write_text("entry\n", encoding="utf-8")
+    await backup.lock.acquire()
+
+    task = asyncio.create_task(ingest(vault, RecordingJob(), backup=backup))
     for _ in range(10):
         await asyncio.sleep(0)
     assert _inbox(vault).read_text(encoding="utf-8") == "entry\n"
 
-    lock.release()
+    backup.lock.release()
     await task
     assert _inbox(vault).read_text(encoding="utf-8") == ""

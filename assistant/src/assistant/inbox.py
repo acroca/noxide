@@ -14,9 +14,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .agent import MAX_ITERATIONS_REPLY
+
+if TYPE_CHECKING:
+    from .backup import VaultBackup
 
 logger = logging.getLogger(__name__)
 
@@ -61,36 +67,76 @@ def clear_processed(vault_path: Path, snapshot: str) -> str:
     except FileNotFoundError:
         return "left"
     if current == snapshot:
-        path.write_text("", encoding="utf-8")
+        _replace_content(path, "")
         return "cleared"
     if current.startswith(snapshot):
-        path.write_text(current[len(snapshot) :], encoding="utf-8")
+        _replace_content(path, current[len(snapshot) :])
         return "trimmed"
     return "left"
 
 
+def _replace_content(path: Path, text: str) -> None:
+    """Atomic rewrite — a crash mid-clear must not delete unprocessed entries."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 async def ingest(
     vault_path: Path,
-    run_job_fn: Callable[[str], Coroutine[Any, Any, None]],
-    lock: asyncio.Lock | None = None,
+    run_job_fn: Callable[[str], Coroutine[Any, Any, str | None]],
+    backup: VaultBackup | None = None,
 ) -> None:
     """Process the inbox through one job-style agent run, then clear it.
 
     A failed run leaves the file exactly as it was — the next startup retries.
-    *lock* is the backup's commit lock when backup is enabled, held around the
-    clear so a sweep never snapshots the file mid-write.
+    With *backup* enabled the pre-clear snapshot is committed to the backup
+    repo first — the startup sweep usually already has it, but that sweep can
+    refuse (iCloud eviction placeholders) or fail silently, and the promise is
+    "in history before anything clears it" — and the clear itself runs under
+    the backup lock so a sweep never snapshots the file mid-write.
     """
+    try:
+        await _ingest(vault_path, run_job_fn, backup)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Runs as a fire-and-forget task: an exception escaping here would
+        # surface (at best) as an unretrieved-task warning at GC time.
+        logger.exception("inbox ingestion failed; %s left untouched", INBOX_FILENAME)
+
+
+async def _ingest(
+    vault_path: Path,
+    run_job_fn: Callable[[str], Coroutine[Any, Any, str | None]],
+    backup: VaultBackup | None,
+) -> None:
     snapshot = read_inbox(vault_path)
     if snapshot is None:
         return
     try:
-        await run_job_fn(_PROMPT_TEMPLATE.format(content=snapshot))
+        reply = await run_job_fn(_PROMPT_TEMPLATE.format(content=snapshot))
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("inbox ingestion failed; %s left untouched", INBOX_FILENAME)
         return
-    async with lock if lock is not None else contextlib.nullcontext():
+    # An abandoned run (iteration cap) may have processed only part of the
+    # snapshot — clearing would delete entries no run completed over.
+    if reply == MAX_ITERATIONS_REPLY:
+        logger.warning(
+            "inbox ingestion abandoned at the iteration cap; %s left untouched",
+            INBOX_FILENAME,
+        )
+        return
+    if backup is not None:
+        # Outside the lock: commit_run acquires it internally.
+        await backup.commit_run(
+            [INBOX_FILENAME],
+            trigger="inbox ingestion",
+            response="pre-clear snapshot, committed before the processed entries are cleared",
+        )
+    async with backup.lock if backup is not None else contextlib.nullcontext():
         outcome = clear_processed(vault_path, snapshot)
     if outcome == "left":
         logger.warning(

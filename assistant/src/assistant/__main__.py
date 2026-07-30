@@ -164,7 +164,7 @@ async def _run(config_path: Path | None) -> None:
     from .inbox import ingest as ingest_inbox
 
     inbox_task = asyncio.create_task(
-        ingest_inbox(cfg.vault_path, run_job, lock=backup.lock if backup else None)
+        ingest_inbox(cfg.vault_path, agent.run_job, backup=backup)
     )
 
     try:

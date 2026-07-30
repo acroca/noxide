@@ -22,6 +22,10 @@ from .tools import VaultTools, slug_from_name
 logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 20
+# Returned as the run's reply when the loop is abandoned at the iteration cap.
+# Public so callers that must not mistake an abandoned run for a completed one
+# (inbox ingestion clears processed entries) can recognize it.
+MAX_ITERATIONS_REPLY = "[Reached maximum tool-call iterations. Please rephrase your request.]"
 _TOOL_TIMEOUT = 60.0
 # Tools that make their own model calls get longer budgets: research and
 # extraction run one sub-agent/vision call, fan_out runs a whole batch of
@@ -694,9 +698,9 @@ class Agent:
 
         # Hit iteration cap
         logger.warning("Agent hit max iterations (%d) for chat_id=%d", _MAX_ITERATIONS, chat_id)
-        return "[Reached maximum tool-call iterations. Please rephrase your request.]", touched
+        return MAX_ITERATIONS_REPLY, touched
 
-    async def run_job(self, prompt: str) -> None:
+    async def run_job(self, prompt: str) -> str:
         """Run a scheduled-job prompt (chat_id 0, no thread).
 
         The prompt reaches the model tagged ``[scheduled run]``, and the run
@@ -707,6 +711,10 @@ class Agent:
         doesn't parse falls back to the legacy rules: a [silent] anywhere in
         it stands down (models misplace the sentinel), anything else is
         delivered raw so a reminder is never lost.
+
+        Returns the run's raw final reply, so callers that must not mistake
+        an abandoned run for a completed one can check it against
+        ``MAX_ITERATIONS_REPLY`` (inbox ingestion does, before clearing).
         """
         base_send = self._send_message_fn
         delivered = 0
@@ -726,11 +734,12 @@ class Agent:
         close = _parse_job_close(reply)
         if close is not None:
             if close["silent"] or delivered or not close["message"] or base_send is None:
-                return
+                return reply
             await base_send(close["message"], None)
-            return
+            return reply
         if _SILENT_SENTINEL in reply.lower():
-            return
+            return reply
         if not delivered and reply and base_send:
             logger.warning("Scheduled run closed without job-close JSON; delivering raw reply")
             await base_send(reply, None)
+        return reply
