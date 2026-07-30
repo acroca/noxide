@@ -1,4 +1,4 @@
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 
 # uv is only needed to build the venv; it stays out of the final image
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -15,7 +15,7 @@ COPY src/ ./src/
 RUN uv sync --frozen --no-dev --no-editable
 
 
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 # ffmpeg converts Telegram voice notes (OGG/Opus) to MP3 for transcription.
 # A static binary instead of Debian's ffmpeg package, whose dependency
