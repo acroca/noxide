@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import logging
 import mimetypes
 import time
@@ -11,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ReactionEmoji
-from telegram.error import RetryAfter
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,7 +26,7 @@ from telegram.ext import (
 from .transcribe import TranscriptionError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from telegram import Message
@@ -47,6 +49,40 @@ _MODEL_CB_PREFIX = "model:"
 # so 👀 marks messages that triggered a web search
 _SEARCH_REACTION = ReactionEmoji.EYES
 _REPLY_QUOTE_MAX_CHARS = 300
+# Startup backoff while Telegram is unreachable. A host reboot can leave DNS
+# down for minutes after the container starts; crashing on the first failed
+# call just turns that into a crash-loop, so startup waits the outage out.
+_STARTUP_RETRY_INITIAL = 1.0
+_STARTUP_RETRY_MAX = 30.0
+
+
+async def _network_retry(
+    action: Callable[[], Awaitable[object]],
+    what: str,
+    abort: asyncio.Event | None,
+) -> bool:
+    """Run one startup Telegram call, retrying while the network is down.
+
+    Retries only NetworkError (TimedOut included) — anything else, like an
+    invalid token, must keep failing fast. Returns True on success, False
+    when ``abort`` was set while waiting.
+    """
+    delay = _STARTUP_RETRY_INITIAL
+    while True:
+        try:
+            await action()
+            return True
+        except NetworkError as exc:
+            logger.warning("%s failed (%s) — retrying in %.0fs", what, exc, delay)
+        if abort is None:
+            await asyncio.sleep(delay)
+        else:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(abort.wait(), timeout=delay)
+            if abort.is_set():
+                logger.info("Shutdown requested — giving up on %s", what)
+                return False
+        delay = min(delay * 2, _STARTUP_RETRY_MAX)
 
 
 def _attachment_ext(file_name: str | None, mime_type: str | None) -> str:
@@ -631,21 +667,36 @@ class TelegramBot:
     # these are the individual steps rather than one run-forever call.
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, abort: asyncio.Event | None = None) -> None:
+        """Initialize and start polling, waiting out network outages.
+
+        ``abort`` (the lifecycle stop event) cuts the waiting short: when it
+        is set, start() returns without polling and the regular shutdown
+        sequence tears down the partially started app — every step already
+        tolerates one that never came up.
+        """
         app = self.build()
-        await app.initialize()
+        if not await _network_retry(app.initialize, "Telegram initialize", abort):
+            return
         # Drop a stale "(alias)" title suffix in case a previous run died while switched
         await self._reconcile_group_title()
         # Declare the command menu (replacing whatever a previous incarnation set);
         # /start stays out of it on purpose
-        await app.bot.set_my_commands(
-            [
-                BotCommand("model", "Pick the model"),
-                BotCommand("clear", "Forget the current conversation"),
-            ]
-        )
+        commands = [
+            BotCommand("model", "Pick the model"),
+            BotCommand("clear", "Forget the current conversation"),
+        ]
+        if not await _network_retry(
+            lambda: app.bot.set_my_commands(commands), "Command menu registration", abort
+        ):
+            return
         await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            # the polling loop retries outages forever once running; the
+            # bootstrap phase (delete_webhook) must do the same
+            bootstrap_retries=-1,
+        )
         logger.info("Telegram bot started (long polling)")
         await self.notify_lifecycle("Started")
 

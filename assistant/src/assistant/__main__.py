@@ -154,7 +154,9 @@ async def _run(config_path: Path | None) -> None:
     # signal abandons it. See lifecycle.py for why the ordering matters.
     lifecycle = Lifecycle()
     lifecycle.install()
-    await bot.start()
+    # The stop event doubles as the abort switch for startup's network
+    # retries, so a SIGTERM during an outage still shuts down promptly.
+    await bot.start(abort=lifecycle.stop)
 
     # Ingest offline captures from inbox.md. Ordering matters: the backup's
     # startup sweep (init_repo above) has already committed the pre-boot file,

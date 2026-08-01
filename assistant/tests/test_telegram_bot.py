@@ -13,7 +13,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from telegram import BotCommand
+from telegram.error import InvalidToken, NetworkError, TimedOut
 
+from assistant import telegram_bot
 from assistant.telegram_bot import TelegramBot
 from assistant.transcribe import TranscriptionError
 
@@ -402,8 +404,7 @@ async def test_photo_without_save_fn_gets_fallback_reply() -> None:
     assert len(_replies(update.message)) == 1
 
 
-async def test_start_registers_model_command_menu() -> None:
-    bot, _ = _bot()
+def _mock_app() -> MagicMock:
     app = MagicMock()
     app.initialize = AsyncMock()
     app.start = AsyncMock()
@@ -412,6 +413,12 @@ async def test_start_registers_model_command_menu() -> None:
     app.updater.start_polling = AsyncMock()
     app.updater.stop = AsyncMock()
     app.bot.set_my_commands = AsyncMock()
+    return app
+
+
+async def test_start_registers_model_command_menu() -> None:
+    bot, _ = _bot()
+    app = _mock_app()
     bot.build = MagicMock(return_value=app)
 
     await bot.start()
@@ -422,6 +429,81 @@ async def test_start_registers_model_command_menu() -> None:
             BotCommand("clear", "Forget the current conversation"),
         ]
     )
+
+
+# ------------------------------------------------------------------
+# Startup network resilience — a host reboot can leave DNS down for
+# minutes; startup must wait it out instead of crash-looping.
+# ------------------------------------------------------------------
+
+
+async def test_start_retries_initialize_while_network_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(telegram_bot, "_STARTUP_RETRY_INITIAL", 0.001)
+    bot, _ = _bot()
+    app = _mock_app()
+    app.initialize = AsyncMock(side_effect=[NetworkError("dns down"), TimedOut(), None])
+    bot.build = MagicMock(return_value=app)
+
+    await bot.start()
+
+    assert app.initialize.await_count == 3
+    app.updater.start_polling.assert_awaited_once()
+
+
+async def test_start_retries_command_menu_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(telegram_bot, "_STARTUP_RETRY_INITIAL", 0.001)
+    bot, _ = _bot()
+    app = _mock_app()
+    app.bot.set_my_commands = AsyncMock(side_effect=[NetworkError("flap"), None])
+    bot.build = MagicMock(return_value=app)
+
+    await bot.start()
+
+    assert app.bot.set_my_commands.await_count == 2
+    app.updater.start_polling.assert_awaited_once()
+
+
+async def test_start_polling_retries_bootstrap_indefinitely() -> None:
+    bot, _ = _bot()
+    app = _mock_app()
+    bot.build = MagicMock(return_value=app)
+
+    await bot.start()
+
+    assert app.updater.start_polling.await_args.kwargs["bootstrap_retries"] == -1
+
+
+async def test_start_gives_up_when_shutdown_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(telegram_bot, "_STARTUP_RETRY_INITIAL", 0.001)
+    bot, _ = _bot()
+    app = _mock_app()
+    app.initialize = AsyncMock(side_effect=NetworkError("dns down"))
+    bot.build = MagicMock(return_value=app)
+    abort = asyncio.Event()
+    abort.set()
+
+    await bot.start(abort=abort)
+
+    app.start.assert_not_awaited()
+    app.updater.start_polling.assert_not_awaited()
+
+
+async def test_start_does_not_retry_non_network_errors() -> None:
+    bot, _ = _bot()
+    app = _mock_app()
+    app.initialize = AsyncMock(side_effect=InvalidToken("bad token"))
+    bot.build = MagicMock(return_value=app)
+
+    with pytest.raises(InvalidToken):
+        await bot.start()
+
+    assert app.initialize.await_count == 1
 
 
 # ------------------------------------------------------------------
