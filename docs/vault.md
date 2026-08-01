@@ -71,7 +71,11 @@ vault/
 - **`now.md` is a copy**, deliberately. It duplicates state owned by other
   pages so that "what do I need to do?" is one read with no queries. The cost is
   that it goes stale the moment a source page changes, which is why keeping it
-  patched is part of every ingest.
+  patched is part of every ingest. Overdue tasks stay listed under Today, with
+  their original due date, until done or rescheduled — a deadline must not fall
+  off the dashboard by passing. A user-declared **Focus** block (current
+  priority plus its next actions) may open Today; it survives the nightly
+  rebuild and only the user creates or clears it.
 
 Everything user-visible can be localized — column headers, section titles, task
 markers. Declare the localized terms in `AGENTS.md` and the bot will match your
@@ -80,10 +84,12 @@ files instead of reverting to the English defaults.
 ## Operations
 
 **Ingest** — the default when a message carries new information. Journal it,
-update the one page that owns the fact, reconcile the now-stale lines in
-`now.md`, check whether a scheduled reminder about it has been made moot, and
-say which files changed. An ingest is not finished when the fact is filed; it
-is finished when no page still shows the old state.
+update the one page that owns the fact, close any open task the message implies
+is done (searching for it — the same task can be tracked on more than one
+page), reconcile the now-stale lines in `now.md`, check whether a scheduled
+reminder about it has been made moot, and say which files changed. An ingest is
+not finished when the fact is filed; it is finished when no page still shows
+the old state.
 
 **Query** — "what do I need to do?" reads `now.md` and answers with today's
 scope only. "Catch me up on X" reads that page's `**Status:**` paragraph.
@@ -91,11 +97,14 @@ Historical questions search the journal and cite dates.
 
 **Compile** — nightly. Re-reads recent journal entries, applies anything ingest
 missed, recomputes every routine's next-due date, rebuilds `now.md` in full,
-reconciles `index.md` against the pages on disk, logs to `log.md`.
+reconciles `index.md` against the pages on disk, logs to `log.md`, and flags
+any task whose deadline lapsed since the previous compile.
 
 **Lint** — weekly. Surfaces projects with no journal mention in 30+ days, tasks
 open 21+ days, contradictions between a page's status and recent entries,
-orphan pages, index drift, and scheduled jobs referencing missing files.
+orphan pages, index drift, scheduled jobs referencing missing files, job
+prompts that restate scheduled-run plumbing, and the same task tracked on more
+than one page.
 
 Compile and lint are ordinary scheduled jobs, not built-in machinery — see
 [scheduling](#scheduling) below.

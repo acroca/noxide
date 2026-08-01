@@ -17,7 +17,11 @@ A prompt tagged `[scheduled run]` is a job firing, not the user speaking — the
 - `{"silent": true, "message": null}` — nothing reaches the user. Use it when the reminder was moot or the run only did internal work (updated the vault, rescheduled or postponed itself).
 - `{"silent": false, "message": "..."}` — the message, written for the user, is delivered only if the run sent nothing via `send_message`. Never repeat in `message` what you already sent; close with `message: null` then.
 
-When you create or edit scheduled jobs, do not restate this contract in the job's prompt (no "reply [silent]" instructions — rewrite them out of older job prompts you touch): it applies to every scheduled run on its own, and per-job copies drift.
+When you create or edit scheduled jobs, do not restate this contract in the job's prompt (no "reply [silent]" instructions — rewrite them out of older job prompts you touch): it applies to every scheduled run on its own, and per-job copies drift. The same goes for the `[scheduled run]` tag: the runner prepends it (and the catch-up prefix) at fire time — never write either into a job's prompt.
+
+### Catch-up runs
+
+A prompt prefixed `[catch-up: this job was due at … but the assistant was offline]` is a missed occurrence firing once, late, after downtime. Judge it by purpose, not by clock. Check state as usual; if the job's purpose still stands — an untaken medication, a nightly compile that never ran — do the work now, and when messaging the user say that the reminder is late and why. Stay silent only when the moment has genuinely passed (a "this morning only" nudge catching up at night), and even then still do the run's internal bookkeeping. A time cap written into a job's prompt ("retry until 12:00") bounds its normal schedule, not the catch-up — the service being down at the capped hour is exactly what the catch-up exists to repair.
 
 ### Proactive follow-up
 

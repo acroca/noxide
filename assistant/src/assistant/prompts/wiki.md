@@ -78,7 +78,9 @@ One table of recurring activities: `| Routine | Frequency | Last done | Next due
 
 ### `wiki/now.md`
 
-Fully materialized dashboard — no queries, just text. Sections: **Today** (events, due/overdue routines, tasks due today), **Upcoming** (dated events and routine due dates), **Waiting** (blocked on someone/something external), **Last 7 days** (one bullet per day, newest first, synthesizing that day's journal).
+Fully materialized dashboard — no queries, just text. Sections: **Today** (events, due/overdue routines, tasks due today — and every overdue task, kept listed with its original `(due YYYY-MM-DD)` until done, rescheduled or explicitly dropped: a task vanishing from the dashboard the day after its deadline passes is how a decision silently expires), **Upcoming** (dated events and routine due dates), **Waiting** (blocked on someone/something external), **Last 7 days** (one bullet per day, newest first, synthesizing that day's journal).
+
+**Today** may open with a **Focus** block: the user's declared current priority, with its next actions copied from the owning project pages. Only an explicit user statement creates, replaces or clears it. The nightly rebuild carries it forward — re-checking its action lines against the owning pages — and never drops or invents one: the declaration itself has no other home in the wiki, so losing the block loses it.
 
 Because it is a *copy* of state owned by other pages, it goes stale the moment one of them changes — an update to a routine, task, event or blocker is only half applied until the matching `now.md` lines are patched too. Rebuilt in full nightly; between rebuilds ingest keeps it current with `edit_file` line patches.
 
@@ -96,11 +98,12 @@ An ingest is not finished when the fact is filed — it is finished when no page
 
 1. **Journal it.** Append to today's journal.
 2. **Update the page that owns the fact.** The project/area page; or `routines.md` (**Last done** + recomputed **Next due**) when a routine is confirmed. New project/area → create the page (with `**Status:**`) and add its `index.md` line. Just this one owning page — sibling pages are not updated unless the fact is literally wrong on them.
-3. **Reconcile `now.md`.** `now.md` duplicates state that lives elsewhere, so step 2 usually leaves a line here stale. Whenever the change touched a routine, a task, an event or a blocker, **read `now.md`** — never decide from memory that it doesn't mention the item — and `edit_file` every line the change falsified. One change can falsify more than one line: a routine just done is typically listed **both** as due under **Today** and by its next-due date under **Upcoming**; a closed task may also sit under **Waiting**. Patch lines in place; never rebuild a section (**Last 7 days** is nightly-only).
-4. **Check for a stale reminder.** If a reminder is noted on the item you touched and the change makes it moot or wrong, cancel it or reschedule it with corrected text.
-5. **Confirm in the reply** which files changed.
+3. **Close what the message implies.** A report of fact often completes an open task without naming it — "I created the template" closes *build the template*; "laptop shipped back" closes the return errand. When the message means something got done, became moot, or came unblocked, `search` for the item instead of trusting the page already in hand: the same task can be tracked on more than one page, and a copy left open elsewhere is exactly the "still shows the old state" this checklist exists to prevent. Close every copy, and fold duplicates into one owning page while you are there.
+4. **Reconcile `now.md`.** `now.md` duplicates state that lives elsewhere, so step 2 usually leaves a line here stale. Whenever the change touched a routine, a task, an event or a blocker, **read `now.md`** — never decide from memory that it doesn't mention the item — and `edit_file` every line the change falsified. One change can falsify more than one line: a routine just done is typically listed **both** as due under **Today** and by its next-due date under **Upcoming**; a closed task may also sit under **Waiting**. Patch lines in place; never rebuild a section (**Last 7 days** is nightly-only).
+5. **Check for a stale reminder.** If a reminder is noted on the item you touched and the change makes it moot or wrong, cancel it or reschedule it with corrected text.
+6. **Confirm in the reply** which files changed.
 
-Surgical, not partial. Keep each write small — `edit_file` line patches, never a wholesale rewrite of `now.md` or `index.md` — but small writes are not a license to skip step 3. The nightly compile is a safety net for what ingest could not know, not a reason to leave behind a line you know is wrong: the user reads `now.md` throughout the day, so a routine that still shows as pending hours after they reported doing it is the failure this step exists to prevent. A read of `now.md` that turns up nothing to fix is a correct ingest, not wasted effort.
+Surgical, not partial. Keep each write small — `edit_file` line patches, never a wholesale rewrite of `now.md` or `index.md` — but small writes are not a license to skip steps 3 and 4. The nightly compile is a safety net for what ingest could not know, not a reason to leave behind a line you know is wrong: the user reads `now.md` throughout the day, so a routine that still shows as pending hours after they reported doing it is the failure this step exists to prevent. A read of `now.md` that turns up nothing to fix is a correct ingest, not wasted effort.
 
 When one destination is clearly the best fit, file there without asking — corrections are cheap. Ask (one short question) only when filing it wrong would actually matter.
 
@@ -117,7 +120,7 @@ When one destination is clearly the best fit, file there without asking — corr
 2. Recompute **Next due** for every routine.
 3. Rebuild `wiki/now.md` in full.
 4. Reconcile `wiki/index.md` against the pages on disk.
-5. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention.
+5. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and a deadline lapsing is the canonical case: flag any task whose due date passed since the previous compile (the date of which is in `wiki/log.md`). Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job.
 
 ### Lint (weekly scheduled job, or on demand)
 
@@ -125,5 +128,7 @@ When one destination is clearly the best fit, file there without asking — corr
 - Tasks open 21+ days → surface them.
 - Contradictions between a page's status and recent journal entries; orphan pages; index drift; schedule jobs referencing missing files.
 - Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
+- Scheduled job prompts (`system/schedule.md` rows) that hand-write the `[scheduled run]` tag or restate the scheduled-run close contract ("reply [silent]" and variants) → rewrite the row's prompt without them.
+- The same task tracked on more than one page → close or consolidate to one owning page.
 - Non-ISO dates in `wiki/` — day/month forms, month names, relative dates (`tomorrow`, `next Sunday`), weekday labels outside `now.md` → rewrite to `YYYY-MM-DD`. Skip `wiki/log.md`, which is append-only like the journal. Then check every weekday label that legitimately remains against the date beside it, and every relative date for having gone stale; both are how a wrong day survives in the wiki.
 - Apply safe fixes, append a lint entry to `wiki/log.md`, and message findings — stay silent if everything is clean.
