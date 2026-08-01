@@ -168,7 +168,7 @@ def test_from_row_malformed() -> None:
 
 def test_from_row_rejects_extra_columns() -> None:
     result = ScheduleEntry.from_row(
-        "| abc123 | 0 8 * * * | true | Brief | 2024-01-01 | injected |"
+        "| abc123 | 0 8 * * * | true | Brief | 2024-01-01 | next | injected |"
     )
 
     assert result is None
@@ -500,6 +500,213 @@ def test_reload_survives_an_invalid_cron_expression(
 
     assert "badcron" in caplog.text
     assert "later" in scheduler._entries, "a bad row stopped the rows after it"
+
+
+# ------------------------------------------------------------------
+# Missed-run catch-up: the `next` column
+# ------------------------------------------------------------------
+#
+# Recurring rows carry the next computed occurrence, advanced after each
+# completed run. On startup, a `next` in the past means the service was down
+# when the job was due — catch_up() fires one late run for it.
+
+
+def test_entry_row_roundtrips_next() -> None:
+    entry = ScheduleEntry(
+        id="rec1",
+        when="0 8 * * *",
+        recurring=True,
+        prompt="Morning brief",
+        created="2024-01-01T00:00:00+00:00",
+        next="2026-01-02T08:00:00+00:00",
+    )
+    parsed = ScheduleEntry.from_row(entry.to_row())
+    assert parsed is not None
+    assert parsed.next == "2026-01-02T08:00:00+00:00"
+
+
+def test_from_row_accepts_legacy_five_column_rows() -> None:
+    """Pre-`next` schedule files must keep parsing; next defaults empty."""
+    parsed = ScheduleEntry.from_row("| abc | 0 8 * * * | true | Brief | 2024-01-01 |")
+    assert parsed is not None
+    assert parsed.next == ""
+
+
+def test_schedule_recurring_stores_next_occurrence(scheduler: Scheduler) -> None:
+    scheduler.schedule("0 8 * * *", "Morning brief", True)
+
+    entry = scheduler._read_entries()[0]
+    nxt = datetime.fromisoformat(entry.next)
+    assert nxt > datetime.now(tz=UTC)
+    assert nxt - datetime.now(tz=UTC) <= timedelta(days=1)
+
+
+def test_schedule_one_off_leaves_next_empty(scheduler: Scheduler) -> None:
+    scheduler.schedule("2099-12-31T23:59:59+00:00", "One off", False)
+
+    assert scheduler._read_entries()[0].next == ""
+
+
+async def test_fire_advances_next_after_a_recurring_run(vault: VaultTools) -> None:
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+    scheduler.schedule("0 8 * * *", "Morning brief", True)
+    entries = scheduler._read_entries()
+    entries[0].next = (datetime.now(tz=UTC) - timedelta(days=2)).isoformat()
+    scheduler._write_entries(entries)
+
+    await scheduler._fire(entries[0].id, "Morning brief", recurring=True)
+
+    entry = scheduler._read_entries()[0]
+    assert datetime.fromisoformat(entry.next) > datetime.now(tz=UTC)
+
+
+def test_reload_backfills_next_for_hand_added_recurring_rows(vault: VaultTools) -> None:
+    """A hand-added row has no baseline, so nothing counts as missed —
+    reload establishes one so a *later* downtime is detectable."""
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD + "| hand | 0 8 * * * | true | Brief | 2024-01-01 |\n",
+    )
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+
+    scheduler.reload()
+
+    entry = scheduler._read_entries()[0]
+    assert datetime.fromisoformat(entry.next) > datetime.now(tz=UTC)
+
+
+def test_reload_keeps_a_past_next_untouched(vault: VaultTools) -> None:
+    """A parseable past `next` is the evidence catch_up() needs — reload
+    must never 'fix' it forward."""
+    past = (datetime.now(tz=UTC) - timedelta(days=2)).isoformat()
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD.replace(" created |", " created | next |")
+        + f"| rec1 | 0 8 * * * | true | Brief | 2024-01-01 | {past} |\n",
+    )
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+
+    scheduler.reload()
+
+    assert scheduler._read_entries()[0].next == past
+
+
+async def test_catch_up_fires_a_recurring_job_whose_next_is_past(
+    vault: VaultTools,
+) -> None:
+    ran = AsyncMock()
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=ran, tz_name="UTC")
+    scheduler.schedule("0 8 * * *", "Morning brief", True)
+    entries = scheduler._read_entries()
+    entries[0].next = (datetime.now(tz=UTC) - timedelta(days=2)).isoformat()
+    scheduler._write_entries(entries)
+
+    fired = scheduler.catch_up()
+    await asyncio.gather(*scheduler._inflight)
+
+    assert fired == 1
+    ran.assert_awaited_once()
+    prompt = ran.await_args.args[0]
+    assert "catch-up" in prompt
+    assert "Morning brief" in prompt
+    # The completed run advances `next`, so a second catch_up is a no-op.
+    assert datetime.fromisoformat(scheduler._read_entries()[0].next) > datetime.now(tz=UTC)
+    assert scheduler.catch_up() == 0
+
+
+async def test_catch_up_note_carries_the_due_time_in_local_tz(
+    vault: VaultTools,
+) -> None:
+    ran = AsyncMock()
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=ran, tz_name="Europe/Madrid")
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD.replace(" created |", " created | next |")
+        + "| rec1 | 0 8 * * * | true | Brief | 2024-01-01 | 2026-07-30T06:00:00+00:00 |\n",
+    )
+
+    scheduler.catch_up()
+    await asyncio.gather(*scheduler._inflight)
+
+    prompt = ran.await_args.args[0]
+    assert "2026-07-30 08:00" in prompt  # 06:00 UTC is 08:00 in summer Madrid
+
+
+async def test_fire_keeps_next_when_the_run_raised(vault: VaultTools) -> None:
+    """A failed run must not consume the missed-run evidence — advancing
+    `next` past a run that never happened silently loses the reminder."""
+    ran = AsyncMock(side_effect=RuntimeError("copilot down"))
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=ran, tz_name="UTC")
+    scheduler.schedule("0 8 * * *", "Morning brief", True)
+    entries = scheduler._read_entries()
+    past = (datetime.now(tz=UTC) - timedelta(days=2)).isoformat()
+    entries[0].next = past
+    scheduler._write_entries(entries)
+
+    await scheduler._fire(entries[0].id, "Morning brief", recurring=True)
+
+    assert scheduler._read_entries()[0].next == past
+
+
+async def test_fire_skips_when_a_run_for_the_same_job_is_in_flight(
+    vault: VaultTools,
+) -> None:
+    """catch_up() and a live APScheduler fire submitted in the same startup
+    instant must not both run the job."""
+    calls = 0
+    release = asyncio.Event()
+
+    async def _slow(prompt: str) -> None:
+        nonlocal calls
+        calls += 1
+        await release.wait()
+
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=_slow, tz_name="UTC")
+    first = asyncio.create_task(scheduler._fire("rec1", "Brief", recurring=True))
+    second = asyncio.create_task(scheduler._fire("rec1", "Brief", recurring=True))
+    await asyncio.sleep(0)  # let both tasks start
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 1
+
+
+def test_reload_backfill_preserves_rows_it_could_not_parse(vault: VaultTools) -> None:
+    """The backfill write is a table rewrite like any other — it must not
+    erase rows the parser skipped."""
+    vault.write_file(
+        "system/schedule.md",
+        _TABLE_HEAD
+        + "| hand | 0 8 * * * | true | Brief | 2024-01-01 |\n"
+        + "| oops | only-three-columns |\n",
+    )
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+
+    scheduler.reload()
+
+    text = vault.read_file("system/schedule.md")
+    assert "| oops | only-three-columns |" in text, "unparseable row was erased"
+    assert datetime.fromisoformat(scheduler._read_entries()[0].next) > datetime.now(tz=UTC)
+
+
+async def test_catch_up_ignores_future_one_off_and_unparseable_rows(
+    vault: VaultTools,
+) -> None:
+    ran = AsyncMock()
+    scheduler = Scheduler(vault_tools=vault, run_job_fn=ran, tz_name="UTC")
+    scheduler.schedule("0 8 * * *", "Future brief", True)  # next is in the future
+    vault_text = vault.read_file("system/schedule.md")
+    vault.write_file(
+        "system/schedule.md",
+        vault_text
+        + "| old1 | 2020-01-01T00:00:00+00:00 | false | Old one-off | 2020-01-01 |\n"
+        + "| bad1 | 0 9 * * * | true | Garbage next | 2020-01-01 | not-a-date |\n",
+    )
+
+    fired = scheduler.catch_up()
+
+    assert fired == 0
+    ran.assert_not_awaited()
 
 
 # ------------------------------------------------------------------

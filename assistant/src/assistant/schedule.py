@@ -2,14 +2,21 @@
 
 The schedule.md file is a Markdown table:
 
-| id | when | recurring | prompt | created |
-|----|------|-----------|--------|---------|
-| abc123 | 2024-01-01T09:00:00 | false | Send reminder | 2024-01-01T08:00:00 |
-| xyz | 0 8 * * * | true | Morning brief | 2024-01-01T08:00:00 |
+| id | when | recurring | prompt | created | next |
+|----|------|-----------|--------|---------|------|
+| abc123 | 2024-01-01T09:00:00 | false | Send reminder | 2024-01-01T08:00:00 |  |
+| xyz | 0 8 * * * | true | Morning brief | 2024-01-01T08:00:00 | 2024-01-02T08:00:00+00:00 |
 
 On startup, parse the file and register jobs with APScheduler (in-memory).
 The schedule tools edit this file AND the live scheduler.
 A watchfiles watcher (or 60s poll) reloads on change.
+
+`next` is bookkeeping for downtime detection, not the live trigger (APScheduler
+still fires off the cron expression): it holds the next computed occurrence of
+a recurring job and is advanced only after a run completes, so on startup a
+`next` in the past means the service was down when the job was due —
+catch_up() fires one late run for it. One-off rows leave it empty; their
+`when` already is the timestamp and the row itself is deleted after the run.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import secrets
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import dateparser
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -31,8 +39,8 @@ from apscheduler.triggers.date import DateTrigger
 logger = logging.getLogger(__name__)
 
 _SCHEDULE_FILE = "system/schedule.md"
-_TABLE_HEADER = "| id | when | recurring | prompt | created |"
-_TABLE_SEP = "|-----|------|-----------|--------|---------|"
+_TABLE_HEADER = "| id | when | recurring | prompt | created | next |"
+_TABLE_SEP = "|-----|------|-----------|--------|---------|------|"
 _MISFIRE_GRACE = 12 * 3600  # 12 hours in seconds
 # Cell boundaries are bare pipes; an escaped \| belongs to the prompt text.
 _CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
@@ -52,7 +60,7 @@ def _unescape_cell(value: str) -> str:
 
 
 class ScheduleEntry:
-    __slots__ = ("id", "when", "recurring", "prompt", "created")
+    __slots__ = ("id", "when", "recurring", "prompt", "created", "next")
 
     def __init__(
         self,
@@ -61,16 +69,18 @@ class ScheduleEntry:
         recurring: bool,
         prompt: str,
         created: str,
+        next: str = "",
     ) -> None:
         self.id = id
         self.when = when
         self.recurring = recurring
         self.prompt = prompt
         self.created = created
+        self.next = next
 
     def to_row(self) -> str:
         rec = "true" if self.recurring else "false"
-        cells = (self.id, self.when, rec, self.prompt, self.created)
+        cells = (self.id, self.when, rec, self.prompt, self.created, self.next)
         return "| " + " | ".join(_escape_cell(cell) for cell in cells) + " |"
 
     @classmethod
@@ -85,12 +95,22 @@ class ScheduleEntry:
         if cols and not cols[-1]:
             cols.pop()
 
-        if len(cols) != 5:
+        # 5 columns is the pre-`next` format, still valid in hand-edited files.
+        if len(cols) == 5:
+            cols.append("")
+        if len(cols) != 6:
             return None
-        id_, when, rec, prompt, created = (_unescape_cell(col) for col in cols)
+        id_, when, rec, prompt, created, next_ = (_unescape_cell(col) for col in cols)
         if not id_ or not when:
             return None
-        return cls(id=id_, when=when, recurring=(rec.lower() == "true"), prompt=prompt, created=created)
+        return cls(
+            id=id_,
+            when=when,
+            recurring=(rec.lower() == "true"),
+            prompt=prompt,
+            created=created,
+            next=next_,
+        )
 
 
 def _generate_id() -> str:
@@ -192,8 +212,8 @@ class Scheduler:
                     # The file is hand-editable, so a typo here is a job that
                     # silently never runs. Say so rather than dropping it mutely.
                     logger.warning(
-                        "Ignoring unparseable row in %s (needs 5 columns: "
-                        "id | when | recurring | prompt | created): %s",
+                        "Ignoring unparseable row in %s (needs 6 columns: "
+                        "id | when | recurring | prompt | created | next): %s",
                         _SCHEDULE_FILE,
                         stripped,
                     )
@@ -268,21 +288,36 @@ class Scheduler:
         logger.info("Registered job %s (%s) at %r", job_id, "recurring" if entry.recurring else "one-off", entry.when)
 
     async def _fire(self, job_id: str, prompt: str, recurring: bool) -> None:
+        if job_id in self._running:
+            # catch_up() and a live APScheduler fire can be submitted in the
+            # same startup instant; whichever starts second stands down.
+            logger.info("Skipping job %s: a run is already in flight", job_id)
+            return
         logger.info("Firing job %s: %r", job_id, prompt)
         task = asyncio.current_task()
         if task is not None:
             self._inflight.add(task)
         self._running.add(job_id)
+        completed = False
         try:
             try:
                 await self._run_job(prompt)
+                completed = True
             except Exception:
                 logger.exception("Error in scheduled job %s", job_id)
             finally:
                 if task is not None:
                     self._inflight.discard(task)
             if not recurring:
+                # Removed even after a failure: left in place, the reload poll
+                # would re-register and hot-loop a persistently failing one-off
+                # every minute for the rest of its 12h grace.
                 self._remove_entry(job_id)
+            elif completed:
+                # Advanced only on success: a past `next` is the missed-run
+                # evidence catch_up() reads, and a failed run must not consume
+                # it. No hot-loop risk here — catch-up fires once per startup.
+                self._advance_next(job_id)
         finally:
             # Released only after the row is gone, so no poll can see a live row
             # for a run that has already happened.
@@ -295,17 +330,103 @@ class Scheduler:
         self._entries.pop(job_id, None)
 
     # ------------------------------------------------------------------
+    # Missed-run bookkeeping: the `next` column
+    # ------------------------------------------------------------------
+
+    def _next_occurrence(self, cron: str) -> datetime | None:
+        """Next occurrence of a cron expression from now, UTC-aware."""
+        try:
+            trigger = CronTrigger.from_crontab(cron, timezone=self._tz)
+        except ValueError:
+            return None
+        fire = trigger.get_next_fire_time(None, datetime.now(tz=UTC))
+        return fire.astimezone(UTC) if fire is not None else None
+
+    def _parse_next(self, value: str) -> datetime | None:
+        """Parse a `next` cell; a naive hand-edited time is read as local."""
+        try:
+            dt = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(self._tz))
+        return dt.astimezone(UTC)
+
+    def _advance_next(self, job_id: str) -> None:
+        """After a completed recurring run, move `next` past now.
+
+        Advancing only on completion mirrors the one-off row deletion: a crash
+        mid-run leaves `next` in the past, so the run is retried on startup.
+        """
+        entries, preserved = self._read_table()
+        entry = next((e for e in entries if e.id == job_id), None)
+        if entry is None:
+            return  # cancelled while the run was in flight
+        nxt = self._next_occurrence(entry.when)
+        if nxt is None:
+            logger.warning(
+                "Cannot compute next occurrence for job %s (%r)", job_id, entry.when
+            )
+            return
+        entry.next = nxt.isoformat()
+        self._write_entries(entries, preserved)
+        cached = self._entries.get(job_id)
+        if cached is not None:
+            cached.next = entry.next
+
+    def catch_up(self) -> int:
+        """Fire one late run per recurring job missed while the service was down.
+
+        A recurring row whose `next` is in the past was due when nothing was
+        running to fire it. Occurrences are coalesced — no matter how many were
+        missed or how long ago, the job gets a single run, told how late it is
+        so the model can adapt or stay silent. Returns the number fired.
+        """
+        now = datetime.now(tz=UTC)
+        fired = 0
+        for entry in self._read_entries():
+            if not entry.recurring or entry.id in self._running:
+                continue
+            nxt = self._parse_next(entry.next)
+            if nxt is None or nxt > now:
+                continue
+            due_local = nxt.astimezone(ZoneInfo(self._tz)).strftime("%Y-%m-%d %H:%M")
+            prompt = (
+                f"[catch-up: this job was due at {due_local} but the assistant "
+                f"was offline] {entry.prompt}"
+            )
+            logger.info("Catch-up fire for job %s (was due %s)", entry.id, due_local)
+            fire_task = asyncio.create_task(self._fire(entry.id, prompt, recurring=True))
+            # _fire tracks itself in _inflight, but only once it starts running;
+            # holding the task here keeps it referenced (and drainable) until then.
+            self._inflight.add(fire_task)
+            fire_task.add_done_callback(self._inflight.discard)
+            fired += 1
+        return fired
+
+    # ------------------------------------------------------------------
     # Startup reload
     # ------------------------------------------------------------------
 
     def reload(self) -> None:
         """Parse schedule.md and sync APScheduler. Safe to call multiple times."""
-        entries = self._read_entries()
+        entries, preserved = self._read_table()
         seen_ids: set[str] = set()
+        backfilled = False
         for entry in entries:
             seen_ids.add(entry.id)
             if entry.id in self._running:
                 continue  # mid-run; its row is still on disk by design
+            # A recurring row with no usable `next` (hand-added, or the legacy
+            # 5-column format) has no baseline, so nothing counts as missed —
+            # establish one so a *later* downtime is detectable. A parseable
+            # past value is exactly the evidence catch_up() reads: never
+            # "fix" it forward here.
+            if entry.recurring and self._parse_next(entry.next) is None:
+                nxt = self._next_occurrence(entry.when)
+                if nxt is not None:
+                    entry.next = nxt.isoformat()
+                    backfilled = True
             prev = self._entries.get(entry.id)
             unchanged = prev is not None and (
                 (prev.when, prev.recurring, prev.prompt)
@@ -315,6 +436,8 @@ class Scheduler:
                 continue
             self._entries[entry.id] = entry
             self._register(entry)
+        if backfilled:
+            self._write_entries(entries, preserved)
         # Remove jobs no longer in file
         for jid in list(self._entries.keys()):
             if jid not in seen_ids:
@@ -338,6 +461,7 @@ class Scheduler:
         now_iso = datetime.now(tz=UTC).isoformat()
 
         # For one-off jobs, normalize 'when' to ISO
+        next_stored = ""
         if not recurring:
             dt = parse_when(when, self._tz)
             if dt is None:
@@ -349,6 +473,9 @@ class Scheduler:
             except ValueError as exc:
                 return f"[error: invalid cron expression {when!r}: {exc}]"
             when_stored = when  # store cron expression as-is
+            nxt = self._next_occurrence(when)
+            if nxt is not None:
+                next_stored = nxt.isoformat()
 
         entry = ScheduleEntry(
             id=job_id,
@@ -356,6 +483,7 @@ class Scheduler:
             recurring=recurring,
             prompt=prompt,
             created=now_iso,
+            next=next_stored,
         )
         entries, preserved = self._read_table()
         entries.append(entry)

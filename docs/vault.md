@@ -158,10 +158,16 @@ weekly **lint**.
 - Relative expressions, one-off only — `in 10 minutes`, `tomorrow at 9am`
 
 The file is the source of truth and is re-read every 60 seconds, so hand edits
-take effect within a minute. All five columns (`id`, `when`, `recurring`,
-`prompt`, `created`) are required; a row that does not parse is skipped with a
-warning in the log, and written back untouched when something else edits the
-table — otherwise one bad row would be erased by the next write.
+take effect within a minute. All six columns (`id`, `when`, `recurring`,
+`prompt`, `created`, `next`) are required — though older five-column rows
+still parse, and the bot fills `next` in on its own; a row that does not parse
+is skipped with a warning in the log, and written back untouched when
+something else edits the table — otherwise one bad row would be erased by the
+next write. `next` is bookkeeping the bot maintains: the next time a recurring
+job is expected to fire, updated after each run. Leave it alone. (Downgrading
+to a pre-`next` version stops six-column rows from parsing — the jobs sit
+inert, warned about in the log but never lost, until the column is removed by
+hand or the bot is upgraded again.)
 
 Times run on the local clock: a cron expression fires on your wall clock, and a
 `when` you write by hand is read as local unless it carries an offset. The one
@@ -170,8 +176,10 @@ instant with `+00:00` — which is unambiguous precisely because the offset is
 there. Write cron weekdays as names (`SUN`); the numbering starts at Monday, so
 `0` means Monday.
 
-On restart, one-off jobs overdue by less than 12 hours fire once; older ones
-are dropped.
+Reminders that came due while the bot was down fire when it comes back up. A
+recurring job whose `next` time has passed gets one run at startup, however
+late — told how late it is, so it can adapt or stand down. One-off jobs
+overdue by less than 12 hours fire once on restart; older ones are dropped.
 
 A reminder whose purpose is already met stays quiet: scheduled runs read the
 relevant wiki state first and stand down silently if the routine was already

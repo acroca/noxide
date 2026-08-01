@@ -158,6 +158,14 @@ async def _run(config_path: Path | None) -> None:
     # retries, so a SIGTERM during an outage still shuts down promptly.
     await bot.start(abort=lifecycle.stop)
 
+    # Fire recurring jobs missed while the service was down. After bot.start()
+    # so the late runs can deliver; reload() above already backfilled `next`
+    # baselines for rows that had none. Skipped when a signal already aborted
+    # startup — the runs would only stall the shutdown drain and, failing,
+    # burn nothing but time; `next` stays past, so the next boot catches up.
+    if not lifecycle.stop.is_set():
+        scheduler.catch_up()
+
     # Ingest offline captures from inbox.md. Ordering matters: the backup's
     # startup sweep (init_repo above) has already committed the pre-boot file,
     # the scheduler is up so entries can create reminders, and the bot is up
