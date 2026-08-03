@@ -189,6 +189,27 @@ async def test_agent_tool_move_file(agent: Agent, vault: VaultTools, tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_agent_tool_check_vault(agent: Agent, vault: VaultTools) -> None:
+    """Agent-level routing must know check_vault too (same trap as move_file:
+    a tool in VaultTools.dispatch but missing from the agent's file-tools
+    allowlist is advertised yet answers [unknown tool: ...])."""
+    responses = [
+        _make_tool_call_response("check_vault", {}),
+        _make_text_response("all clean"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.run(chat_id=1, user_message="run the checks")
+
+    assert reply == "all clean"
+    tool_result = mock_client.chat.call_args_list[1].args[0][-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["content"] == "[no findings]"
+
+
+@pytest.mark.asyncio
 async def test_agent_path_jail_in_tool_call(agent: Agent, vault: VaultTools) -> None:
     """Tool call with path escape should return error string, not crash."""
     responses = [

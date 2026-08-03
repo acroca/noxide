@@ -48,6 +48,7 @@ assistant/
     copilot.py      ← auth + chat completions (streaming)
     telegram_bot.py ← long polling, handlers, allowlist
     tools.py        ← vault file tools (path-jailed)
+    vault_check.py  ← deterministic wiki consistency checks
     schedule.py     ← APScheduler over system/schedule.md
     skills.py       ← skill discovery and loading
     web.py          ← quarantined research sub-agent

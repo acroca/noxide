@@ -524,6 +524,7 @@ class Agent:
             "move_file",
             "list_files",
             "search",
+            "check_vault",
         ):
             return self._vault.dispatch(name, args)
         # Skills (stored procedures; bodies live in the package or the vault)
