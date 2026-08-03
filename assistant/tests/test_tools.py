@@ -73,6 +73,20 @@ def test_path_jail_dotdot_deep(vault: VaultTools) -> None:
         vault.read_file("a/b/../../../../../../etc/passwd")
 
 
+def test_path_jail_error_does_not_leak_vault_location(
+    vault: VaultTools, tmp_path: Path
+) -> None:
+    """The jail message reaches the model as a [permission denied: ...] tool
+    result; where the vault lives on the host is deployment detail that must
+    stay out of runtime error strings."""
+    with pytest.raises(PermissionError) as excinfo:
+        vault.read_file("../etc/passwd")
+
+    message = str(excinfo.value)
+    assert "../etc/passwd" in message  # still names the offending path
+    assert str(tmp_path.resolve()) not in message
+
+
 def test_path_jail_dotdot_write(vault: VaultTools) -> None:
     with pytest.raises(PermissionError):
         vault.write_file("../evil.txt", "bad")

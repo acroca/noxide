@@ -65,9 +65,10 @@ class VaultTools:
         try:
             candidate.relative_to(self._root)
         except ValueError:
-            raise PermissionError(
-                f"Path {rel!r} escapes vault root {self._root}"
-            ) from None
+            # Model-visible via "[permission denied: ...]" — never include
+            # self._root: where the vault lives on the host is deployment
+            # detail that must stay out of runtime error strings.
+            raise PermissionError(f"Path {rel!r} escapes the vault") from None
         return candidate
 
     def abs_path(self, rel: str) -> Path:
