@@ -35,7 +35,7 @@ vault/
   raw/
     journal/YYYY-MM-DD.md      ← append-only event log, one file per day
   wiki/
-    now.md                     ← dashboard: today, upcoming, waiting, last 7 days
+    now.md                     ← dashboard: today, upcoming, waiting, every open task, last 7 days
     routines.md                ← recurring activities: frequency, last done, next due
     index.md                   ← one line per wiki page
     log.md                     ← operations log (nightly compile, weekly lint)
@@ -63,17 +63,21 @@ vault/
   keep whatever notation they were written with.
 - **Every project and area page** opens with `**Status:** …`, one always-current
   paragraph. That is what catch-up questions read first.
-- **Tasks** live only on project/area pages under `## Tasks`: `- [ ] thing (due
+- **Tasks** are owned by project/area pages under `## Tasks`: `- [ ] thing (due
   YYYY-MM-DD)`, `- [x] thing (done YYYY-MM-DD)`, and `(waiting: X)` when blocked
-  on someone else.
+  on someone else. Every open task is also mirrored into `now.md`'s **Tasks**
+  section; the page copy is the authority.
 - **People pages** are created on recurrence, not first mention, and hold stated
   facts only — never invented relationship detail.
 - **`now.md` is a copy**, deliberately. It duplicates state owned by other
   pages so that "what do I need to do?" is one read with no queries. The cost is
   that it goes stale the moment a source page changes, which is why keeping it
-  patched is part of every ingest. Overdue tasks stay listed under Today, with
-  their original due date, until done or rescheduled — a deadline must not fall
-  off the dashboard by passing. A user-declared **Focus** block (current
+  patched is part of every ingest. Its **Tasks** section is the complete
+  inventory — every open task on every page, grouped by owning page — so the
+  dashboard is the only place you have to look; the noise of listing everything
+  is accepted, a second place to look is not. Overdue tasks stay listed under
+  Today, with their original due date, until done or rescheduled — a deadline
+  must not fall off the dashboard by passing. A user-declared **Focus** block (current
   priority plus its next actions) may open Today; it survives the nightly
   rebuild and only the user creates or clears it.
 

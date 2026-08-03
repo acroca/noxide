@@ -60,7 +60,7 @@ Where a weekday genuinely is required (the `now.md` header, and its **Upcoming**
 
 - No plugin syntax; every page has a one-line entry in `wiki/index.md`.
 - Every project/area page starts with `**Status:** …` — one always-current paragraph. That is what catch-up questions read first.
-- Tasks live only on project/area pages under `## Tasks`:
+- Tasks are owned by project/area pages (or their sub-pages), under `## Tasks` — never by the journal or people pages. `now.md` additionally mirrors every open task (see its **Tasks** section below); the owning page's copy is the authority:
   - Open: `- [ ] description (due YYYY-MM-DD)` — the date is optional.
   - Done: `- [x] description (done YYYY-MM-DD)`.
   - Waiting on someone/something: append `(waiting: X)`.
@@ -78,7 +78,9 @@ One table of recurring activities: `| Routine | Frequency | Last done | Next due
 
 ### `wiki/now.md`
 
-Fully materialized dashboard — no queries, just text. Sections: **Today** (events, due/overdue routines, tasks due today — and every overdue task, kept listed with its original `(due YYYY-MM-DD)` until done, rescheduled or explicitly dropped: a task vanishing from the dashboard the day after its deadline passes is how a decision silently expires), **Upcoming** (dated events and routine due dates), **Waiting** (blocked on someone/something external), **Last 7 days** (one bullet per day, newest first, synthesizing that day's journal).
+Fully materialized dashboard — no queries, just text. Sections: **Today** (events, due/overdue routines, tasks due today — and every overdue task, kept listed with its original `(due YYYY-MM-DD)` until done, rescheduled or explicitly dropped: a task vanishing from the dashboard the day after its deadline passes is how a decision silently expires), **Upcoming** (dated events and routine due dates), **Waiting** (blocked on someone/something external), **Tasks** (every open task in the wiki — see below), **Last 7 days** (one bullet per day, newest first, synthesizing that day's journal).
+
+**Tasks** is the complete inventory, not a selection: every open `- [ ]` on every wiki page, one line per task grouped under a link to its owning page, each keeping its `(due …)`/`(waiting: …)` markers verbatim. The dashboard is the one page the user reads to see everything on their plate, so a task filed on a page but absent here is, to the user, filed nowhere. Overlap with the sections above (an overdue task also under **Today**, a blocked one also under **Waiting**) is by design — noise is acceptable, a second place to look is not. A task enters this list the moment it is created and leaves it the moment it is closed.
 
 **Today** may open with a **Focus** block: the user's declared current priority, with its next actions copied from the owning project pages. Only an explicit user statement creates, replaces or clears it. The nightly rebuild carries it forward — re-checking its action lines against the owning pages — and never drops or invents one: the declaration itself has no other home in the wiki, so losing the block loses it.
 
@@ -99,7 +101,7 @@ An ingest is not finished when the fact is filed — it is finished when no page
 1. **Journal it.** Append to today's journal.
 2. **Update the page that owns the fact.** The project/area page; or `routines.md` (**Last done** + recomputed **Next due**) when a routine is confirmed. New project/area → create the page (with `**Status:**`) and add its `index.md` line. Just this one owning page — sibling pages are not updated unless the fact is literally wrong on them.
 3. **Close what the message implies.** A report of fact often completes an open task without naming it — "I created the template" closes *build the template*; "laptop shipped back" closes the return errand. When the message means something got done, became moot, or came unblocked, `search` for the item instead of trusting the page already in hand: the same task can be tracked on more than one page, and a copy left open elsewhere is exactly the "still shows the old state" this checklist exists to prevent. Close every copy, and fold duplicates into one owning page while you are there.
-4. **Reconcile `now.md`.** `now.md` duplicates state that lives elsewhere, so step 2 usually leaves a line here stale. Whenever the change touched a routine, a task, an event or a blocker, **read `now.md`** — never decide from memory that it doesn't mention the item — and `edit_file` every line the change falsified. One change can falsify more than one line: a routine just done is typically listed **both** as due under **Today** and by its next-due date under **Upcoming**; a closed task may also sit under **Waiting**. Patch lines in place; never rebuild a section (**Last 7 days** is nightly-only).
+4. **Reconcile `now.md`.** `now.md` duplicates state that lives elsewhere, so step 2 usually leaves a line here stale. Whenever the change touched a routine, a task, an event or a blocker, **read `now.md`** — never decide from memory that it doesn't mention the item — and `edit_file` every line the change falsified. One change can falsify more than one line: a routine just done is typically listed **both** as due under **Today** and by its next-due date under **Upcoming**; a closed task may also sit under **Waiting**. A new task is also a `now.md` edit — add its line to **Tasks** (and to **Today** when due today or overdue); a closed one is removed from **Tasks** and every other section that shows it. Patch lines in place; never rebuild a section (**Last 7 days** is nightly-only).
 5. **Check for a stale reminder.** If a reminder is noted on the item you touched and the change makes it moot or wrong, cancel it or reschedule it with corrected text.
 6. **Confirm in the reply** which files changed.
 
@@ -118,7 +120,7 @@ When one destination is clearly the best fit, file there without asking — corr
 
 1. Read today's and yesterday's journal; verify the wiki reflects every event (apply anything ingest missed).
 2. Recompute **Next due** for every routine.
-3. Rebuild `wiki/now.md` in full.
+3. Rebuild `wiki/now.md` in full — its **Tasks** section by sweeping every wiki page's `## Tasks`, so a task ingest failed to mirror still reaches the dashboard within a day.
 4. Reconcile `wiki/index.md` against the pages on disk.
 5. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and a deadline lapsing is the canonical case: flag any task whose due date passed since the previous compile (the date of which is in `wiki/log.md`). Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job.
 
@@ -129,6 +131,6 @@ When one destination is clearly the best fit, file there without asking — corr
 - Contradictions between a page's status and recent journal entries; orphan pages; index drift; schedule jobs referencing missing files.
 - Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
 - Scheduled job prompts (`system/schedule.md` rows) that hand-write the `[scheduled run]` tag or restate the scheduled-run close contract ("reply [silent]" and variants) → rewrite the row's prompt without them.
-- The same task tracked on more than one page → close or consolidate to one owning page.
+- The same task tracked on more than one page → close or consolidate to one owning page (`now.md`'s mirror lines are the mechanism, not a duplicate — but do verify **Tasks** lists exactly the open tasks the pages hold).
 - Non-ISO dates in `wiki/` — day/month forms, month names, relative dates (`tomorrow`, `next Sunday`), weekday labels outside `now.md` → rewrite to `YYYY-MM-DD`. Skip `wiki/log.md`, which is append-only like the journal. Then check every weekday label that legitimately remains against the date beside it, and every relative date for having gone stale; both are how a wrong day survives in the wiki.
 - Apply safe fixes, append a lint entry to `wiki/log.md`, and message findings — stay silent if everything is clean.
