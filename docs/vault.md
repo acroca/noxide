@@ -112,15 +112,22 @@ projects gone quiet, and only the user's yes triggers it.
 **Compile** — nightly. Re-reads recent journal entries, applies anything ingest
 missed, recomputes every routine's next-due date, rebuilds `now.md` in full,
 reconciles `index.md` against the pages on disk (archived pages under
-`## Archived`), logs to `log.md`, and flags any task whose deadline lapsed
-since the previous compile.
+`## Archived`), verifies the result with `check_vault` (see below), logs to
+`log.md`, and flags any task whose deadline lapsed since the previous compile.
 
-**Lint** — weekly. Surfaces projects with no journal mention in 30+ days
-(proposing to archive them), tasks
+**Lint** — weekly. Starts from a `check_vault` report, then surfaces projects
+with no journal mention in 30+ days (proposing to archive them), tasks
 open 21+ days, contradictions between a page's status and recent entries,
 orphan pages, index drift, scheduled jobs referencing missing files, job
 prompts that restate scheduled-run plumbing, and the same task tracked on more
 than one page.
+
+Both jobs lean on **`check_vault`**, a deterministic consistency checker built
+into the bot: pure code, no model involved, that enumerates every open task on
+every live wiki page against the `now.md` mirror (in both directions) and
+verifies weekday names written beside ISO dates against the calendar. The
+model fixes what the checker finds instead of being trusted to re-discover it
+— an enumerated sweep can't skip a page, and code can't miscompute a weekday.
 
 Compile and lint are ordinary scheduled jobs, not built-in machinery — see
 [scheduling](#scheduling) below.

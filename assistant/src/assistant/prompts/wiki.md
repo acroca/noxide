@@ -138,10 +138,12 @@ Archived pages stay readable and searchable but are never listed as live work. R
 2. Recompute **Next due** for every routine.
 3. Rebuild `wiki/now.md` in full — its **Tasks** section by sweeping every wiki page's `## Tasks`, so a task ingest failed to mirror still reaches the dashboard within a day.
 4. Reconcile `wiki/index.md` against the pages on disk — pages under `wiki/archive/` belong in its `## Archived` section, everything else in the live list.
-5. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and a deadline lapsing is the canonical case: flag any task whose due date passed since the previous compile (the date of which is in `wiki/log.md`). Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job.
+5. Run `check_vault` and fix every finding. It re-verifies the rebuild mechanically — the task mirror by enumeration, weekday labels against the calendar — so a page the sweep in step 3 missed surfaces tonight instead of at the next lint. A clean report is the expected outcome, not a wasted call.
+6. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and a deadline lapsing is the canonical case: flag any task whose due date passed since the previous compile (the date of which is in `wiki/log.md`). Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job.
 
 ### Lint (weekly scheduled job, or on demand)
 
+- Start with `check_vault` and fix its findings: the mechanical sweeps — task-mirror gaps and weekday labels beside dates — come from the tool, which enumerates where a read-through samples. The judgment checks below stay yours.
 - Projects with no journal mention in 30+ days → propose archiving (see Archive above); never archive without the user's yes.
 - Open tasks or `now.md` mentions on a page under `wiki/archive/` → the page was retired too early; surface it.
 - Tasks open 21+ days → surface them.

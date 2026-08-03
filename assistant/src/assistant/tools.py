@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from assistant import vault_check
+
 # Generous enough that no hand-written vault page realistically hits it, low
 # enough that a runaway file cannot displace the conversation.
 _MAX_READ_CHARS = 100_000
@@ -258,6 +260,10 @@ class VaultTools:
 
         return "\n".join(results) if results else "[no matches]"
 
+    def check_vault(self) -> str:
+        """Run the deterministic wiki consistency checks; see vault_check.py."""
+        return vault_check.run_checks(self._root)
+
     def save_attachment(self, data: bytes, ext: str = "jpg") -> str:
         """Save binary *data* under attachments/ and return the vault-relative path.
 
@@ -429,6 +435,26 @@ class VaultTools:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "check_vault",
+                    "description": (
+                        "Run deterministic consistency checks over the live wiki "
+                        "and return a findings list with file:line locations "
+                        "(or [no findings]). Checks: every open task on wiki "
+                        "pages appears in wiki/now.md and vice versa; weekday "
+                        "names written beside ISO dates match the date. Use it "
+                        "during compile and lint runs and after bulk wiki edits "
+                        "— fix what it reports instead of re-sweeping by hand."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
         ]
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
@@ -461,5 +487,7 @@ class VaultTools:
             return self.list_files(args["glob"])
         elif name == "search":
             return self.search(args["pattern"])
+        elif name == "check_vault":
+            return self.check_vault()
         else:
             return f"[unknown tool: {name}]"

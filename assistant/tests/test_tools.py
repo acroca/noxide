@@ -203,6 +203,29 @@ def test_edit_file_dispatch(vault: VaultTools) -> None:
 
 
 # ------------------------------------------------------------------
+# check_vault
+# ------------------------------------------------------------------
+
+def test_check_vault_is_exposed_as_a_tool(vault: VaultTools) -> None:
+    names = [s["function"]["name"] for s in vault.tool_schemas()]
+
+    assert "check_vault" in names
+
+
+def test_check_vault_dispatch(vault: VaultTools) -> None:
+    assert vault.dispatch("check_vault", {}) == "[no findings]"
+
+
+def test_check_vault_dispatch_reports_findings(vault: VaultTools) -> None:
+    vault.write_file("wiki/now.md", "# Now — Monday — 2026-08-04\n")
+
+    result = vault.dispatch("check_vault", {})
+
+    assert "wiki/now.md:1" in result
+    assert "Tuesday" in result
+
+
+# ------------------------------------------------------------------
 # list_files
 # ------------------------------------------------------------------
 
