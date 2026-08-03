@@ -132,6 +132,7 @@ _VAULT_MUTATING_TOOLS = frozenset({
     "rewrite_file",
     "edit_file",
     "append_file",
+    "move_file",
     "schedule",
     "cancel_scheduled",
     "create_forum_topic",
@@ -147,6 +148,9 @@ def _paths_touched(name: str, args: dict[str, Any]) -> set[str]:
     if name in ("create_file", "rewrite_file", "edit_file", "append_file"):
         path = args.get("path")
         return {path} if path else set()
+    if name == "move_file":
+        # A move deletes the source and adds the destination; stage both.
+        return {p for p in (args.get("path"), args.get("new_path")) if p}
     if name in ("schedule", "cancel_scheduled"):
         return {"system/schedule.md"}
     if name == "create_forum_topic":

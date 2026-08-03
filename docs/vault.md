@@ -42,6 +42,7 @@ vault/
     projects/<slug>.md         ← goal-oriented, time-bounded work
     areas/<slug>.md            ← ongoing life areas (health, family, hobbies…)
     people/<slug>.md           ← one page per recurring person
+    archive/projects/<slug>.md ← finished or abandoned projects, out of the way
   system/                      ← managed by the bot: schedule.md, topics/, skills/, usage.md
 ```
 
@@ -99,12 +100,23 @@ the old state.
 scope only. "Catch me up on X" reads that page's `**Status:**` paragraph.
 Historical questions search the journal and cite dates.
 
+**Archive** — when a project is finished or abandoned, its page moves to
+`wiki/archive/projects/<slug>.md`: final status written, remaining tasks closed
+or deliberately dropped, stale reminders cancelled, every wiki reference
+patched to the new path (the append-only journal keeps its old prose mentions
+as history), and its `index.md` line re-filed under an `## Archived` section at
+the bottom. Out of the live wiki but still readable and searchable; reviving a
+project is the same move in reverse. The weekly lint proposes archiving for
+projects gone quiet, and only the user's yes triggers it.
+
 **Compile** — nightly. Re-reads recent journal entries, applies anything ingest
 missed, recomputes every routine's next-due date, rebuilds `now.md` in full,
-reconciles `index.md` against the pages on disk, logs to `log.md`, and flags
-any task whose deadline lapsed since the previous compile.
+reconciles `index.md` against the pages on disk (archived pages under
+`## Archived`), logs to `log.md`, and flags any task whose deadline lapsed
+since the previous compile.
 
-**Lint** — weekly. Surfaces projects with no journal mention in 30+ days, tasks
+**Lint** — weekly. Surfaces projects with no journal mention in 30+ days
+(proposing to archive them), tasks
 open 21+ days, contradictions between a page's status and recent entries,
 orphan pages, index drift, scheduled jobs referencing missing files, job
 prompts that restate scheduled-run plumbing, and the same task tracked on more

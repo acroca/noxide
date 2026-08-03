@@ -185,6 +185,31 @@ class VaultTools:
             f"(version {_version_of(p.read_text(encoding='utf-8'))})"
         )
 
+    def move_file(self, path: str, new_path: str) -> str:
+        """Move (rename) *path* to *new_path*; refuse to overwrite.
+
+        Exists for archiving and renames — a copy-then-delete is impossible
+        for the model (there is no delete tool), so without this a page
+        "moved" to the archive would leave its original behind.
+        """
+        src = self._safe_path(path)
+        dst = self._safe_path(new_path)
+        if not src.exists():
+            return f"[file not found: {path}]"
+        if not src.is_file():
+            return f"[move error: {path} is a directory — move its files one at a time]"
+        if dst.exists():
+            return (
+                f"[move error: destination {new_path} already exists — "
+                "pick another path or rewrite that file instead]"
+            )
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        return (
+            f"Moved {path} to {new_path} "
+            f"(version {_version_of(dst.read_text(encoding='utf-8'))})"
+        )
+
     def list_files(self, glob: str) -> str:
         """Return newline-separated list of vault-relative paths matching *glob*."""
         # glob patterns are applied from vault root. glob() does not route through
@@ -359,6 +384,25 @@ class VaultTools:
             {
                 "type": "function",
                 "function": {
+                    "name": "move_file",
+                    "description": (
+                        "Move or rename a vault file. Fails if the destination "
+                        "already exists. After moving a wiki page, search for the "
+                        "old path and patch any references to it."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Current vault-relative path"},
+                            "new_path": {"type": "string", "description": "New vault-relative path"},
+                        },
+                        "required": ["path", "new_path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "list_files",
                     "description": "List vault files matching a glob pattern, e.g. wiki/people/*.md",
                     "parameters": {
@@ -410,6 +454,8 @@ class VaultTools:
             return self.edit_file(args["path"], args["old_string"], args["new_string"])
         elif name == "append_file":
             return self.append_file(args["path"], args["content"])
+        elif name == "move_file":
+            return self.move_file(args["path"], args["new_path"])
         elif name == "list_files":
             return self.list_files(args["glob"])
         elif name == "search":

@@ -1546,3 +1546,22 @@ def test_paths_touched_maps_forum_topic_writes() -> None:
         "system/topics/health-fitness/AGENTS.md",
         "system/topics/index.md",
     }
+
+
+def test_paths_touched_maps_move_file_to_both_paths() -> None:
+    """A move is a deletion at the source and an addition at the destination;
+    the backup commit must stage both."""
+    from assistant.agent import _paths_touched
+
+    assert _paths_touched(
+        "move_file",
+        {"path": "wiki/projects/boat.md", "new_path": "wiki/archive/projects/boat.md"},
+    ) == {"wiki/projects/boat.md", "wiki/archive/projects/boat.md"}
+
+
+def test_move_file_holds_the_backup_lock() -> None:
+    """move_file mutates the vault, so its dispatch must serialize with
+    backup commits like every other mutating tool."""
+    from assistant.agent import _VAULT_MUTATING_TOOLS
+
+    assert "move_file" in _VAULT_MUTATING_TOOLS

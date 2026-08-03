@@ -422,6 +422,98 @@ def test_mutating_tools_report_the_new_version(vault: VaultTools) -> None:
 
 
 # ------------------------------------------------------------------
+# move_file
+# ------------------------------------------------------------------
+
+def test_move_file_moves_content(vault: VaultTools, tmp_path: Path) -> None:
+    vault.write_file("wiki/projects/boat.md", "# Boat\n**Status:** done\n")
+
+    result = vault.move_file("wiki/projects/boat.md", "wiki/archive/projects/boat.md")
+
+    assert not result.startswith("[")
+    assert not (tmp_path / "wiki/projects/boat.md").exists()
+    assert vault.read_file("wiki/archive/projects/boat.md") == "# Boat\n**Status:** done\n"
+
+
+def test_move_file_creates_destination_parents(vault: VaultTools) -> None:
+    vault.write_file("a.md", "content")
+
+    vault.move_file("a.md", "deeply/nested/dir/a.md")
+
+    assert vault.read_file("deeply/nested/dir/a.md") == "content"
+
+
+def test_move_file_reports_both_paths_and_version(vault: VaultTools) -> None:
+    vault.write_file("old.md", "same content")
+
+    result = vault.move_file("old.md", "new.md")
+
+    assert "old.md" in result
+    assert "new.md" in result
+    assert f"version {vault.version('new.md')}" in result
+
+
+def test_move_file_missing_source_returns_not_found_sentinel(vault: VaultTools) -> None:
+    result = vault.move_file("nope.md", "elsewhere.md")
+
+    assert result.startswith("[file not found")
+
+
+def test_move_file_refuses_existing_destination(vault: VaultTools) -> None:
+    vault.write_file("src.md", "source")
+    vault.write_file("dst.md", "destination")
+
+    result = vault.move_file("src.md", "dst.md")
+
+    assert result.startswith("[move error:")
+    assert vault.read_file("src.md") == "source"
+    assert vault.read_file("dst.md") == "destination"
+
+
+def test_move_file_refuses_directories(vault: VaultTools, tmp_path: Path) -> None:
+    """A directory source must be refused up front — renaming it would move a
+    whole tree in one call and then crash reading the destination as text,
+    leaving a mutation behind a [tool error]."""
+    vault.write_file("wiki/projects/boat/notes.md", "sub-page")
+
+    result = vault.move_file("wiki/projects/boat", "wiki/archive/projects/boat")
+
+    assert result.startswith("[move error:")
+    assert (tmp_path / "wiki/projects/boat/notes.md").exists()
+    assert not (tmp_path / "wiki/archive/projects/boat").exists()
+
+
+def test_move_file_path_jail_source(vault: VaultTools) -> None:
+    with pytest.raises(PermissionError):
+        vault.move_file("../outside.md", "inside.md")
+
+
+def test_move_file_path_jail_destination(vault: VaultTools, tmp_path: Path) -> None:
+    vault.write_file("inside.md", "content")
+
+    with pytest.raises(PermissionError):
+        vault.move_file("inside.md", "../escaped.md")
+
+    assert vault.read_file("inside.md") == "content"
+    assert not (tmp_path.parent / "escaped.md").exists()
+
+
+def test_move_file_is_exposed_as_a_tool(vault: VaultTools) -> None:
+    names = [s["function"]["name"] for s in vault.tool_schemas()]
+
+    assert "move_file" in names
+
+
+def test_move_file_dispatch(vault: VaultTools) -> None:
+    vault.write_file("from.md", "x")
+
+    vault.dispatch("move_file", {"path": "from.md", "new_path": "to.md"})
+
+    assert vault.read_file("to.md") == "x"
+    assert vault.read_file("from.md").startswith("[file not found")
+
+
+# ------------------------------------------------------------------
 # Tool surface: dispatch and schemas
 # ------------------------------------------------------------------
 

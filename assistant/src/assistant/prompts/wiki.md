@@ -16,6 +16,7 @@ vault/
     projects/<slug>.md         ← goal-oriented, time-bounded work
     areas/<slug>.md            ← ongoing life areas (health, family, hobbies…)
     people/<slug>.md           ← one page per recurring person
+    archive/projects/<slug>.md ← finished or abandoned projects, out of the way
   system/                      ← managed by the bot (schedule.md, topics/, skills/)
 ```
 
@@ -58,7 +59,7 @@ Where a weekday genuinely is required (the `now.md` header, and its **Upcoming**
 
 ## Wiki conventions
 
-- No plugin syntax; every page has a one-line entry in `wiki/index.md`.
+- No plugin syntax; every page has a one-line entry in `wiki/index.md` (archived pages under its `## Archived` section at the bottom).
 - Every project/area page starts with `**Status:** …` — one always-current paragraph. That is what catch-up questions read first.
 - Tasks are owned by project/area pages (or their sub-pages), under `## Tasks` — never by the journal or people pages. `now.md` additionally mirrors every open task (see its **Tasks** section below); the owning page's copy is the authority:
   - Open: `- [ ] description (due YYYY-MM-DD)` — the date is optional.
@@ -116,17 +117,31 @@ When one destination is clearly the best fit, file there without asking — corr
 - Historical questions → search `raw/journal/` and the page's History/Decisions sections; cite dates and files.
 - Valuable synthesis produced in chat gets filed back into the wiki, not left to evaporate.
 
+### Archive (when a project ends)
+
+When the user declares a project finished or abandoned — or approves the lint's proposal to retire one — move its page out of the live wiki:
+
+1. **Settle the page.** Write the final `**Status:**` paragraph (outcome + ISO date). Close every remaining task, or mark what was deliberately dropped; cancel or reword scheduled reminders that reference the project.
+2. **Move it** to `wiki/archive/projects/<slug>.md` with `move_file`.
+3. **Patch references.** `search` for the old path and update every wiki mention (people pages' thread pointers, other pages' Decisions/History). `raw/journal/` stays untouched — append-only, its path mentions are history, not links.
+4. **Re-file the index line.** Move the page's `index.md` line into the `## Archived` section at the bottom (create the section on first use).
+5. **Reconcile `now.md`.** A settled project has no open tasks, so usually nothing to do — but verify **Tasks** and **Waiting** no longer mention it.
+6. **Journal the event** in today's entry.
+
+Archived pages stay readable and searchable but are never listed as live work. Reviving a project is the same move in reverse: back to `wiki/projects/`, index line restored to the live list, journal entry.
+
 ### Compile (nightly scheduled job)
 
 1. Read today's and yesterday's journal; verify the wiki reflects every event (apply anything ingest missed).
 2. Recompute **Next due** for every routine.
 3. Rebuild `wiki/now.md` in full — its **Tasks** section by sweeping every wiki page's `## Tasks`, so a task ingest failed to mirror still reaches the dashboard within a day.
-4. Reconcile `wiki/index.md` against the pages on disk.
+4. Reconcile `wiki/index.md` against the pages on disk — pages under `wiki/archive/` belong in its `## Archived` section, everything else in the live list.
 5. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and a deadline lapsing is the canonical case: flag any task whose due date passed since the previous compile (the date of which is in `wiki/log.md`). Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job.
 
 ### Lint (weekly scheduled job, or on demand)
 
-- Projects with no journal mention in 30+ days → propose a status change.
+- Projects with no journal mention in 30+ days → propose archiving (see Archive above); never archive without the user's yes.
+- Open tasks or `now.md` mentions on a page under `wiki/archive/` → the page was retired too early; surface it.
 - Tasks open 21+ days → surface them.
 - Contradictions between a page's status and recent journal entries; orphan pages; index drift; schedule jobs referencing missing files.
 - Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
