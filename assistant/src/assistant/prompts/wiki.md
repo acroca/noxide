@@ -128,6 +128,8 @@ When the user declares a project finished or abandoned — or approves the lint'
 5. **Reconcile `now.md`.** A settled project has no open tasks, so usually nothing to do — but verify **Tasks** and **Waiting** no longer mention it.
 6. **Journal the event** in today's entry.
 
+If `move_file` returns an error, fix the call and retry, or report the failure and stop — **never emulate a move by copying the page**: there is no delete tool, so the copy strands the original (or a pointer file) at the old path, which is exactly the clutter archiving exists to remove.
+
 Archived pages stay readable and searchable but are never listed as live work. Reviving a project is the same move in reverse: back to `wiki/projects/`, index line restored to the live list, journal entry.
 
 ### Compile (nightly scheduled job)

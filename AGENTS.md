@@ -58,7 +58,7 @@ Entry point `__main__.py:_run()` wires everything together (note the circular de
 
 ### Tool plumbing
 
-Tools are plain OpenAI function schemas assembled in `Agent._all_tools()` from four sources: `VaultTools.tool_schemas()`, `Scheduler.tool_schemas()`, `SkillLibrary.tool_schemas()` (when wired), and callback-backed tools (`send_message`, `create_forum_topic`, `research`, `extract_attachment`, `fan_out`) added only when the corresponding callback was injected. Dispatch is by name in `Agent._dispatch_tool`. To add a tool: add its schema and its dispatch branch, keeping the return value a string (error strings like `[tool error: ...]` go back to the model).
+Tools are plain OpenAI function schemas assembled in `Agent._all_tools()` from four sources: `VaultTools.tool_schemas()`, `Scheduler.tool_schemas()`, `SkillLibrary.tool_schemas()` (when wired), and callback-backed tools (`send_message`, `create_forum_topic`, `research`, `extract_attachment`, `fan_out`) added only when the corresponding callback was injected. Dispatch is by name in `Agent._dispatch_tool`. To add a tool: add its schema and its dispatch branch, keeping the return value a string (error strings like `[tool error: ...]` go back to the model). Vault file tools have **two** dispatch layers: `VaultTools.dispatch` *and* the file-tools allowlist in `Agent._dispatch_tool_unlocked` — a tool present in the first but missing from the second is advertised to the model yet answers `[unknown tool: ...]` (how `move_file` first shipped broken; the agent-level test is what catches it).
 
 ### Conventions the code relies on
 

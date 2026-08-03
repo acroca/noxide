@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 from datetime import UTC, datetime
@@ -160,6 +161,31 @@ async def test_agent_tool_edit_file(agent: Agent, vault: VaultTools) -> None:
         await agent.run(chat_id=1, user_message="I fed the ants")
 
     assert vault.read_file("wiki/now.md") == "## Today\n- feed the ants (done)\n- gym\n"
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_move_file(agent: Agent, vault: VaultTools, tmp_path: Path) -> None:
+    """The agent-level routing must know move_file — VaultTools having the
+    method is not enough (the allowlist in _dispatch_tool_unlocked answered
+    [unknown tool: move_file] to a perfectly-formed call in production)."""
+    vault.write_file("wiki/projects/p.md", "page")
+
+    responses = [
+        _make_tool_call_response(
+            "move_file",
+            {"path": "wiki/projects/p.md", "new_path": "wiki/archive/projects/p.md"},
+        ),
+        _make_text_response("moved"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.run(chat_id=1, user_message="archive it")
+
+    assert reply == "moved"
+    assert not (tmp_path / "wiki/projects/p.md").exists()
+    assert (tmp_path / "wiki/archive/projects/p.md").read_text() == "page"
 
 
 @pytest.mark.asyncio
@@ -1537,6 +1563,122 @@ async def test_mutating_tool_waits_for_backup_lock(vault: VaultTools, tmp_path: 
     await run
 
     assert (tmp_path / "x.md").exists()
+
+
+# ------------------------------------------------------------------
+# Tool failure logging
+# ------------------------------------------------------------------
+# A production move_file failure left zero log trace: error results went back
+# to the model as strings and the operator saw nothing. Every failed tool call
+# must leave a WARNING with the tool name, the error, and the arguments.
+
+@pytest.mark.asyncio
+async def test_error_tool_result_is_logged_as_warning(
+    agent: Agent, vault: VaultTools, caplog: pytest.LogCaptureFixture
+) -> None:
+    responses = [
+        _make_tool_call_response("edit_file", {"path": "nope.md", "old_string": "a", "new_string": "b"}),
+        _make_text_response("done"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.agent"):
+        with patch("assistant.copilot.get_client", return_value=mock_client):
+            await agent.run(chat_id=1, user_message="edit")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "edit_file" in r.getMessage() and "[file not found" in r.getMessage()
+        for r in warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_exception_is_logged_with_traceback(
+    agent: Agent, vault: VaultTools, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dispatch exception (the model passed wrong argument names) must log
+    the traceback, not just silently become a [tool error: ...] string."""
+    vault.write_file("wiki/projects/p.md", "page")
+    responses = [
+        # Wrong argument name: dispatch does args["new_path"] -> KeyError
+        _make_tool_call_response("move_file", {"path": "wiki/projects/p.md", "destination": "wiki/archive/p.md"}),
+        _make_text_response("done"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.agent"):
+        with patch("assistant.copilot.get_client", return_value=mock_client):
+            reply = await agent.run(chat_id=1, user_message="archive it")
+
+    assert reply == "done"  # the loop survived the exception as before
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    joined = "\n".join(warnings)
+    assert "move_file" in joined
+    assert "KeyError" in joined
+    assert "new_path" in joined
+
+
+@pytest.mark.asyncio
+async def test_successful_tool_call_logs_no_warning(
+    agent: Agent, vault: VaultTools, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "memo.md").write_text("Buy milk")
+    responses = [
+        _make_tool_call_response("read_file", {"path": "memo.md"}),
+        _make_text_response("done"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.agent"):
+        with patch("assistant.copilot.get_client", return_value=mock_client):
+            await agent.run(chat_id=1, user_message="read")
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_unparseable_tool_arguments_are_logged(
+    agent: Agent, vault: VaultTools, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Malformed arguments JSON used to silently become {} — the model's call
+    then fails on missing keys with no trace of the real cause."""
+    bad = _make_tool_call_response("read_file", {})
+    bad["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = "{not json"
+    responses = [bad, _make_text_response("done")]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.agent"):
+        with patch("assistant.copilot.get_client", return_value=mock_client):
+            await agent.run(chat_id=1, user_message="go")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("read_file" in m and "arguments" in m for m in warnings)
+
+
+@pytest.mark.asyncio
+async def test_turn_log_names_the_tools_called(
+    agent: Agent, vault: VaultTools, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`tools=1` alone made it impossible to reconstruct a run from the logs."""
+    (tmp_path / "memo.md").write_text("x")
+    responses = [
+        _make_tool_call_response("read_file", {"path": "memo.md"}),
+        _make_text_response("done"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with caplog.at_level(logging.INFO, logger="assistant.agent"):
+        with patch("assistant.copilot.get_client", return_value=mock_client):
+            await agent.run(chat_id=1, user_message="read")
+
+    infos = [r.getMessage() for r in caplog.records if "agent turn=" in r.getMessage()]
+    assert any("read_file" in m for m in infos)
 
 
 def test_paths_touched_maps_forum_topic_writes() -> None:

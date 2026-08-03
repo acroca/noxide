@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
@@ -36,6 +37,15 @@ _TOOL_TIMEOUTS = {
     "extract_attachment": 300.0,
     "fan_out": 1800.0,
 }
+
+# Failed tool results all use a bracketed sentinel prefix ("[tool error: ...]",
+# "[file not found: ...]", "[move error: ...]", ...). Matching them here gives
+# every failed call a WARNING — error strings only go back to the model, so a
+# failure it silently works around is otherwise invisible to operators (a
+# production move_file failure left zero log trace).
+_ERROR_RESULT_RX = re.compile(
+    r"^\[[^\]\n]*\b(error|not found|timed out|denied|unknown tool)\b"
+)
 
 # A scheduled run replies with this sentinel (prompts/schedule.md) when it
 # finds its purpose already met; run_job then delivers nothing.
@@ -511,6 +521,7 @@ class Agent:
             "rewrite_file",
             "edit_file",
             "append_file",
+            "move_file",
             "list_files",
             "search",
         ):
@@ -673,11 +684,13 @@ class Agent:
                 thread_id=thread_id,
             )
             tool_calls_in_turn = extract_tool_calls(msg)
+            tool_names = ",".join(tc["function"]["name"] for tc in tool_calls_in_turn)
             logger.info(
-                "agent turn=%d finish=%s tools=%d tokens_in=%s tokens_out=%s duration=%.1fs",
+                "agent turn=%d finish=%s tools=%d%s tokens_in=%s tokens_out=%s duration=%.1fs",
                 iteration,
                 finish_reason,
                 len(tool_calls_in_turn),
+                f"({tool_names})" if tool_names else "",
                 usage_dict.get("prompt_tokens", "?"),
                 usage_dict.get("completion_tokens", "?"),
                 time.monotonic() - t_start,
@@ -703,6 +716,11 @@ class Agent:
                 try:
                     fn_args = json.loads(tc["function"].get("arguments", "{}"))
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "tool %s: unparseable arguments, dispatching with {}: %s",
+                        fn_name,
+                        str(tc["function"].get("arguments", ""))[:300],
+                    )
                     fn_args = {}
                 total_tool_calls += 1
                 touched |= _paths_touched(fn_name, fn_args)
@@ -712,6 +730,7 @@ class Agent:
                     except Exception:
                         logger.warning("on_research callback failed", exc_info=True)
                     on_research = None  # notify at most once per run
+                failure_tb = ""
                 try:
                     timeout = _TOOL_TIMEOUTS.get(fn_name, _TOOL_TIMEOUT)
                     result = await asyncio.wait_for(
@@ -724,6 +743,16 @@ class Agent:
                     result = f"[permission denied: {e}]"
                 except Exception as e:
                     result = f"[tool error: {e}]"
+                    failure_tb = traceback.format_exc()
+
+                if _ERROR_RESULT_RX.match(str(result)):
+                    logger.warning(
+                        "tool %s failed: %s | args: %s%s",
+                        fn_name,
+                        str(result)[:300],
+                        json.dumps(fn_args, ensure_ascii=False)[:300],
+                        f"\n{failure_tb}" if failure_tb else "",
+                    )
 
                 history.append({
                     "role": "tool",
