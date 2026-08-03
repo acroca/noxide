@@ -6,9 +6,12 @@ weekdays by arithmetic it is explicitly told not to trust. Each check returns
 ``path:line`` findings for the agent to fix; the module never writes to the
 vault.
 
-Scope is the live wiki only: ``raw/`` and ``system/`` are append-only or
-bot-managed, and ``wiki/log.md`` is append-only like the journal — a finding
-in any of them would nag forever with no fix allowed.
+Scope is ``wiki/`` minus ``wiki/log.md``: ``raw/`` and ``system/`` are
+append-only or bot-managed, and ``log.md`` is append-only like the journal —
+a finding in any of them would nag forever with no fix allowed. Archived
+pages (``wiki/archive/``) stay in scope for the weekday check (they remain
+editable, so a wrong label there is fixable) but are exempt from the task
+mirror, which covers live work only.
 """
 
 from __future__ import annotations
@@ -134,29 +137,35 @@ def _mirror_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> lis
             f"{_NOW_PATH} not found — the Tasks mirror cannot be verified",
         )]
 
+    # Only checkbox lines are mirror entries — a task named in now.md prose
+    # (a Last-7-days bullet, an Upcoming event) does not satisfy the Tasks
+    # inventory. Containment runs both ways so decoration on either side
+    # (page label in the mirror, marker added on the page) does not
+    # false-positive.
     findings = []
-    normalized_now = [_normalize(line) for line in now_lines]
+    mirror_lines = [
+        (i, m.group("text"))
+        for i, line in enumerate(now_lines, 1)
+        if (m := _OPEN_TASK.match(line))
+    ]
+    mirror_texts = [_normalize(text) for _, text in mirror_lines]
     for rel, line_no, text in tasks:
         needle = _normalize(text)
-        if not any(needle in haystack for haystack in normalized_now):
+        if not any(needle in mirrored for mirrored in mirror_texts):
             findings.append((
                 _MIRROR_HEADING,
                 f'{rel}:{line_no}: open task not mirrored in {_NOW_PATH}: "{text}"',
             ))
 
-    # Reverse direction: a now.md checkbox no page backs is a stale mirror
-    # line. Containment runs both ways so decoration on either side (page
-    # label in the mirror, marker added on the page) does not false-positive.
     task_texts = [_normalize(text) for _, _, text in tasks]
-    for i, line in enumerate(now_lines, 1):
-        if m := _OPEN_TASK.match(line):
-            mirrored = _normalize(m.group("text"))
-            if not any(t in mirrored or mirrored in t for t in task_texts):
-                findings.append((
-                    _MIRROR_HEADING,
-                    f"{_NOW_PATH}:{i}: mirror line matches no open task on any "
-                    f'wiki page: "{m.group("text")}"',
-                ))
+    for i, text in mirror_lines:
+        mirrored = _normalize(text)
+        if not any(t in mirrored or mirrored in t for t in task_texts):
+            findings.append((
+                _MIRROR_HEADING,
+                f"{_NOW_PATH}:{i}: mirror line matches no open task on any "
+                f'wiki page: "{text}"',
+            ))
     return findings
 
 

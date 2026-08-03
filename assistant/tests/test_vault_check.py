@@ -75,6 +75,22 @@ def test_mirror_match_tolerates_decoration_around_the_task_text(tmp_path: Path) 
     assert run_checks(tmp_path) == "[no findings]"
 
 
+def test_prose_mention_in_now_md_is_not_a_mirror_line(tmp_path: Path) -> None:
+    """A task named in a Last-7-days bullet (or any prose) is not mirrored —
+    only a checkbox line in now.md satisfies the Tasks-inventory invariant."""
+    _write(tmp_path, "wiki/areas/health.md", "## Tasks\n- [ ] book dentist\n")
+    _write(
+        tmp_path,
+        "wiki/now.md",
+        "## Tasks\n\n## Last 7 days\n- 2026-08-02: decided to book dentist soon\n",
+    )
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/areas/health.md:2" in report
+    assert "book dentist" in report
+
+
 def test_done_tasks_need_no_mirror(tmp_path: Path) -> None:
     _clean_vault(tmp_path)
     _write(tmp_path, "wiki/projects/attic.md", "## Tasks\n- [x] clear attic (done 2026-08-01)\n")
