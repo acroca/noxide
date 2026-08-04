@@ -640,3 +640,60 @@ def test_interior_version_tokens_are_kept(vault: VaultTools) -> None:
     body = "# A\n[version: ab12cd34]\nmore text"
     vault.create_file("wiki/a.md", body)
     assert vault.read_file("wiki/a.md") == body
+
+
+# ---------------------------------------------------------------------------
+# Append-only enforcement: raw/journal/ and wiki/log.md are the permanent
+# record — history is corrected by new entries, never by editing old ones.
+# ---------------------------------------------------------------------------
+
+
+def test_edit_file_refuses_journal(vault: VaultTools) -> None:
+    vault.write_file("raw/journal/2026-08-01.md", "# 2026-08-01\n- 10:00 fed the ants")
+    result = vault.edit_file("raw/journal/2026-08-01.md", "fed the ants", "did nothing")
+    assert result.startswith("[edit error:")
+    assert "append-only" in result
+    assert "fed the ants" in vault.read_file("raw/journal/2026-08-01.md")
+
+
+def test_rewrite_file_refuses_journal(vault: VaultTools) -> None:
+    vault.write_file("raw/journal/2026-08-01.md", "# 2026-08-01\n- 10:00 original")
+    result = vault.rewrite_file(
+        "raw/journal/2026-08-01.md", "rewritten history", vault.version("raw/journal/2026-08-01.md")
+    )
+    assert result.startswith("[rewrite error:")
+    assert "append-only" in result
+    assert "original" in vault.read_file("raw/journal/2026-08-01.md")
+
+
+def test_edit_file_refuses_log(vault: VaultTools) -> None:
+    vault.write_file("wiki/log.md", "## [2026-08-01] compile | ok")
+    result = vault.edit_file("wiki/log.md", "ok", "great")
+    assert result.startswith("[edit error:")
+    assert "append-only" in result
+
+
+def test_move_file_refuses_journal_source(vault: VaultTools) -> None:
+    vault.write_file("raw/journal/2026-08-01.md", "# 2026-08-01")
+    result = vault.move_file("raw/journal/2026-08-01.md", "wiki/old-journal.md")
+    assert result.startswith("[move error:")
+    assert "append-only" in result
+
+
+def test_move_file_refuses_protected_destination(vault: VaultTools) -> None:
+    vault.write_file("wiki/notes.md", "notes")
+    result = vault.move_file("wiki/notes.md", "raw/journal/2026-08-01.md")
+    assert result.startswith("[move error:")
+    assert "append-only" in result
+
+
+def test_append_and_create_still_allowed_in_journal(vault: VaultTools) -> None:
+    assert vault.create_file("raw/journal/2026-08-02.md", "# 2026-08-02").startswith("Created")
+    assert vault.append_file("raw/journal/2026-08-02.md", "\n- 09:00 entry").startswith("Appended")
+
+
+def test_append_only_predicate_uses_resolved_path(vault: VaultTools) -> None:
+    vault.write_file("raw/journal/2026-08-01.md", "# 2026-08-01\n- 10:00 x")
+    result = vault.edit_file("wiki/../raw/journal/2026-08-01.md", "x", "y")
+    assert result.startswith("[edit error:")
+    assert "append-only" in result

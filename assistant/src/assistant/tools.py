@@ -88,6 +88,18 @@ class VaultTools:
         """Absolute path for a vault-relative path; raises PermissionError on escape."""
         return self._safe_path(rel)
 
+    def _append_only_rel(self, p: Path) -> str | None:
+        """Vault-relative form of *p* when it lies in an append-only area.
+
+        raw/journal/ and wiki/log.md are the permanent record: history is
+        corrected by new entries, never by editing old ones. Decided on the
+        resolved path so ``wiki/../raw/journal/…`` doesn't slip past.
+        """
+        parts = p.relative_to(self._root).parts
+        if parts[:2] == ("raw", "journal") or parts == ("wiki", "log.md"):
+            return "/".join(parts)
+        return None
+
     # ------------------------------------------------------------------
     # File tools
     # ------------------------------------------------------------------
@@ -149,6 +161,11 @@ class VaultTools:
         """
         content = _strip_leaked_version_token(content)
         p = self._safe_path(path)
+        if rel := self._append_only_rel(p):
+            return (
+                f"[rewrite error: {rel} is append-only history — "
+                "record a correction as a new entry instead]"
+            )
         if not p.exists():
             return f"[rewrite error: file not found: {path} — use create_file for new files]"
         current = _version_of(p.read_text(encoding="utf-8"))
@@ -175,6 +192,11 @@ class VaultTools:
         line the caller meant.
         """
         p = self._safe_path(path)
+        if rel := self._append_only_rel(p):
+            return (
+                f"[edit error: {rel} is append-only history — "
+                "record a correction as a new entry instead]"
+            )
         if not p.exists():
             return f"[file not found: {path}]"
         content = p.read_text(encoding="utf-8")
@@ -211,6 +233,12 @@ class VaultTools:
         """
         src = self._safe_path(path)
         dst = self._safe_path(new_path)
+        for p in (src, dst):
+            if rel := self._append_only_rel(p):
+                return (
+                    f"[move error: {rel} is append-only history — "
+                    "journal and log files stay in place]"
+                )
         if not src.exists():
             return f"[file not found: {path}]"
         if not src.is_file():
