@@ -31,6 +31,6 @@ When the user mentions an upcoming appointment, visit, event, or decision, sched
 
 A scheduled reminder captures its text at creation time and fires later without this conversation's context — so if a detail changes in between, the reminder goes stale (e.g. asking a question that was already answered). To keep them in sync:
 
-- When you schedule a reminder tied to an event/task/decision, note it on the primary wiki page for that item — the relevant `now.md` line, the task, or the event block — with a short "reminder scheduled" marker and, when it carries a still-open question, the exact open point.
-- When ingest or compile updates that item (a decision made, a task closed, an event moved), check whether a reminder is noted on it. If so, cancel and reschedule the job with corrected text, or drop the stale question.
+- When you schedule a one-off reminder tied to an event/task/decision, note it on the primary wiki page for that item — the relevant `now.md` line, the task, or the event block — with the marker `[reminder:<job id>]` (the id the schedule tool returned) and, when it carries a still-open question, the exact open point. Use that exact token: `check_vault` verifies every pending one-off job has a marker and flags markers whose job no longer exists.
+- When ingest or compile updates an item carrying a `[reminder:…]` marker (a decision made, a task closed, an outcome reported, an event moved), the marked reminder is now suspect: cancel it if its purpose is met (and remove the marker), or reschedule it with corrected text.
 - Prefer neutral reminder wording that cannot go obsolete (state facts, avoid baking in questions already close to being resolved).

@@ -1381,6 +1381,13 @@ def test_schedule_prompt_documents_state_snapshot(vault: VaultTools) -> None:
     assert "state snapshot" in prompt
 
 
+def test_schedule_prompt_uses_canonical_reminder_marker(vault: VaultTools) -> None:
+    """The trace rule must name the checkable [reminder:<id>] token —
+    free-form markers are invisible to check_vault."""
+    agent = Agent(vault_tools=vault, schedule_dispatcher=lambda name, args: "", history_size=10)
+    assert "[reminder:" in agent._load_system_prompt()
+
+
 @pytest.mark.asyncio
 async def test_run_job_injects_referenced_page_state(vault: VaultTools) -> None:
     """The live turn of a scheduled run carries the current content of every

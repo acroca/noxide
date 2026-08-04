@@ -11,7 +11,9 @@ append-only or bot-managed, and ``log.md`` is append-only like the journal —
 a finding in any of them would nag forever with no fix allowed. Archived
 pages (``wiki/archive/``) stay in scope for the weekday check (they remain
 editable, so a wrong label there is fixable) but are exempt from the task
-mirror, which covers live work only.
+mirror, which covers live work only. The reminder-marker check additionally
+*reads* ``system/schedule.md`` as input (the pending-job list) — findings
+still point at wiki pages or at the schedule row to fix.
 """
 
 from __future__ import annotations
@@ -65,7 +67,11 @@ def run_checks(root: Path) -> str:
     Returns the sentinel ``"[no findings]"`` when the vault is consistent.
     """
     wiki_files = _wiki_files(root)
-    findings = _mirror_findings(root, wiki_files) + _weekday_findings(wiki_files)
+    findings = (
+        _mirror_findings(root, wiki_files)
+        + _weekday_findings(wiki_files)
+        + _reminder_findings(root, wiki_files)
+    )
     if not findings:
         return "[no findings]"
 
@@ -184,6 +190,76 @@ def _weekday_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str
                 for m in rx.finditer(line):
                     if issue := _check_pair(m.group("wd"), m.group("date")):
                         findings.append((_WEEKDAY_HEADING, f"{rel}:{i}: {issue}"))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Reminder markers: every pending one-off scheduled job leaves a
+# [reminder:<id>] marker on a wiki page (so ingest trips over it right where
+# it edits), and every marker references a still-pending job (a fired or
+# cancelled job's marker is stale and should be removed or rescheduled).
+# ---------------------------------------------------------------------------
+
+_REMINDER_HEADING = "Reminder markers (system/schedule.md vs wiki pages)"
+
+_SCHEDULE_PATH = "system/schedule.md"
+_REMINDER_MARKER = re.compile(r"\[reminder:([0-9a-f]{8})\]")
+_JOB_ID = re.compile(r"[0-9a-f]{8}")
+
+
+def _schedule_jobs(root: Path) -> tuple[set[str], set[str]] | None:
+    """(one-off ids, all ids) from the schedule table, or None when absent.
+
+    Only the first three columns are parsed — id and recurring cells cannot
+    contain pipes, so prompt-cell pipes further right are harmless.
+    """
+    path = root / _SCHEDULE_PATH
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    one_off: set[str] = set()
+    all_ids: set[str] = set()
+    for line in lines:
+        cells = line.split("|")
+        if len(cells) < 4:
+            continue
+        job_id = cells[1].strip()
+        if not _JOB_ID.fullmatch(job_id):
+            continue
+        all_ids.add(job_id)
+        if cells[3].strip().lower() == "false":
+            one_off.add(job_id)
+    return one_off, all_ids
+
+
+def _reminder_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
+    jobs = _schedule_jobs(root)
+    if jobs is None:
+        # Scheduling not in use — a marker cannot be judged stale, and there
+        # are no pending jobs to demand markers for.
+        return []
+    one_off, all_ids = jobs
+
+    findings = []
+    marked: set[str] = set()
+    for rel, lines in wiki_files:
+        for i, line in enumerate(lines, 1):
+            for job_id in _REMINDER_MARKER.findall(line):
+                marked.add(job_id)
+                if job_id not in all_ids:
+                    findings.append((
+                        _REMINDER_HEADING,
+                        f"{rel}:{i}: marker [reminder:{job_id}] references no "
+                        f"pending job — remove it or reschedule",
+                    ))
+    for job_id in sorted(one_off - marked):
+        findings.append((
+            _REMINDER_HEADING,
+            f"{_SCHEDULE_PATH}: one-off job {job_id} has no [reminder:{job_id}] "
+            f"marker on any wiki page — add one beside the item it concerns, "
+            f"or cancel the job if it is obsolete",
+        ))
     return findings
 
 

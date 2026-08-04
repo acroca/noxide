@@ -228,3 +228,91 @@ def test_report_caps_findings_and_says_so(tmp_path: Path) -> None:
     assert "120 findings" in report
     assert "truncated" in report
     assert report.count("- [ ] task number") <= 100
+
+
+# ---------------------------------------------------------------------------
+# Reminder markers: every pending one-off job leaves a [reminder:<id>] marker
+# on a wiki page, and every marker references a still-pending job.
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_HEADER = (
+    "# Schedule\n\n"
+    "| id | when | recurring | prompt | created | next |\n"
+    "|-----|------|-----------|--------|---------|------|\n"
+)
+
+
+def _schedule(root: Path, *rows: str) -> None:
+    _write(root, "system/schedule.md", _SCHEDULE_HEADER + "".join(r + "\n" for r in rows))
+
+
+def _one_off_row(job_id: str, prompt: str = "Ask how it went.") -> str:
+    return f"| {job_id} | 2026-08-12T18:00:00+00:00 | false | {prompt} | 2026-08-01T00:00:00+00:00 |  |"
+
+
+def _recurring_row(job_id: str) -> str:
+    return f"| {job_id} | 0 7 * * * | true | Daily pill reminder. | 2026-08-01T00:00:00+00:00 | 2026-08-05T05:00:00+00:00 |"
+
+
+def test_one_off_job_without_marker_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _one_off_row("ab12cd34"))
+
+    report = run_checks(tmp_path)
+
+    assert "system/schedule.md" in report
+    assert "[reminder:ab12cd34]" in report
+
+
+def test_one_off_job_with_marker_passes(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _one_off_row("ab12cd34"))
+    _write(
+        tmp_path,
+        "wiki/areas/salud.md",
+        "# Salud\n\nVisita hepatólogo 2026-08-12 [reminder:ab12cd34]\n",
+    )
+
+    assert run_checks(tmp_path) == "[no findings]"
+
+
+def test_recurring_jobs_need_no_marker(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _recurring_row("11223344"))
+
+    assert run_checks(tmp_path) == "[no findings]"
+
+
+def test_stale_marker_is_reported_with_location(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _one_off_row("ab12cd34"))
+    _write(
+        tmp_path,
+        "wiki/areas/salud.md",
+        "# Salud\n\nVisita [reminder:ab12cd34]\n\nOtra cosa [reminder:deadbeef]\n",
+    )
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/areas/salud.md:5" in report
+    assert "deadbeef" in report
+
+
+def test_marker_for_recurring_job_is_not_stale(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _recurring_row("11223344"))
+    _write(
+        tmp_path,
+        "wiki/routines.md",
+        "# Rutinas\n\nPastilla diaria [reminder:11223344]\n",
+    )
+
+    assert run_checks(tmp_path) == "[no findings]"
+
+
+def test_no_schedule_file_skips_reminder_checks(tmp_path: Path) -> None:
+    """Scheduling may be disabled; a marker cannot be judged stale then."""
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/areas/salud.md", "# Salud\n\nVisita [reminder:deadbeef]\n")
+
+    assert run_checks(tmp_path) == "[no findings]"
