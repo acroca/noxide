@@ -71,6 +71,7 @@ def run_checks(root: Path) -> str:
         _mirror_findings(root, wiki_files)
         + _weekday_findings(wiki_files)
         + _reminder_findings(root, wiki_files)
+        + _schedule_hygiene_findings(root)
         + _version_token_findings(wiki_files)
     )
     if not findings:
@@ -208,39 +209,38 @@ _REMINDER_MARKER = re.compile(r"\[reminder:([0-9a-f]{8})\]")
 _JOB_ID = re.compile(r"[0-9a-f]{8}")
 
 
-def _schedule_jobs(root: Path) -> tuple[set[str], set[str]] | None:
-    """(one-off ids, all ids) from the schedule table, or None when absent.
+def _schedule_rows(root: Path) -> list[tuple[int, str, str, str, str]] | None:
+    """(line no, id, when, recurring, raw line) per table row; None when absent.
 
-    Only the first three columns are parsed — id and recurring cells cannot
-    contain pipes, so prompt-cell pipes further right are harmless.
+    Only the first three columns are parsed positionally — id, when and
+    recurring cells cannot contain pipes, so prompt-cell pipes further right
+    are harmless.
     """
     path = root / _SCHEDULE_PATH
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return None
-    one_off: set[str] = set()
-    all_ids: set[str] = set()
-    for line in lines:
+    rows = []
+    for i, line in enumerate(lines, 1):
         cells = line.split("|")
         if len(cells) < 4:
             continue
         job_id = cells[1].strip()
         if not _JOB_ID.fullmatch(job_id):
             continue
-        all_ids.add(job_id)
-        if cells[3].strip().lower() == "false":
-            one_off.add(job_id)
-    return one_off, all_ids
+        rows.append((i, job_id, cells[2].strip(), cells[3].strip().lower(), line))
+    return rows
 
 
 def _reminder_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
-    jobs = _schedule_jobs(root)
-    if jobs is None:
+    rows = _schedule_rows(root)
+    if rows is None:
         # Scheduling not in use — a marker cannot be judged stale, and there
         # are no pending jobs to demand markers for.
         return []
-    one_off, all_ids = jobs
+    all_ids = {job_id for _, job_id, _, _, _ in rows}
+    one_off = {job_id for _, job_id, _, recurring, _ in rows if recurring == "false"}
 
     findings = []
     marked: set[str] = set()
@@ -261,6 +261,50 @@ def _reminder_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> l
             f"marker on any wiki page — add one beside the item it concerns, "
             f"or cancel the job if it is obsolete",
         ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Schedule hygiene: rows carrying what the schedule tool now refuses to
+# create — hand-written [scheduled run] tags, restated close contract,
+# numeric cron weekdays (APScheduler numbers from Monday=0, classic cron
+# from Sunday=0, so a numeric day-of-week fires on the wrong day). The tool
+# guards new jobs; this catches rows that predate it or were hand-edited.
+# ---------------------------------------------------------------------------
+
+_HYGIENE_HEADING = "Schedule hygiene (system/schedule.md)"
+
+_SCHEDULED_RUN_TAG = re.compile(r"\[scheduled run\]", re.IGNORECASE)
+_SILENT_SENTINEL = re.compile(r"\[silent\]", re.IGNORECASE)
+
+
+def _schedule_hygiene_findings(root: Path) -> list[tuple[str, str]]:
+    rows = _schedule_rows(root)
+    if rows is None:
+        return []
+    findings = []
+    for i, job_id, when, recurring, line in rows:
+        # Scanning the raw line is safe: id/when/recurring cells can't
+        # contain these patterns, so a hit is always in the prompt cell.
+        if _SCHEDULED_RUN_TAG.search(line):
+            findings.append((
+                _HYGIENE_HEADING,
+                f'{_SCHEDULE_PATH}:{i}: job {job_id} prompt hand-writes '
+                f'"[scheduled run]" — the runner prepends it; rewrite the prompt without it',
+            ))
+        elif _SILENT_SENTINEL.search(line):
+            findings.append((
+                _HYGIENE_HEADING,
+                f'{_SCHEDULE_PATH}:{i}: job {job_id} prompt restates the close '
+                f'contract ("[silent]") — it applies on its own; rewrite the prompt without it',
+            ))
+        cron_fields = when.split()
+        if recurring == "true" and len(cron_fields) == 5 and re.search(r"\d", cron_fields[4]):
+            findings.append((
+                _HYGIENE_HEADING,
+                f"{_SCHEDULE_PATH}:{i}: job {job_id} cron day-of-week uses numbers "
+                f"— write names (SUN, MON, ...): the numbering is ambiguous",
+            ))
     return findings
 
 

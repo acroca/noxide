@@ -332,3 +332,52 @@ def test_leaked_version_token_is_reported(tmp_path: Path) -> None:
 
     assert "wiki/areas/salud.md:4" in report
     assert "version token" in report
+
+
+# ---------------------------------------------------------------------------
+# Schedule hygiene: existing/hand-written rows carrying what the schedule
+# tool now refuses — hand-written [scheduled run] tags, restated close
+# contract, numeric cron weekdays.
+# ---------------------------------------------------------------------------
+
+
+def test_job_prompt_with_scheduled_run_tag_is_flagged(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _one_off_row("ab12cd34", "[scheduled run] Remind Albert of X."))
+
+    report = run_checks(tmp_path)
+
+    assert "system/schedule.md:5" in report
+    assert "[scheduled run]" in report
+
+
+def test_job_prompt_restating_silent_contract_is_flagged(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, _one_off_row("ab12cd34", "Check state; if met, responde [silent]."))
+    _write(tmp_path, "wiki/a.md", "# A\n\nitem [reminder:ab12cd34]\n")
+
+    report = run_checks(tmp_path)
+
+    assert "system/schedule.md:5" in report
+    assert "close contract" in report
+
+
+def test_numeric_cron_weekday_row_is_flagged(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(tmp_path, "| 11223344 | 0 8 * * 0 | true | Weekly check. | 2026-08-01T00:00:00+00:00 |  |")
+
+    report = run_checks(tmp_path)
+
+    assert "system/schedule.md:5" in report
+    assert "day-of-week" in report
+
+
+def test_clean_schedule_rows_pass_hygiene(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _schedule(
+        tmp_path,
+        _recurring_row("11223344"),
+        "| 55667788 | 0 8 * * SUN | true | Weekly stock check. | 2026-08-01T00:00:00+00:00 |  |",
+    )
+
+    assert run_checks(tmp_path) == "[no findings]"

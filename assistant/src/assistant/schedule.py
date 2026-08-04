@@ -45,6 +45,17 @@ _MISFIRE_GRACE = 12 * 3600  # 12 hours in seconds
 # Cell boundaries are bare pipes; an escaped \| belongs to the prompt text.
 _CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
+# Rejected in new job prompts (see the refusals in Scheduler.schedule);
+# vault_check flags the same patterns in existing/hand-written rows.
+_SCHEDULED_RUN_TAG_RX = re.compile(r"\[scheduled run\]", re.IGNORECASE)
+_SILENT_SENTINEL_RX = re.compile(r"\[silent\]", re.IGNORECASE)
+
+
+def _has_numeric_cron_dow(cron: str) -> bool:
+    """True when a 5-field cron expression's day-of-week field contains digits."""
+    fields = cron.split()
+    return len(fields) == 5 and bool(re.search(r"\d", fields[4]))
+
 
 def _escape_cell(value: str) -> str:
     """Escape cell delimiters and refuse values that could create another row."""
@@ -456,6 +467,26 @@ class Scheduler:
             return "[error: schedule time must be a single line]"
         if "\r" in prompt or "\n" in prompt:
             return "[error: schedule prompt must be a single line]"
+        # Refusals for what prompts/schedule.md used to merely warn about:
+        # per-job contract copies drift, and a hand-written "[scheduled run]"
+        # tag doubles the one the runner prepends at fire time.
+        if _SCHEDULED_RUN_TAG_RX.search(prompt):
+            return (
+                '[error: do not write "[scheduled run]" into the job prompt — '
+                "the runner prepends it at fire time; drop it and reschedule]"
+            )
+        if _SILENT_SENTINEL_RX.search(prompt):
+            return (
+                '[error: the prompt restates the close contract ("[silent]") — '
+                "it applies to every scheduled run on its own; drop it and reschedule]"
+            )
+        # APScheduler numbers weekdays from Monday=0 while classic cron uses
+        # Sunday=0, so a numeric day-of-week silently fires on the wrong day.
+        if recurring and _has_numeric_cron_dow(when):
+            return (
+                "[error: cron day-of-week must use names (SUN, MON, ...), never "
+                "numbers — the numbering is ambiguous and fires on the wrong day]"
+            )
 
         job_id = _generate_id()
         now_iso = datetime.now(tz=UTC).isoformat()

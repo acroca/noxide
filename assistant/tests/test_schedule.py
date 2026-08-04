@@ -745,3 +745,42 @@ async def test_reload_skips_a_one_off_that_is_still_running(vault: VaultTools) -
 
     release.set()
     await fire
+
+
+# ------------------------------------------------------------------
+# Input hardening: footguns the prompt used to merely warn about
+# ------------------------------------------------------------------
+
+
+def _hardening_scheduler(tmp_path: Path) -> Scheduler:
+    return Scheduler(vault_tools=VaultTools(tmp_path), run_job_fn=AsyncMock(), tz_name="UTC")
+
+
+def test_schedule_rejects_prompt_with_scheduled_run_tag(tmp_path: Path) -> None:
+    s = _hardening_scheduler(tmp_path)
+    result = s.schedule("in 10 minutes", "[scheduled run] Remind Albert to stretch.", False)
+    assert result.startswith("[error:")
+    assert "[scheduled run]" in result
+
+
+def test_schedule_rejects_prompt_restating_silent_contract(tmp_path: Path) -> None:
+    s = _hardening_scheduler(tmp_path)
+    result = s.schedule("in 10 minutes", "Check the wiki; if done, reply [silent].", False)
+    assert result.startswith("[error:")
+
+
+def test_schedule_rejects_numeric_cron_weekday(tmp_path: Path) -> None:
+    s = _hardening_scheduler(tmp_path)
+    result = s.schedule("0 8 * * 0", "Weekly stock check.", True)
+    assert result.startswith("[error:")
+    assert "SUN" in result
+
+
+def test_schedule_accepts_named_cron_weekday(tmp_path: Path) -> None:
+    s = _hardening_scheduler(tmp_path)
+    assert s.schedule("0 8 * * SUN", "Weekly stock check.", True).startswith("Scheduled job")
+
+
+def test_schedule_accepts_digits_in_other_cron_fields(tmp_path: Path) -> None:
+    s = _hardening_scheduler(tmp_path)
+    assert s.schedule("0 9 27 * *", "Monthly top-up.", True).startswith("Scheduled job")
