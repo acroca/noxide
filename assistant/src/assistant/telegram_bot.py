@@ -172,22 +172,26 @@ class TelegramBot:
             persisted_chat_id if persisted_chat_id is not None else default_chat_id
         )
 
-    async def send_message(self, text: str, message_thread_id: int | None = None) -> None:
+    async def send_message(self, text: str, message_thread_id: int | None = None) -> int | None:
         """Send a proactive message (e.g. from a scheduled job).
 
         Pass ``message_thread_id`` to deliver the message into a specific forum topic.
+        Returns the chat id the message was delivered to — the caller may need
+        the real conversation key (the agent mirrors scheduled-run deliveries
+        into that conversation's history) — or None when the message was dropped.
         """
         if self._chat_id is None:
             logger.warning("send_message called but no chat_id set yet; dropping: %r", text[:80])
-            return
+            return None
         if self._app is None:
             logger.warning("send_message called before bot started; dropping.")
-            return
+            return None
         kwargs: dict[str, Any] = {"chat_id": self._chat_id, "text": ""}
         if message_thread_id is not None:
             kwargs["message_thread_id"] = message_thread_id
         for chunk in _split_message(text):
             await self._app.bot.send_message(**{**kwargs, "text": chunk})
+        return self._chat_id
 
     async def create_forum_topic(self, name: str) -> dict[str, Any]:
         """Create a new forum topic in the group and return its data dict.

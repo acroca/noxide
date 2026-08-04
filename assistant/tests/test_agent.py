@@ -1193,6 +1193,163 @@ async def test_run_job_sends_nothing_for_empty_reply(vault: VaultTools) -> None:
 
 
 # ------------------------------------------------------------------
+# Mirroring scheduled-run deliveries into the target conversation
+# ------------------------------------------------------------------
+
+_NOTE_RX = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} local, sent from a scheduled run\] "
+)
+
+
+def _mirror_agent(vault: VaultTools, deliver_to: int | None = 7) -> Agent:
+    """Agent whose send fn reports delivering to chat ``deliver_to``."""
+
+    async def send(text: str, thread_id: int | None = None) -> int | None:
+        return deliver_to
+
+    return Agent(vault_tools=vault, send_message_fn=send, history_size=10)
+
+
+def _mirror_notes(messages: list[dict]) -> list[str]:
+    return [
+        m["content"]
+        for m in messages
+        if m.get("role") == "assistant" and _NOTE_RX.match(m.get("content") or "")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_is_mirrored_before_next_user_message(vault: VaultTools) -> None:
+    """A reminder delivered by a scheduled run shows up in the target
+    conversation's history, so the user's reply to it has context."""
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
+        _make_text_response('{"silent": false, "message": null}'),
+        _make_text_response("Logged!"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+        await agent.run(chat_id=7, user_message="Pill taken")
+
+    messages = mock_client.chat.call_args[0][0]
+    notes = _mirror_notes(messages)
+    assert len(notes) == 1
+    assert notes[0].endswith("Reminder: take the pill")
+    note_idx = next(i for i, m in enumerate(messages) if m.get("content") == notes[0])
+    user_idx = next(
+        i for i, m in enumerate(messages)
+        if m.get("role") == "user" and "Pill taken" in str(m.get("content"))
+    )
+    assert note_idx < user_idx
+
+
+@pytest.mark.asyncio
+async def test_mirrored_note_lands_only_in_target_thread(vault: VaultTools) -> None:
+    """A delivery into a forum topic is mirrored into that topic's
+    conversation, not the general one."""
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response(
+            "send_message", {"text": "Topic reminder", "message_thread_id": 42}
+        ),
+        _make_text_response('{"silent": false, "message": null}'),
+        _make_text_response("reply general"),
+        _make_text_response("reply topic"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind in the topic")
+        await agent.run(chat_id=7, user_message="Hi general")
+        general_messages = mock_client.chat.call_args[0][0]
+        await agent.run(chat_id=7, user_message="Hi topic", thread_id=42)
+        topic_messages = mock_client.chat.call_args[0][0]
+
+    assert _mirror_notes(general_messages) == []
+    assert len(_mirror_notes(topic_messages)) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_mirror_when_delivery_target_unknown(vault: VaultTools) -> None:
+    """A send fn that cannot say where it delivered (dropped message, legacy
+    None-returning signature) queues no note anywhere."""
+    agent = _mirror_agent(vault, deliver_to=None)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
+        _make_text_response('{"silent": false, "message": null}'),
+        _make_text_response("Logged!"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+        await agent.run(chat_id=7, user_message="Pill taken")
+
+    assert _mirror_notes(mock_client.chat.call_args[0][0]) == []
+
+
+@pytest.mark.asyncio
+async def test_close_json_delivery_is_mirrored(vault: VaultTools) -> None:
+    """A reminder delivered via the job-close message (no send_message call)
+    is mirrored like any other delivery."""
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response('{"silent": false, "message": "Cita con el dentista"}'),
+        _make_text_response("ok"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind about the dentist")
+        await agent.run(chat_id=7, user_message="Vale, gracias")
+
+    notes = _mirror_notes(mock_client.chat.call_args[0][0])
+    assert len(notes) == 1
+    assert notes[0].endswith("Cita con el dentista")
+
+
+@pytest.mark.asyncio
+async def test_raw_fallback_delivery_is_mirrored(vault: VaultTools) -> None:
+    """The safety-net raw-reply delivery is mirrored too."""
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response("Plain reminder"),
+        _make_text_response("ok"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user")
+        await agent.run(chat_id=7, user_message="ok!")
+
+    notes = _mirror_notes(mock_client.chat.call_args[0][0])
+    assert len(notes) == 1
+    assert notes[0].endswith("Plain reminder")
+
+
+@pytest.mark.asyncio
+async def test_clear_history_drops_pending_notes(vault: VaultTools) -> None:
+    """/clear forgets queued cross-conversation notes along with history."""
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
+        _make_text_response('{"silent": false, "message": null}'),
+        _make_text_response("Logged!"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+        agent.clear_history(7)
+        await agent.run(chat_id=7, user_message="Pill taken")
+
+    assert _mirror_notes(mock_client.chat.call_args[0][0]) == []
+
+
+# ------------------------------------------------------------------
 # Job-close JSON contract
 # ------------------------------------------------------------------
 

@@ -742,6 +742,22 @@ async def test_pending_updates_reports_queue_depth() -> None:
     assert bot.pending_updates() == 4
 
 
+async def test_send_message_returns_delivered_chat_id() -> None:
+    """The sender reports where it delivered, so the agent can mirror
+    scheduled-run messages into that conversation's history."""
+    bot, app = _lifecycle_bot()
+    await bot.start()
+
+    assert await bot.send_message("hola") == 777
+
+
+async def test_send_message_returns_none_when_dropped() -> None:
+    bot, _ = _lifecycle_bot(chat_id=None)
+    await bot.start()
+
+    assert await bot.send_message("hola") is None
+
+
 async def test_lifecycle_messages_dropped_without_chat_id() -> None:
     bot, app = _lifecycle_bot(chat_id=None)
 

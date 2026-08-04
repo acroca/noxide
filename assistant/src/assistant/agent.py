@@ -51,6 +51,12 @@ _ERROR_RESULT_RX = re.compile(
 # finds its purpose already met; run_job then delivers nothing.
 _SILENT_SENTINEL = "[silent]"
 
+# A proactive sender: delivers text (optionally into a forum topic) and
+# returns the chat id it delivered to, or None when the message was dropped.
+# The chat id is how run_job learns the real conversation key when mirroring
+# a delivery into that conversation's history.
+SendMessageFn = Callable[[str, int | None], Coroutine[Any, Any, int | None]]
+
 # Scheduled runs close with a JSON object matching this schema (the contract
 # in prompts/schedule.md). It also rides job-run requests as response_format:
 # Copilot currently ignores it (verified 2026-07-29 — accepted, not enforced,
@@ -245,7 +251,7 @@ class Agent:
         vault_tools: VaultTools,
         schedule_dispatcher: Callable[[str, dict[str, Any]], str] | None = None,
         schedule_schemas: list[dict[str, Any]] | None = None,
-        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        send_message_fn: SendMessageFn | None = None,
         create_forum_topic_fn: Callable[[str], Coroutine[Any, Any, dict[str, Any]]] | None = None,
         research_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         extract_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
@@ -266,6 +272,13 @@ class Agent:
         self._skills = skills
         self._backup = backup
         self._histories: dict[tuple[int, int | None], ConversationHistory] = {}
+        # Scheduled-run deliveries queued for mirroring into the target
+        # conversation's history, keyed like _histories. Queued at send time,
+        # drained by that conversation's next run — appending directly from
+        # the job run could interleave into an in-flight run's tool sequence,
+        # and waiting for the target's run lock inside a send_message dispatch
+        # could outlive the tool timeout and bait the model into re-sending.
+        self._pending_notes: dict[tuple[int, int | None], deque[str]] = {}
         # One lock per conversation: concurrent runs for the same
         # (chat_id, thread_id) would interleave appends into one history and
         # produce tool messages the API rejects. Different conversations
@@ -280,9 +293,25 @@ class Agent:
             self._histories[key] = ConversationHistory(self._history_size)
         return self._histories[key]
 
+    def _local_stamp(self) -> str:
+        return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
+
+    def _queue_sent_note(self, chat_id: int, thread_id: int | None, text: str) -> None:
+        """Queue a scheduled-run delivery for the target conversation's history.
+
+        The stamp is frozen now, like user-message stamps; the provenance
+        prefix tells the model this is a message it already sent, not one to
+        send again.
+        """
+        notes = self._pending_notes.setdefault(
+            (chat_id, thread_id), deque(maxlen=self._history_size)
+        )
+        notes.append(f"[{self._local_stamp()}, sent from a scheduled run] {text}")
+
     def clear_history(self, chat_id: int, thread_id: int | None = None) -> None:
         """Forget one chat/topic's conversation; the next run starts fresh."""
         self._histories.pop((chat_id, thread_id), None)
+        self._pending_notes.pop((chat_id, thread_id), None)
 
     def _base_prompt(self) -> str:
         """Embedded capability prompt: ships with the code, sections gated by enabled features."""
@@ -499,7 +528,7 @@ class Agent:
         self,
         name: str,
         args: dict[str, Any],
-        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        send_message_fn: SendMessageFn | None = None,
     ) -> str:
         # Vault mutations wait for any in-flight backup commit, so a commit
         # never snapshots a file mid-write.
@@ -512,7 +541,7 @@ class Agent:
         self,
         name: str,
         args: dict[str, Any],
-        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        send_message_fn: SendMessageFn | None = None,
     ) -> str:
         # File tools
         if name in (
@@ -577,7 +606,7 @@ class Agent:
         extra_context: str | None = None,
         image_data_url: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
-        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
@@ -619,13 +648,19 @@ class Agent:
         extra_context: str | None = None,
         image_data_url: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
-        send_message_fn: Callable[[str, int | None], Coroutine[Any, Any, None]] | None = None,
+        send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> tuple[str, set[str]]:
         """Returns the final text reply and the vault paths this run touched."""
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
         touched: set[str] = set()
+
+        # Messages a scheduled run delivered to this conversation since its
+        # last run enter history here, under its run lock, so the incoming
+        # user message lands with the reminder it is replying to in context.
+        for note in self._pending_notes.pop((chat_id, thread_id), ()):
+            history.append({"role": "assistant", "content": note})
 
         # Resolve topic slug for thread-specific prompt (if in a forum topic)
         topic_slug: str | None = None
@@ -641,8 +676,7 @@ class Agent:
         # It is already the user's local time: stamping UTC left the model doing
         # DST-aware arithmetic in its head, and UTC clock times leaked into vault
         # fields (routines "last done", reminder notes) that must be local.
-        stamp = datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
-        stamped_message = f"[{stamp}] {user_message}"
+        stamped_message = f"[{self._local_stamp()}] {user_message}"
         user_entry: dict[str, Any] = {"role": "user", "content": stamped_message}
         history.append(user_entry)
 
@@ -784,11 +818,19 @@ class Agent:
         base_send = self._send_message_fn
         delivered = 0
 
-        async def counting_send(text: str, thread_id: int | None = None) -> None:
+        async def counting_send(text: str, thread_id: int | None = None) -> int | None:
             nonlocal delivered
+            target_chat = None
             if base_send:
-                await base_send(text, thread_id)
+                target_chat = await base_send(text, thread_id)
             delivered += 1
+            # Mirror the delivery into the target conversation's history so a
+            # user reply to it there arrives with context — this run is the
+            # chat-0 job conversation, invisible to the one the message
+            # landed in. A None chat id means the delivery was dropped.
+            if target_chat is not None:
+                self._queue_sent_note(target_chat, thread_id, text)
+            return target_chat
 
         reply = await self.run(
             chat_id=0,
@@ -800,11 +842,11 @@ class Agent:
         if close is not None:
             if close["silent"] or delivered or not close["message"] or base_send is None:
                 return reply
-            await base_send(close["message"], None)
+            await counting_send(close["message"], None)
             return reply
         if _SILENT_SENTINEL in reply.lower():
             return reply
         if not delivered and reply and base_send:
             logger.warning("Scheduled run closed without job-close JSON; delivering raw reply")
-            await base_send(reply, None)
+            await counting_send(reply, None)
         return reply
