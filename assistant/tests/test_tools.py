@@ -609,3 +609,34 @@ def test_rewrite_file_accepts_full_version_marker(vault: VaultTools) -> None:
 
     assert result.startswith("Rewrote note.md")
     assert vault.read_file("note.md") == "new"
+
+
+# ---------------------------------------------------------------------------
+# Version-token leak guard: a model pasting read_file output back as content
+# must not bake the trailing "[version: ...]" line into the file.
+# ---------------------------------------------------------------------------
+
+
+def test_create_file_strips_trailing_version_token(vault: VaultTools) -> None:
+    vault.create_file("wiki/a.md", "# A\n\ncontent\n[version: ab12cd34]")
+    assert vault.read_file("wiki/a.md") == "# A\n\ncontent"
+
+
+def test_rewrite_file_strips_trailing_version_token(vault: VaultTools) -> None:
+    vault.write_file("wiki/a.md", "old")
+    vault.rewrite_file("wiki/a.md", "new body\n[version: ab12cd34]", vault.version("wiki/a.md"))
+    assert vault.read_file("wiki/a.md") == "new body"
+
+
+def test_append_file_strips_trailing_version_token(vault: VaultTools) -> None:
+    vault.write_file("wiki/a.md", "start")
+    vault.append_file("wiki/a.md", "\n- entry\n[version: ab12cd34]")
+    assert vault.read_file("wiki/a.md") == "start\n- entry"
+
+
+def test_interior_version_tokens_are_kept(vault: VaultTools) -> None:
+    """Only the trailing read_file suffix position is stripped — interior
+    occurrences are content (and vault_check flags them instead)."""
+    body = "# A\n[version: ab12cd34]\nmore text"
+    vault.create_file("wiki/a.md", body)
+    assert vault.read_file("wiki/a.md") == body

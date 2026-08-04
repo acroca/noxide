@@ -32,6 +32,17 @@ def _version_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
 
 
+# The read_file *tool* suffixes its output with "\n[version: <hash>]". A model
+# pasting a read result back as new content bakes that line into the file
+# (production framer.md ended with one). Trailing position only — an interior
+# occurrence is content, and vault_check flags it instead.
+_LEAKED_VERSION_RX = re.compile(r"\n?\[version: [0-9a-f]{8}\]\s*\Z")
+
+
+def _strip_leaked_version_token(content: str) -> str:
+    return _LEAKED_VERSION_RX.sub("", content)
+
+
 def slug_from_name(name: str) -> str:
     """Derive a topic slug from its display name.
 
@@ -116,6 +127,7 @@ class VaultTools:
 
     def create_file(self, path: str, content: str) -> str:
         """Create *path* with *content*; refuse if it already exists."""
+        content = _strip_leaked_version_token(content)
         p = self._safe_path(path)
         if p.exists():
             return (
@@ -135,6 +147,7 @@ class VaultTools:
         redo its changes on the current content, exactly like a failed
         ``edit_file`` match.
         """
+        content = _strip_leaked_version_token(content)
         p = self._safe_path(path)
         if not p.exists():
             return f"[rewrite error: file not found: {path} — use create_file for new files]"
@@ -179,6 +192,7 @@ class VaultTools:
 
     def append_file(self, path: str, content: str) -> str:
         """Append *content* to *path*, creating it if absent."""
+        content = _strip_leaked_version_token(content)
         p = self._safe_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:

@@ -316,3 +316,19 @@ def test_no_schedule_file_skips_reminder_checks(tmp_path: Path) -> None:
     _write(tmp_path, "wiki/areas/salud.md", "# Salud\n\nVisita [reminder:deadbeef]\n")
 
     assert run_checks(tmp_path) == "[no findings]"
+
+
+# ---------------------------------------------------------------------------
+# Leaked version tokens: a "[version: ...]" line in a wiki page is read_file
+# output pasted back as content, never something the page should contain.
+# ---------------------------------------------------------------------------
+
+
+def test_leaked_version_token_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/areas/salud.md", "# Salud\n\nnotas\n[version: bad69be0]\n")
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/areas/salud.md:4" in report
+    assert "version token" in report

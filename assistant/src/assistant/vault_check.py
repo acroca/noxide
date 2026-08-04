@@ -71,6 +71,7 @@ def run_checks(root: Path) -> str:
         _mirror_findings(root, wiki_files)
         + _weekday_findings(wiki_files)
         + _reminder_findings(root, wiki_files)
+        + _version_token_findings(wiki_files)
     )
     if not findings:
         return "[no findings]"
@@ -261,6 +262,30 @@ def _reminder_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> l
             f"or cancel the job if it is obsolete",
         ))
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Leaked version tokens: a whole-line "[version: ...]" in a wiki page is
+# read_file tool output pasted back as content. The write tools strip the
+# trailing case; this catches interior leaks and anything that predates the
+# strip. Full-line matches only — prose *mentioning* the token is content.
+# ---------------------------------------------------------------------------
+
+_VERSION_TOKEN_HEADING = "Leaked version tokens"
+
+_VERSION_TOKEN_LINE = re.compile(r"^\[version: [0-9a-f]{8}\]\s*$")
+
+
+def _version_token_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
+    return [
+        (
+            _VERSION_TOKEN_HEADING,
+            f"{rel}:{i}: leaked read_file version token — delete this line",
+        )
+        for rel, lines in wiki_files
+        for i, line in enumerate(lines, 1)
+        if _VERSION_TOKEN_LINE.match(line)
+    ]
 
 
 def _check_pair(weekday: str, iso: str) -> str | None:
