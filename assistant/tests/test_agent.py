@@ -19,6 +19,7 @@ from assistant.agent import (
     _JOB_CLOSE_RESPONSE_FORMAT,
     Agent,
     ConversationHistory,
+    _extract_vault_paths,
     _parse_job_close,
 )
 from assistant.skills import SkillLibrary
@@ -1347,6 +1348,121 @@ async def test_clear_history_drops_pending_notes(vault: VaultTools) -> None:
         await agent.run(chat_id=7, user_message="Pill taken")
 
     assert _mirror_notes(mock_client.chat.call_args[0][0]) == []
+
+
+# ------------------------------------------------------------------
+# Fire-time state snapshot for scheduled runs
+# ------------------------------------------------------------------
+
+
+def test_extract_vault_paths_finds_slashed_md_paths() -> None:
+    prompt = (
+        "Pregunta cómo fue e ingiere en `wiki/projects/busqueda-empleo/empresas/framer.md` "
+        "y en wiki/projects/busqueda-empleo/index.md. Ver wiki/projects/busqueda-empleo/index.md."
+    )
+    assert _extract_vault_paths(prompt) == [
+        "wiki/projects/busqueda-empleo/empresas/framer.md",
+        "wiki/projects/busqueda-empleo/index.md",
+    ]
+
+
+def test_extract_vault_paths_ignores_bare_basenames_and_caps() -> None:
+    # A bare basename is not a vault-relative path; more than 5 paths cap at 5.
+    many = " ".join(f"wiki/p{i}.md" for i in range(8))
+    assert _extract_vault_paths("mira framer.md") == []
+    assert len(_extract_vault_paths(many)) == 5
+
+
+def test_schedule_prompt_documents_state_snapshot(vault: VaultTools) -> None:
+    """The standing contract must tell scheduled runs the snapshot exists and
+    to check it, and job authors to name the pages a job depends on."""
+    agent = Agent(vault_tools=vault, schedule_dispatcher=lambda name, args: "", history_size=10)
+    prompt = agent._load_system_prompt()
+    assert "state snapshot" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_job_injects_referenced_page_state(vault: VaultTools) -> None:
+    """The live turn of a scheduled run carries the current content of every
+    vault page the job prompt names — the premise check cannot be skipped."""
+    vault.write_file("wiki/x.md", "**Estado:** ya realizado y registrado")
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Pregunta a Albert cómo fue X e ingiere en wiki/x.md.")
+
+    messages = mock_client.chat.call_args.args[0]
+    user_msg = [m for m in messages if m["role"] == "user"][-1]
+    assert "state snapshot" in user_msg["content"]
+    assert "--- wiki/x.md ---" in user_msg["content"]
+    assert "**Estado:** ya realizado y registrado" in user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_job_snapshot_not_stored_in_history(vault: VaultTools) -> None:
+    """Snapshots ride the live turn only: chat-0 history keeps the bare
+    prompt, or every later job run would re-pay old snapshots."""
+    vault.write_file("wiki/x.md", "**Estado:** ya realizado")
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Revisa wiki/x.md y avisa si procede.")
+        await agent.run_job("Otra tarea sin páginas.")
+
+    messages = mock_client.chat.call_args.args[0]
+    earlier_user_msgs = [m for m in messages if m["role"] == "user"][:-1]
+    assert earlier_user_msgs, "expected first job's user message in history"
+    for m in earlier_user_msgs:
+        assert "state snapshot" not in m["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_job_snapshot_inlines_not_found_sentinel(vault: VaultTools) -> None:
+    """A named page that no longer exists is itself information: the job's
+    premise is broken and the model should see that, not guess."""
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Ingiere la respuesta en wiki/gone.md.")
+
+    user_msg = [m for m in mock_client.chat.call_args.args[0] if m["role"] == "user"][-1]
+    assert "--- wiki/gone.md ---" in user_msg["content"]
+    assert "[file not found" in user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_job_without_page_references_gets_no_snapshot(vault: VaultTools) -> None:
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Recuérdale a Albert que estire la espalda.")
+
+    user_msg = [m for m in mock_client.chat.call_args.args[0] if m["role"] == "user"][-1]
+    assert "state snapshot" not in user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_job_snapshot_truncates_long_pages(vault: VaultTools) -> None:
+    vault.write_file("wiki/big.md", "x" * 6000)
+    agent = _mirror_agent(vault)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Revisa wiki/big.md.")
+
+    user_msg = [m for m in mock_client.chat.call_args.args[0] if m["role"] == "user"][-1]
+    assert "x" * 5000 in user_msg["content"]
+    assert "x" * 5001 not in user_msg["content"]
+    assert "[truncated]" in user_msg["content"]
 
 
 # ------------------------------------------------------------------

@@ -4,7 +4,7 @@ Always use the `schedule` tool for anything time-based ("remind me in 10 min", "
 
 ### Check state before delivering
 
-A reminder can fire after its purpose is already met — the routine already logged, the task already closed, the question already answered. Start every scheduled run by reading the wiki state it concerns (`wiki/routines.md`, the task's page); if the reminder is moot, stay silent: do not call `send_message`, and close with `{"silent": true, "message": null}`.
+A reminder can fire after its purpose is already met — the routine already logged, the task already closed, the question already answered. The runner attaches a read-only state snapshot to the firing prompt: the current content of every vault page the job's prompt names. Check it first — if it already answers the job's question or records the outcome, the reminder is moot: do not call `send_message`, and close with `{"silent": true, "message": null}`. The snapshot only covers pages the prompt names, so when you create a job, name the vault pages it depends on in its prompt; at fire time, still read any state the snapshot doesn't cover.
 
 ### Closing a scheduled run
 

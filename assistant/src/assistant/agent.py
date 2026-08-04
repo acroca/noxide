@@ -78,6 +78,35 @@ _JOB_CLOSE_RESPONSE_FORMAT: dict[str, Any] = {
 }
 
 
+# Fire-time state snapshot: a scheduled run's live turn carries the current
+# content of every vault page its prompt names, so the "is this reminder
+# still needed?" check happens against state the model cannot fail to see
+# (a follow-up once asked about an interview whose outcome was already
+# recorded in the very page its prompt named as the ingest destination).
+_SNAPSHOT_MAX_FILES = 5
+_SNAPSHOT_MAX_CHARS = 5000
+_SNAPSHOT_HEADER = (
+    "[state snapshot, fetched at fire time — current content of pages this job references]"
+)
+_VAULT_PATH_RX = re.compile(r"[\w./-]+\.md\b")
+
+
+def _extract_vault_paths(prompt: str) -> list[str]:
+    """Vault-relative markdown paths named in a job prompt, deduped in order.
+
+    Bare basenames don't count — job prompts name pages vault-relative, and a
+    lone "framer.md" would only inline a misleading not-found sentinel.
+    """
+    paths: list[str] = []
+    for match in _VAULT_PATH_RX.findall(prompt):
+        if "/" not in match or match in paths:
+            continue
+        paths.append(match)
+        if len(paths) == _SNAPSHOT_MAX_FILES:
+            break
+    return paths
+
+
 def _parse_job_close(reply: str) -> dict[str, Any] | None:
     """Parse a scheduled run's closing reply against ``_JOB_CLOSE_SCHEMA``.
 
@@ -307,6 +336,28 @@ class Agent:
             (chat_id, thread_id), deque(maxlen=self._history_size)
         )
         notes.append(f"[{self._local_stamp()}, sent from a scheduled run] {text}")
+
+    def _job_state_snapshot(self, prompt: str) -> str | None:
+        """Current content of the vault pages a job prompt names.
+
+        Injected into the run's live turn only (never stored in history —
+        chat 0 would otherwise re-pay every old snapshot on every job run).
+        A missing page inlines the not-found sentinel: a broken premise is
+        itself something the run should see rather than guess around.
+        """
+        paths = _extract_vault_paths(prompt)
+        if not paths:
+            return None
+        blocks = [_SNAPSHOT_HEADER]
+        for path in paths:
+            try:
+                content = self._vault.read_file(path)
+            except Exception as e:  # jail violations from odd matches (../, /abs)
+                content = f"[unreadable: {e}]"
+            if len(content) > _SNAPSHOT_MAX_CHARS:
+                content = content[:_SNAPSHOT_MAX_CHARS] + "\n[truncated]"
+            blocks.append(f"--- {path} ---\n{content}")
+        return "\n\n".join(blocks)
 
     def clear_history(self, chat_id: int, thread_id: int | None = None) -> None:
         """Forget one chat/topic's conversation; the next run starts fresh."""
@@ -605,11 +656,15 @@ class Agent:
         thread_id: int | None = None,
         extra_context: str | None = None,
         image_data_url: str | None = None,
+        transient_context: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
+
+        ``transient_context`` rides the user message during this run only;
+        stored history keeps the bare message (same treatment as images).
 
         Runs for the same ``(chat_id, thread_id)`` are serialized on a lock —
         interleaved appends into one history would produce orphaned tool
@@ -630,6 +685,7 @@ class Agent:
                 thread_id=thread_id,
                 extra_context=extra_context,
                 image_data_url=image_data_url,
+                transient_context=transient_context,
                 on_research=on_research,
                 send_message_fn=send_message_fn,
                 response_format=response_format,
@@ -647,6 +703,7 @@ class Agent:
         thread_id: int | None = None,
         extra_context: str | None = None,
         image_data_url: str | None = None,
+        transient_context: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
@@ -680,17 +737,25 @@ class Agent:
         user_entry: dict[str, Any] = {"role": "user", "content": stamped_message}
         history.append(user_entry)
 
-        # Images are sent only during this run; stored history keeps the text
-        # version so later turns don't re-send image tokens on every request.
-        multimodal_entry: dict[str, Any] | None = None
+        # Images and transient context ride only this run's requests; stored
+        # history keeps the bare text version so later turns don't re-pay
+        # image tokens or stale state snapshots on every request.
+        live_text = (
+            stamped_message
+            if transient_context is None
+            else f"{stamped_message}\n\n{transient_context}"
+        )
+        live_entry: dict[str, Any] | None = None
         if image_data_url:
-            multimodal_entry = {
+            live_entry = {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": stamped_message},
+                    {"type": "text", "text": live_text},
                     {"type": "image_url", "image_url": {"url": image_data_url}},
                 ],
             }
+        elif transient_context is not None:
+            live_entry = {"role": "user", "content": live_text}
 
         tools = self._all_tools()
         client = copilot.get_client()
@@ -698,9 +763,9 @@ class Agent:
 
         for iteration in range(_MAX_ITERATIONS):
             turn_messages = history.messages()
-            if multimodal_entry is not None:
+            if live_entry is not None:
                 turn_messages = [
-                    multimodal_entry if m is user_entry else m for m in turn_messages
+                    live_entry if m is user_entry else m for m in turn_messages
                 ]
             messages = [{"role": "system", "content": system_prompt}] + turn_messages
             response = await client.chat(messages, tools, response_format=response_format)
@@ -835,6 +900,7 @@ class Agent:
         reply = await self.run(
             chat_id=0,
             user_message=f"[scheduled run] {prompt}",
+            transient_context=self._job_state_snapshot(prompt),
             send_message_fn=counting_send,
             response_format=_JOB_CLOSE_RESPONSE_FORMAT,
         )
