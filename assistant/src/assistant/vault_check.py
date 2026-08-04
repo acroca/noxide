@@ -18,8 +18,9 @@ still point at wiki pages or at the schedule row to fix.
 
 from __future__ import annotations
 
+import calendar
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 _MAX_FINDINGS = 100
@@ -72,6 +73,7 @@ def run_checks(root: Path) -> str:
         + _weekday_findings(wiki_files)
         + _reminder_findings(root, wiki_files)
         + _schedule_hygiene_findings(root)
+        + _routine_findings(root)
         + _version_token_findings(wiki_files)
     )
     if not findings:
@@ -305,6 +307,93 @@ def _schedule_hygiene_findings(root: Path) -> list[tuple[str, str]]:
                 f"{_SCHEDULE_PATH}:{i}: job {job_id} cron day-of-week uses numbers "
                 f"— write names (SUN, MON, ...): the numbering is ambiguous",
             ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Routine due dates: "Next due = last done + frequency" is date arithmetic
+# the compile prompt asks the model to recompute — the same arithmetic it is
+# told not to trust for weekdays. Frequencies are semi-structured text;
+# common en/es forms are parsed, everything else (approximate "~N", paused
+# rows, missing last-done) is skipped rather than guessed at.
+# ---------------------------------------------------------------------------
+
+_ROUTINE_HEADING = "Routine due dates (wiki/routines.md)"
+
+_ROUTINES_PATH = "wiki/routines.md"
+_DAILY_RX = re.compile(r"^(?:diaria|diario|daily)$", re.IGNORECASE)
+_WEEKLY_RX = re.compile(r"^(?:semanal|weekly)(?:\s*\(([^)]+)\))?$", re.IGNORECASE)
+_EVERY_N_RX = re.compile(r"^(?:cada|every)\s+(\d+)(?:-(\d+))?\s+(?:días|dias|days)$", re.IGNORECASE)
+_MONTHLY_RX = re.compile(r"^(?:mensual|monthly)$", re.IGNORECASE)
+_CELL_DATE_RX = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:\s+\d{2}:\d{2})?$")
+
+
+def _parse_cell_date(cell: str) -> date | None:
+    m = _CELL_DATE_RX.match(cell)
+    if not m:
+        return None
+    try:
+        return date(*(int(g) for g in m.groups()))
+    except ValueError:
+        return None
+
+
+def _expected_next(freq: str, last: date) -> tuple[date, date] | None:
+    """Acceptable [earliest, latest] next-due window, or None when unparseable."""
+    f = freq.strip()
+    if _DAILY_RX.match(f):
+        d = last + timedelta(days=1)
+        return d, d
+    if m := _WEEKLY_RX.match(f):
+        anchor = (m.group(1) or "").strip().lower()
+        if not anchor:
+            d = last + timedelta(days=7)
+            return d, d
+        entry = _WEEKDAY_LOOKUP.get(anchor)
+        if entry is None:
+            return None
+        # The next occurrence of the anchor weekday strictly after last done.
+        d = last + timedelta(days=(entry[1] - last.weekday()) % 7 or 7)
+        return d, d
+    if m := _EVERY_N_RX.match(f):
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if hi < lo:
+            return None
+        return last + timedelta(days=lo), last + timedelta(days=hi)
+    if _MONTHLY_RX.match(f):
+        year, month = (last.year, last.month + 1) if last.month < 12 else (last.year + 1, 1)
+        d = date(year, month, min(last.day, calendar.monthrange(year, month)[1]))
+        return d, d
+    return None
+
+
+def _routine_findings(root: Path) -> list[tuple[str, str]]:
+    try:
+        lines = (root / _ROUTINES_PATH).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    findings = []
+    for i, line in enumerate(lines, 1):
+        cells = line.split("|")
+        if len(cells) < 6:
+            continue
+        name, freq, last_cell, next_cell = (cells[j].strip() for j in range(1, 5))
+        last = _parse_cell_date(last_cell)
+        next_due = _parse_cell_date(next_cell)
+        if last is None or next_due is None:
+            continue
+        window = _expected_next(freq, last)
+        if window is None:
+            continue
+        lo, hi = window
+        if lo <= next_due <= hi:
+            continue
+        expected = str(lo) if lo == hi else f"{lo}..{hi}"
+        findings.append((
+            _ROUTINE_HEADING,
+            f'{_ROUTINES_PATH}:{i}: "{name}" next due {next_due} does not match '
+            f"last done {last} + {freq} — expected {expected}",
+        ))
     return findings
 
 

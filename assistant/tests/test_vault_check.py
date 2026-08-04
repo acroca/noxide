@@ -381,3 +381,79 @@ def test_clean_schedule_rows_pass_hygiene(tmp_path: Path) -> None:
     )
 
     assert run_checks(tmp_path) == "[no findings]"
+
+
+# ---------------------------------------------------------------------------
+# Routine due dates: Next due = last done + frequency is date arithmetic;
+# check it like weekdays instead of trusting the model's recompute.
+# ---------------------------------------------------------------------------
+
+
+def _routines(root: Path, *rows: str) -> None:
+    _write(
+        root,
+        "wiki/routines.md",
+        "# Rutinas\n\n"
+        "| Rutina | Frecuencia | Última vez | Próxima | Notas |\n"
+        "| --- | --- | --- | --- | --- |\n" + "".join(r + "\n" for r in rows),
+    )
+
+
+def test_daily_routine_next_due_mismatch_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _routines(tmp_path, "| Pastilla | Diaria | 2026-08-04 09:23 | 2026-08-07 | x |")
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/routines.md:5" in report
+    assert "expected 2026-08-05" in report
+
+
+def test_correct_next_due_values_pass(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _routines(
+        tmp_path,
+        "| Pastilla | Diaria | 2026-08-04 09:23 | 2026-08-05 | x |",
+        "| Plain weekly | Semanal | 2026-08-01 | 2026-08-08 | x |",
+        "| Stock | Semanal (domingo) | 2026-08-04 | 2026-08-09 | x |",
+        "| Pill | Daily | 2026-08-04 | 2026-08-05 | x |",
+        "| Water | Every 3 days | 2026-08-01 | 2026-08-04 | x |",
+        "| Amazon | Mensual | 2026-07-27 | 2026-08-27 | x |",
+    )
+
+    assert run_checks(tmp_path) == "[no findings]"
+
+
+def test_weekday_anchored_weekly_uses_next_occurrence(tmp_path: Path) -> None:
+    """Semanal (domingo) from a Tuesday means the coming Sunday, not +7."""
+    _clean_vault(tmp_path)
+    _routines(tmp_path, "| Stock | Semanal (domingo) | 2026-08-04 | 2026-08-11 | x |")
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/routines.md:5" in report
+    assert "expected 2026-08-09" in report
+
+
+def test_range_frequency_accepts_the_window(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _routines(tmp_path, "| Semillas | Cada 2-3 días | 2026-07-29 | 2026-08-01 | x |")
+    assert run_checks(tmp_path) == "[no findings]"
+
+    _routines(tmp_path, "| Semillas | Cada 2-3 días | 2026-07-29 | 2026-08-03 | x |")
+    report = run_checks(tmp_path)
+    assert "wiki/routines.md:5" in report
+    assert "expected 2026-07-31..2026-08-01" in report
+
+
+def test_unparseable_rows_are_skipped(tmp_path: Path) -> None:
+    """Approximate frequencies, missing last-done, paused rows: no findings."""
+    _clean_vault(tmp_path)
+    _routines(
+        tmp_path,
+        "| Bebedero | Cada ~6 días | 2026-07-27 | 2026-08-02 | x |",
+        "| Stock | Semanal (domingo) | — | 2026-08-02 | x |",
+        "| Gusano | Semanal (lunes) | 2026-07-27 | En pausa | x |",
+    )
+
+    assert run_checks(tmp_path) == "[no findings]"
