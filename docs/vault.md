@@ -118,16 +118,20 @@ reconciles `index.md` against the pages on disk (archived pages under
 **Lint** — weekly. Starts from a `check_vault` report, then surfaces projects
 with no journal mention in 30+ days (proposing to archive them), tasks
 open 21+ days, contradictions between a page's status and recent entries,
-orphan pages, index drift, scheduled jobs referencing missing files, job
-prompts that restate scheduled-run plumbing, and the same task tracked on more
+scheduled jobs referencing missing files, and the same task tracked on more
 than one page.
 
 Both jobs lean on **`check_vault`**, a deterministic consistency checker built
-into the bot: pure code, no model involved, that enumerates every open task on
-every live wiki page against the `now.md` mirror (in both directions) and
-verifies weekday names written beside ISO dates against the calendar. The
-model fixes what the checker finds instead of being trusted to re-discover it
-— an enumerated sweep can't skip a page, and code can't miscompute a weekday.
+into the bot: pure code, no model involved. It enumerates every open task on
+every live wiki page against the `now.md` mirror (in both directions),
+verifies weekday names written beside ISO dates against the calendar, checks
+each routine's next-due date against last-done + frequency, reconciles every
+page against the index (orphan pages, dead index links), cross-checks reminder
+markers with the pending schedule, flags schedule rows carrying hand-written
+run plumbing or numeric cron weekdays, and reports leaked `[version: …]`
+tokens. The model fixes what the checker finds instead of being trusted to
+re-discover it — an enumerated sweep can't skip a page, and code can't
+miscompute a date.
 
 Compile and lint are ordinary scheduled jobs, not built-in machinery — see
 [scheduling](#scheduling) below.

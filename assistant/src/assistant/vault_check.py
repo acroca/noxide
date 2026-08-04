@@ -19,6 +19,7 @@ still point at wiki pages or at the schedule row to fix.
 from __future__ import annotations
 
 import calendar
+import posixpath
 import re
 from datetime import date, timedelta
 from pathlib import Path
@@ -74,6 +75,7 @@ def run_checks(root: Path) -> str:
         + _reminder_findings(root, wiki_files)
         + _schedule_hygiene_findings(root)
         + _routine_findings(root)
+        + _index_findings(root)
         + _version_token_findings(wiki_files)
     )
     if not findings:
@@ -393,6 +395,54 @@ def _routine_findings(root: Path) -> list[tuple[str, str]]:
             _ROUTINE_HEADING,
             f'{_ROUTINES_PATH}:{i}: "{name}" next due {next_due} does not match '
             f"last done {last} + {freq} — expected {expected}",
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Index: every wiki page is a link target of some index.md (the top one or a
+# nested subtree index, the busqueda-empleo pattern), and every index link
+# resolves to a page on disk. Skipped entirely when wiki/index.md is absent —
+# a vault that keeps no index has nothing to reconcile.
+# ---------------------------------------------------------------------------
+
+_INDEX_HEADING = "Index (wiki/index.md vs pages on disk)"
+
+_TOP_INDEX = "wiki/index.md"
+_INDEX_LINK_RX = re.compile(r"\]\(([^)#\s]+\.md)\)")
+
+
+def _index_findings(root: Path) -> list[tuple[str, str]]:
+    if not (root / _TOP_INDEX).is_file():
+        return []
+    pages = {str(p.relative_to(root)) for p in root.glob("wiki/**/*.md") if p.is_file()}
+    linked: set[str] = set()
+    findings = []
+    for rel in sorted(pages):
+        if posixpath.basename(rel) != "index.md":
+            continue
+        try:
+            lines = (root / rel).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        base = posixpath.dirname(rel)
+        for i, line in enumerate(lines, 1):
+            for target in _INDEX_LINK_RX.findall(line):
+                resolved = posixpath.normpath(posixpath.join(base, target))
+                if not resolved.startswith("wiki/"):
+                    continue
+                linked.add(resolved)
+                if resolved not in pages:
+                    findings.append((
+                        _INDEX_HEADING,
+                        f"{rel}:{i}: index links to missing page {target} — "
+                        f"remove the line or restore the page",
+                    ))
+    for rel in sorted(pages - linked - {_TOP_INDEX}):
+        findings.append((
+            _INDEX_HEADING,
+            f"{rel}: page has no line in any index — add one to {_TOP_INDEX} "
+            f"or the relevant nested index (archived pages under its Archived section)",
         ))
     return findings
 

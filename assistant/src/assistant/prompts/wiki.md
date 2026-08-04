@@ -147,7 +147,7 @@ Archived pages stay readable and searchable but are never listed as live work. R
 - Projects with no journal mention in 30+ days → propose archiving (see Archive above); never archive without the user's yes.
 - Open tasks or `now.md` mentions on a page under `wiki/archive/` → the page was retired too early; surface it.
 - Tasks open 21+ days → surface them.
-- Contradictions between a page's status and recent journal entries; orphan pages; index drift; schedule jobs referencing missing files.
+- Contradictions between a page's status and recent journal entries; schedule jobs referencing missing files.
 - Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
 - The same task tracked on more than one page → close or consolidate to one owning page (`now.md`'s mirror lines are the mechanism, not a duplicate — but do verify **Tasks** lists exactly the open tasks the pages hold).
 - Non-ISO dates in `wiki/` — day/month forms, month names, relative dates (`tomorrow`, `next Sunday`), weekday labels outside `now.md` → rewrite to `YYYY-MM-DD`. Skip `wiki/log.md`, which is append-only like the journal. Then check every weekday label that legitimately remains against the date beside it, and every relative date for having gone stale; both are how a wrong day survives in the wiki.

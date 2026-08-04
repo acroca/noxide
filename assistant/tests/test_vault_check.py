@@ -457,3 +457,81 @@ def test_unparseable_rows_are_skipped(tmp_path: Path) -> None:
     )
 
     assert run_checks(tmp_path) == "[no findings]"
+
+
+# ---------------------------------------------------------------------------
+# Index: every wiki page is linked from some index.md, and every index link
+# points at a page that exists. Enumeration replaces the lint's sampled
+# "orphan pages; index drift" sweep.
+# ---------------------------------------------------------------------------
+
+
+def _index(root: Path, *lines: str) -> None:
+    _write(root, "wiki/index.md", "# Índice\n\n" + "".join(line + "\n" for line in lines))
+
+
+def _indexed_clean_vault(root: Path) -> None:
+    _clean_vault(root)
+    _index(
+        root,
+        "- [now](now.md) — dashboard",
+        "- [garden](projects/garden.md) — the garden",
+    )
+
+
+def test_unindexed_page_is_reported(tmp_path: Path) -> None:
+    _indexed_clean_vault(tmp_path)
+    _write(tmp_path, "wiki/areas/quiet.md", "# Quiet corner\n")
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/areas/quiet.md" in report
+    assert "index" in report
+
+
+def test_fully_indexed_vault_passes(tmp_path: Path) -> None:
+    _indexed_clean_vault(tmp_path)
+
+    assert run_checks(tmp_path) == "[no findings]"
+
+
+def test_dead_index_link_is_reported(tmp_path: Path) -> None:
+    _indexed_clean_vault(tmp_path)
+    _index(
+        tmp_path,
+        "- [now](now.md) — dashboard",
+        "- [garden](projects/garden.md) — the garden",
+        "- [ghost](projects/ghost.md) — page that no longer exists",
+    )
+
+    report = run_checks(tmp_path)
+
+    assert "wiki/index.md:5" in report
+    assert "projects/ghost.md" in report
+
+
+def test_nested_index_covers_its_subtree(tmp_path: Path) -> None:
+    """Sub-pages listed in a nested index need no top-level line — the
+    busqueda-empleo pattern: empresas/* live in the project's own index."""
+    _indexed_clean_vault(tmp_path)
+    _index(
+        tmp_path,
+        "- [now](now.md) — dashboard",
+        "- [garden](projects/garden.md) — the garden",
+        "- [jobs](projects/jobs/index.md) — job hunt",
+    )
+    _write(
+        tmp_path,
+        "wiki/projects/jobs/index.md",
+        "# Jobs\n\n- [acme](companies/acme.md) — applied\n",
+    )
+    _write(tmp_path, "wiki/projects/jobs/companies/acme.md", "# Acme\n\n**Status:** applied\n")
+
+    assert run_checks(tmp_path) == "[no findings]"
+
+
+def test_missing_index_skips_the_check(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/areas/quiet.md", "# Quiet corner\n")
+
+    assert run_checks(tmp_path) == "[no findings]"
