@@ -67,8 +67,9 @@ they say yes:
 
 ## 6. Confirm
 
-One short message: which files you created, and one sentence on what to do
-next — just start telling them things. Do not paste the vault schema back.
+One short message: the vault is ready, plus one sentence on what to do next —
+just start telling them things. Do not paste the vault schema back or list the
+files you created.
 
 ## Gotchas
 

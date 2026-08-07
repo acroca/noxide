@@ -91,10 +91,10 @@ files instead of reverting to the English defaults.
 **Ingest** — the default when a message carries new information. Journal it,
 update the one page that owns the fact, close any open task the message implies
 is done (searching for it — the same task can be tracked on more than one
-page), reconcile the now-stale lines in `now.md`, check whether a scheduled
-reminder about it has been made moot, and say which files changed. An ingest is
-not finished when the fact is filed; it is finished when no page still shows
-the old state.
+page), reconcile the now-stale lines in `now.md`, and check whether a scheduled
+reminder about it has been made moot. An ingest is not finished when the fact
+is filed; it is finished when no page still shows the old state. The reply
+acknowledges the outcome — it never lists the files touched.
 
 **Query** — "what do I need to do?" reads `now.md` and answers with today's
 scope only. "Catch me up on X" reads that page's `**Status:**` paragraph.
