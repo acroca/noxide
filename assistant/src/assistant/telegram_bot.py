@@ -23,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+from .copilot import CopilotUnavailableError
 from .transcribe import TranscriptionError
 
 if TYPE_CHECKING:
@@ -145,6 +146,7 @@ class TelegramBot:
         set_model_fn: Callable[[str], None] | None = None,
         state_dir: Path | None = None,
         default_chat_id: int | None = None,
+        queue_message_fn: Callable[[int, int | None, str], None] | None = None,
     ) -> None:
         self._token = token
         self._allowed_user_ids = allowed_user_ids
@@ -154,6 +156,7 @@ class TelegramBot:
         self._models = models or {}
         self._default_model = default_model
         self._set_model_fn = set_model_fn
+        self._queue_message_fn = queue_message_fn
         # No persistence: selection resets to the default on every restart
         self._current_alias = default_model
         # Monotonic deadline while Telegram flood-limits group-title changes
@@ -172,26 +175,34 @@ class TelegramBot:
             persisted_chat_id if persisted_chat_id is not None else default_chat_id
         )
 
-    async def send_message(self, text: str, message_thread_id: int | None = None) -> int | None:
+    async def send_message(
+        self,
+        text: str,
+        message_thread_id: int | None = None,
+        chat_id: int | None = None,
+    ) -> int | None:
         """Send a proactive message (e.g. from a scheduled job).
 
         Pass ``message_thread_id`` to deliver the message into a specific forum topic.
+        ``chat_id`` overrides the pinned home chat — retry-queue replays answer
+        into the conversation the failed message came from.
         Returns the chat id the message was delivered to — the caller may need
         the real conversation key (the agent mirrors scheduled-run deliveries
         into that conversation's history) — or None when the message was dropped.
         """
-        if self._chat_id is None:
+        target_chat_id = chat_id if chat_id is not None else self._chat_id
+        if target_chat_id is None:
             logger.warning("send_message called but no chat_id set yet; dropping: %r", text[:80])
             return None
         if self._app is None:
             logger.warning("send_message called before bot started; dropping.")
             return None
-        kwargs: dict[str, Any] = {"chat_id": self._chat_id, "text": ""}
+        kwargs: dict[str, Any] = {"chat_id": target_chat_id, "text": ""}
         if message_thread_id is not None:
             kwargs["message_thread_id"] = message_thread_id
         for chunk in _split_message(text):
             await self._app.bot.send_message(**{**kwargs, "text": chunk})
-        return self._chat_id
+        return target_chat_id
 
     async def create_forum_topic(self, name: str) -> dict[str, Any]:
         """Create a new forum topic in the group and return its data dict.
@@ -622,6 +633,23 @@ class TelegramBot:
 
         try:
             reply = await self._agent.run(msg.chat_id, text, **agent_kwargs)
+        except CopilotUnavailableError as e:
+            if self._queue_message_fn is None:
+                logger.exception(
+                    "Copilot unavailable for chat_id=%d thread_id=%s", msg.chat_id, thread_id
+                )
+                reply = f"Sorry, something went wrong: {e}"
+            else:
+                logger.warning(
+                    "Copilot unavailable (%s); queueing message for retry "
+                    "(chat_id=%d thread_id=%s)",
+                    e, msg.chat_id, thread_id,
+                )
+                self._queue_message_fn(msg.chat_id, thread_id, text)
+                reply = (
+                    "GitHub Copilot looks down right now — I've queued your "
+                    "message and will answer as soon as it's back."
+                )
         except Exception as e:
             logger.exception("Agent error for chat_id=%d thread_id=%s", msg.chat_id, thread_id)
             reply = f"Sorry, something went wrong: {e}"

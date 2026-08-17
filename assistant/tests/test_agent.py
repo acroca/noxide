@@ -2008,3 +2008,161 @@ def test_move_file_holds_the_backup_lock() -> None:
     from assistant.agent import _VAULT_MUTATING_TOOLS
 
     assert "move_file" in _VAULT_MUTATING_TOOLS
+
+
+# ------------------------------------------------------------------
+# Outage replay (retry_message): hot resumes in place, cold replays
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_retry_message_hot_resumes_pending_turn(agent: Agent) -> None:
+    """The failed turn is still in history; replay appends only a resume note,
+    never a second copy of the message (which could redo tool side effects)."""
+    history = agent._get_history(1, None)
+    history.append({"role": "user", "content": "[2026-08-17 15:08 local] pastilla tomada"})
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("Anotado."))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.retry_message(
+            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+        )
+
+    assert reply == "Anotado."
+    sent = mock_client.chat.call_args.args[0]
+    user_contents = [str(m.get("content")) for m in sent if m.get("role") == "user"]
+    assert sum("pastilla tomada" in c for c in user_contents) == 1
+    assert "Copilot" in user_contents[-1]
+
+
+@pytest.mark.asyncio
+async def test_retry_message_hot_resumes_after_tool_tail(agent: Agent) -> None:
+    """A mid-run failure leaves history ending in tool results; the resume note
+    lets the model continue instead of re-running the whole turn."""
+    history = agent._get_history(1, None)
+    history.append({"role": "user", "content": "[2026-08-17 15:08 local] log my run"})
+    history.append({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "tc1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }],
+    })
+    history.append({"role": "tool", "tool_call_id": "tc1", "content": "file contents"})
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("Done."))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.retry_message(
+            1, None, "log my run", "2026-08-17 15:08 local", hot=True
+        )
+
+    assert reply == "Done."
+    sent = mock_client.chat.call_args.args[0]
+    assert sent[-1]["role"] == "user"
+    assert "Copilot" in str(sent[-1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_retry_message_hot_superseded_returns_none(agent: Agent) -> None:
+    """A later successful run already answered this turn — replaying would
+    double-process it."""
+    history = agent._get_history(1, None)
+    history.append({"role": "user", "content": "[2026-08-17 15:08 local] pastilla tomada"})
+    history.append({"role": "assistant", "content": "Anotado."})
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock()
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.retry_message(
+            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+        )
+
+    assert reply is None
+    mock_client.chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_message_hot_after_clear_returns_none(agent: Agent) -> None:
+    """/clear during the outage means the conversation was deliberately forgotten."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock()
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.retry_message(
+            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+        )
+
+    assert reply is None
+    mock_client.chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_message_cold_replays_with_provenance(agent: Agent) -> None:
+    """After a restart the history is gone: replay the original text, flagged
+    with when it was sent and that it may have been partially processed."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("Anotado."))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await agent.retry_message(
+            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=False
+        )
+
+    assert reply == "Anotado."
+    sent = mock_client.chat.call_args.args[0]
+    last = str(sent[-1]["content"])
+    assert "pastilla tomada" in last
+    assert "2026-08-17 15:08 local" in last
+    assert "Copilot outage" in last
+
+
+@pytest.mark.asyncio
+async def test_retry_message_failed_attempts_leave_history_unchanged(agent: Agent) -> None:
+    """The drain loop re-invokes retry_message every backoff cycle during a
+    sustained outage; each failed attempt must be a no-op on history or the
+    accumulated notes evict the original failed turn from the deque."""
+    from assistant.copilot import CopilotUnavailableError
+
+    history = agent._get_history(1, None)
+    history.append({"role": "user", "content": "[2026-08-17 15:08 local] pastilla tomada"})
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        CopilotUnavailableError("HTTP 502"),
+        CopilotUnavailableError("HTTP 502"),
+        _make_text_response("Anotado."),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        for _ in range(2):
+            with pytest.raises(CopilotUnavailableError):
+                await agent.retry_message(
+                    1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+                )
+            assert len(history.messages()) == 1, "failed replay attempt left a note behind"
+        reply = await agent.retry_message(
+            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+        )
+
+    assert reply == "Anotado."
+    sent = mock_client.chat.call_args.args[0]
+    notes = [m for m in sent if m.get("role") == "user" and "Copilot" in str(m.get("content"))]
+    assert len(notes) == 1, "the model saw stale notes from failed attempts"
+
+
+@pytest.mark.asyncio
+async def test_retry_message_failed_cold_attempt_leaves_no_trace(agent: Agent) -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=CopilotUnavailableError("HTTP 502"))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        with pytest.raises(CopilotUnavailableError):
+            await agent.retry_message(
+                1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=False
+            )
+
+    assert agent._get_history(1, None).messages() == []

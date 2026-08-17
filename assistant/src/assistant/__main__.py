@@ -72,6 +72,54 @@ async def _run(config_path: Path | None) -> None:
             "GITHUB_TOKEN not set — voice messages disabled"
         )
 
+    # Outage retry queue: messages and one-off jobs that failed because
+    # Copilot was unreachable are persisted and replayed once it answers
+    # again. The closures resolve `agent` and `bot` late — both are
+    # constructed below.
+    from .retry_queue import PendingItem, RetryQueue
+
+    async def replay_message(
+        chat_id: int, thread_id: int | None, text: str, queued_at: str, hot: bool
+    ) -> None:
+        reply = await agent.retry_message(chat_id, thread_id, text, queued_at, hot=hot)
+        if reply is None:
+            return  # superseded — correctly silent
+        try:
+            await bot.send_message(reply or "(no reply)", thread_id, chat_id=chat_id)
+        except Exception:
+            # The run itself succeeded (vault writes happened); a Telegram
+            # delivery hiccup — likely when several items drain back-to-back —
+            # must not classify the item as poison and tell the user their
+            # message failed.
+            logging.getLogger(__name__).warning(
+                "Could not deliver replayed reply for chat_id=%d", chat_id, exc_info=True
+            )
+
+    async def notify_drop(item: PendingItem, exc: Exception) -> None:
+        if item.kind == "message" and item.chat_id is not None:
+            await bot.send_message(
+                f"Sorry — I couldn't process your message from {item.queued_at} "
+                f"even after Copilot came back: {exc}",
+                item.thread_id,
+                chat_id=item.chat_id,
+            )
+        else:
+            await bot.notify_lifecycle(
+                f"A reminder queued during a Copilot outage failed and was "
+                f"dropped: {item.text[:200]}"
+            )
+
+    async def replay_job(prompt: str) -> None:
+        await agent.run_job(prompt)
+
+    retry_queue = RetryQueue(
+        cfg.state_dir,
+        replay_message_fn=replay_message,
+        replay_job_fn=replay_job,
+        notify_drop_fn=notify_drop,
+        tz_name=cfg.timezone,
+    )
+
     # Init Telegram bot (we need send_message before building agent)
     bot = TelegramBot(
         token=cfg.telegram_bot_token,
@@ -84,6 +132,7 @@ async def _run(config_path: Path | None) -> None:
         set_model_fn=copilot.get_client().set_model,
         state_dir=cfg.state_dir,
         default_chat_id=cfg.default_chat_id,
+        queue_message_fn=retry_queue.enqueue_message,
     )
 
     # Web research is optional — enabled when a SearXNG URL is configured
@@ -121,7 +170,12 @@ async def _run(config_path: Path | None) -> None:
     async def run_job(prompt: str) -> None:
         await agent.run_job(prompt)
 
-    scheduler = Scheduler(vault_tools=vault, run_job_fn=run_job, tz_name=cfg.timezone)
+    scheduler = Scheduler(
+        vault_tools=vault,
+        run_job_fn=run_job,
+        tz_name=cfg.timezone,
+        queue_job_fn=retry_queue.enqueue_job,
+    )
 
     # Init agent
     agent = Agent(
@@ -158,6 +212,10 @@ async def _run(config_path: Path | None) -> None:
     # retries, so a SIGTERM during an outage still shuts down promptly.
     await bot.start(abort=lifecycle.stop)
 
+    # Drain the outage retry queue (items reloaded from a previous run, plus
+    # anything queued live). After bot.start() so replayed replies can deliver.
+    retry_task = asyncio.create_task(retry_queue.run())
+
     # Fire recurring jobs missed while the service was down. After bot.start()
     # so the late runs can deliver; reload() above already backfilled `next`
     # baselines for rows that had none. Skipped when a signal already aborted
@@ -182,6 +240,9 @@ async def _run(config_path: Path | None) -> None:
     finally:
         lifecycle.remove()
         inbox_task.cancel()
+        # Stop replaying queued work mid-shutdown; unfinished items are on
+        # disk and the next startup reprocesses them.
+        retry_task.cancel()
         # Stop reloading schedule.md so it cannot register jobs mid-shutdown
         poll_task.cancel()
         await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force)

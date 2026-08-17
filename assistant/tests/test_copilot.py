@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import httpx
 
-from assistant.copilot import CopilotAuth, CopilotClient
+from assistant.copilot import CopilotAuth, CopilotClient, CopilotUnavailableError
 
 
 @pytest.fixture
@@ -239,7 +239,7 @@ async def test_bearer_gives_up_after_max_attempts(auth: CopilotAuth, state_dir: 
         patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(CopilotUnavailableError):
             await auth.get_bearer()
 
     assert mock_client.get.await_count == 3
@@ -662,6 +662,76 @@ async def test_chat_gives_up_after_max_attempts(auth: CopilotAuth, state_dir: Pa
             await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
 
     assert mock_client.stream.call_count == 3
+
+
+# ------------------------------------------------------------------
+# Outage classification (CopilotUnavailableError)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_chat_5xx_exhaustion_raises_unavailable(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.stream = MagicMock(side_effect=[_stream_cm(502) for _ in range(3)])
+
+    with (
+        patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
+        patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
+    ):
+        with pytest.raises(CopilotUnavailableError):
+            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+
+
+@pytest.mark.asyncio
+async def test_chat_network_exhaustion_raises_unavailable(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.stream = MagicMock(side_effect=httpx.ConnectError("dns down"))
+
+    with (
+        patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
+        patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
+    ):
+        with pytest.raises(CopilotUnavailableError):
+            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+
+    assert mock_client.stream.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_chat_4xx_is_not_unavailable(auth: CopilotAuth, state_dir: Path) -> None:
+    """Rejected requests must not look like an outage — they would retry forever."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.stream = MagicMock(side_effect=[_stream_cm(400)])
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+
+    assert not isinstance(excinfo.value, CopilotUnavailableError)
+
+
+@pytest.mark.asyncio
+async def test_bearer_network_exhaustion_raises_unavailable(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=httpx.ConnectError("dns down"))
+
+    with (
+        patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
+        patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
+    ):
+        with pytest.raises(CopilotUnavailableError):
+            await auth.get_bearer()
+
+    assert mock_client.get.await_count == 3
 
 
 # ------------------------------------------------------------------

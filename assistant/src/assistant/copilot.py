@@ -43,6 +43,16 @@ _COPILOT_HEADERS = {
 }
 
 
+class CopilotUnavailableError(RuntimeError):
+    """Copilot could not be reached even after retries (5xx or network failure).
+
+    Distinguishes an outage — work worth queueing for a later retry — from a
+    request the API rejected (4xx), which must never be retried blindly.
+    429 rate limits are deliberately excluded: they concern the request or
+    quota, not availability, and keep the plain error-reply behavior.
+    """
+
+
 async def send_with_retries(send, what: str) -> httpx.Response:
     """Await `send()` and return its response, retrying transient failures.
 
@@ -165,20 +175,29 @@ class CopilotAuth:
     async def _refresh_bearer(self) -> str:
         oauth_token = self._load_oauth_token()
         async with httpx.AsyncClient() as client:
-            r = await send_with_retries(
-                lambda: client.get(
-                    _COPILOT_TOKEN_URL,
-                    headers={
-                        **_COPILOT_HEADERS,
-                        "Authorization": f"token {oauth_token}",
-                    },
-                    timeout=15,
-                ),
-                "Copilot token exchange",
-            )
+            try:
+                r = await send_with_retries(
+                    lambda: client.get(
+                        _COPILOT_TOKEN_URL,
+                        headers={
+                            **_COPILOT_HEADERS,
+                            "Authorization": f"token {oauth_token}",
+                        },
+                        timeout=15,
+                    ),
+                    "Copilot token exchange",
+                )
+            except httpx.TransportError as exc:
+                raise CopilotUnavailableError(
+                    f"Copilot token exchange failed: {exc}"
+                ) from exc
             if r.status_code == 401:
                 raise RuntimeError(
                     "OAuth token rejected by GitHub. Re-run `assistant auth`."
+                )
+            if r.status_code >= 500:
+                raise CopilotUnavailableError(
+                    f"Copilot token exchange failed: HTTP {r.status_code}"
                 )
             r.raise_for_status()
             data = r.json()
@@ -347,7 +366,7 @@ class CopilotClient:
                 return response
             except (httpx.TransportError, _TransientServerError) as exc:
                 if attempt == _MAX_ATTEMPTS:
-                    raise
+                    raise CopilotUnavailableError(str(exc)) from exc
                 delay = _RETRY_BASE_DELAY * 2 ** (attempt - 1)
                 logger.warning(
                     "Copilot chat completion failed (%s), retrying in %.0fs (attempt %d/%d)",

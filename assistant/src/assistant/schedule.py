@@ -36,6 +36,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+from .copilot import CopilotUnavailableError
+
 logger = logging.getLogger(__name__)
 
 _SCHEDULE_FILE = "system/schedule.md"
@@ -151,9 +153,14 @@ class Scheduler:
         vault_tools: Any,  # VaultTools instance
         run_job_fn: Callable[[str], Coroutine[Any, Any, None]],
         tz_name: str = "UTC",
+        queue_job_fn: Callable[[str], None] | None = None,
     ) -> None:
         self._vault = vault_tools
         self._run_job = run_job_fn
+        # Hands a one-off's prompt to the outage retry queue when its run
+        # failed because Copilot was unreachable — the row is still removed,
+        # so the reminder must survive somewhere.
+        self._queue_job_fn = queue_job_fn
         self._tz = tz_name
         self._apscheduler = AsyncIOScheduler(timezone=tz_name)
         self._entries: dict[str, ScheduleEntry] = {}
@@ -314,6 +321,18 @@ class Scheduler:
             try:
                 await self._run_job(prompt)
                 completed = True
+            except CopilotUnavailableError as exc:
+                if not recurring and self._queue_job_fn is not None:
+                    # A one-off's row is removed below either way; without this
+                    # hand-off the reminder would be silently lost. Recurring
+                    # jobs self-heal: `next` stays past and catch_up() retries.
+                    logger.warning(
+                        "Copilot unavailable (%s); queueing one-off job %s for retry",
+                        exc, job_id,
+                    )
+                    self._queue_job_fn(prompt)
+                else:
+                    logger.exception("Error in scheduled job %s", job_id)
             except Exception:
                 logger.exception("Error in scheduled job %s", job_id)
             finally:

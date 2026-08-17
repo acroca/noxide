@@ -119,6 +119,45 @@ async def test_text_message_runs_agent_and_replies() -> None:
 
 
 # ------------------------------------------------------------------
+# Copilot outage: failed messages are queued for retry
+# ------------------------------------------------------------------
+
+async def test_outage_queues_message_and_tells_user() -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    agent = MagicMock()
+    agent.run = AsyncMock(side_effect=CopilotUnavailableError("HTTP 502"))
+    queue_fn = MagicMock()
+    bot = TelegramBot(
+        token="tg-token",
+        allowed_user_ids=[_USER_ID],
+        agent=agent,
+        queue_message_fn=queue_fn,
+    )
+    update, ctx = _update(text="pastilla tomada")
+
+    await bot._handle_message(update, ctx)
+
+    queue_fn.assert_called_once_with(777, None, "pastilla tomada")
+    (reply,) = _replies(update.message)
+    assert "queued" in reply
+    assert "Copilot" in reply
+
+
+async def test_outage_without_queue_keeps_generic_error_reply() -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    bot, agent = _bot()
+    agent.run = AsyncMock(side_effect=CopilotUnavailableError("HTTP 502"))
+    update, ctx = _update(text="hola")
+
+    await bot._handle_message(update, ctx)
+
+    (reply,) = _replies(update.message)
+    assert reply.startswith("Sorry, something went wrong")
+
+
+# ------------------------------------------------------------------
 # Replies (Telegram reply-to context)
 # ------------------------------------------------------------------
 
@@ -756,6 +795,18 @@ async def test_send_message_returns_none_when_dropped() -> None:
     await bot.start()
 
     assert await bot.send_message("hola") is None
+
+
+async def test_send_message_chat_id_override_bypasses_pinned_chat() -> None:
+    """Retry-queue replays deliver to the conversation the message came from,
+    which needs a chat other than the pinned one to be addressable."""
+    bot, app = _lifecycle_bot()
+    await bot.start()
+
+    result = await bot.send_message("hola", chat_id=555)
+
+    assert result == 555
+    assert app.bot.send_message.call_args.kwargs["chat_id"] == 555
 
 
 async def test_lifecycle_messages_dropped_without_chat_id() -> None:

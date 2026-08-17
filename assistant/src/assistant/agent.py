@@ -249,6 +249,18 @@ class ConversationHistory:
             msgs.pop(0)
         return msgs
 
+    def pop_if_last(self, msg: dict[str, Any]) -> bool:
+        """Remove ``msg`` if it is (by identity) the newest entry.
+
+        Lets a failed outage-replay attempt unwind the note it just appended:
+        anything newer than the note means the run made progress, which must
+        be kept.
+        """
+        if self._history and self._history[-1] is msg:
+            self._history.pop()
+            return True
+        return False
+
     def clear(self) -> None:
         self._history.clear()
 
@@ -660,6 +672,7 @@ class Agent:
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
+        unwind_on_unavailable: bool = False,
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
 
@@ -689,6 +702,7 @@ class Agent:
                 on_research=on_research,
                 send_message_fn=send_message_fn,
                 response_format=response_format,
+                unwind_on_unavailable=unwind_on_unavailable,
             )
         # One commit per interaction, in the background: the reply is not
         # delayed by git, and the commit message carries the full exchange.
@@ -707,8 +721,19 @@ class Agent:
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
+        unwind_on_unavailable: bool = False,
     ) -> tuple[str, set[str]]:
-        """Returns the final text reply and the vault paths this run touched."""
+        """Returns the final text reply and the vault paths this run touched.
+
+        With ``unwind_on_unavailable`` (outage-replay attempts), a
+        CopilotUnavailableError removes the just-appended user message from
+        history before propagating — the drain loop re-invokes the replay on
+        every backoff cycle, and without the unwind each failed attempt would
+        leave its note behind, eventually evicting the original failed turn
+        from the deque. Only the newest entry is ever removed: anything newer
+        means the run made progress (completed tool calls) that the next
+        resume must see.
+        """
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
         touched: set[str] = set()
@@ -768,7 +793,12 @@ class Agent:
                     live_entry if m is user_entry else m for m in turn_messages
                 ]
             messages = [{"role": "system", "content": system_prompt}] + turn_messages
-            response = await client.chat(messages, tools, response_format=response_format)
+            try:
+                response = await client.chat(messages, tools, response_format=response_format)
+            except copilot.CopilotUnavailableError:
+                if unwind_on_unavailable:
+                    history.pop_if_last(user_entry)
+                raise
 
             choice = response["choices"][0]
             msg = choice["message"]
@@ -863,6 +893,70 @@ class Agent:
         # Hit iteration cap
         logger.warning("Agent hit max iterations (%d) for chat_id=%d", _MAX_ITERATIONS, chat_id)
         return MAX_ITERATIONS_REPLY, touched
+
+    async def retry_message(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        text: str,
+        queued_at: str,
+        hot: bool,
+    ) -> str | None:
+        """Replay a user message that failed during a Copilot outage.
+
+        *Hot* items were queued in this process: the failed turn — the user
+        message, possibly followed by completed tool calls — still sits in
+        this conversation's history, so the replay appends only a resume note
+        and lets the model pick the turn up in place. Re-appending the text
+        would double it, and re-running a mid-run failure from scratch could
+        redo vault writes the first attempt already made. Two hot cases stand
+        down instead: an empty history (/clear during the outage — the
+        conversation was deliberately forgotten) and a history whose last
+        entry is a plain assistant reply (a later successful run saw the
+        pending message in context and already covered it).
+
+        *Cold* items were reloaded from disk after a restart: the history is
+        gone, so the original text is replayed with a provenance note carrying
+        when it was sent and that it may have been partially processed —
+        the model re-reads pages before writing, per its normal recipe.
+
+        Returns the reply to deliver, or None when the item was superseded.
+        Raises CopilotUnavailableError while the outage lasts, so the retry
+        queue keeps the item.
+        """
+        if hot:
+            # Peeked outside the run lock: a concurrent run can only leave a
+            # user/tool/assistant-with-tools tail (no false drop); worst case
+            # is a redundant "everything's handled" reply after racing one.
+            msgs = self._get_history(chat_id, thread_id).messages()
+            if not msgs:
+                logger.info(
+                    "Dropping queued message for chat_id=%d thread_id=%s: history cleared",
+                    chat_id, thread_id,
+                )
+                return None
+            last = msgs[-1]
+            if last.get("role") == "assistant" and not extract_tool_calls(last):
+                logger.info(
+                    "Dropping queued message for chat_id=%d thread_id=%s: already covered "
+                    "by a later run", chat_id, thread_id,
+                )
+                return None
+            note = (
+                "[Copilot went down mid-conversation and is back now — review the "
+                "messages above and finish handling anything still unanswered or "
+                "incomplete]"
+            )
+            return await self.run(
+                chat_id, note, thread_id=thread_id, unwind_on_unavailable=True
+            )
+        note = (
+            f"[this message was originally sent {queued_at} and delayed by a Copilot "
+            f"outage; it may have been partially processed before the failure] {text}"
+        )
+        return await self.run(
+            chat_id, note, thread_id=thread_id, unwind_on_unavailable=True
+        )
 
     async def run_job(self, prompt: str) -> str:
         """Run a scheduled-job prompt (chat_id 0, no thread).

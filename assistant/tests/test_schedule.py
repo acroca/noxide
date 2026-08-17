@@ -748,6 +748,54 @@ async def test_reload_skips_a_one_off_that_is_still_running(vault: VaultTools) -
 
 
 # ------------------------------------------------------------------
+# Copilot outage: a one-off must be queued for retry, not silently lost
+# ------------------------------------------------------------------
+
+async def test_fire_queues_one_off_when_copilot_is_down(vault: VaultTools) -> None:
+    from unittest.mock import MagicMock
+
+    from assistant.copilot import CopilotUnavailableError
+
+    queue_fn = MagicMock()
+    scheduler = Scheduler(
+        vault_tools=vault,
+        run_job_fn=AsyncMock(side_effect=CopilotUnavailableError("HTTP 502")),
+        tz_name="UTC",
+        queue_job_fn=queue_fn,
+    )
+    result = scheduler.schedule("2099-01-01T09:00:00+00:00", "Take the pill", False)
+    job_id = result.split()[2]
+
+    await scheduler._fire(job_id, "Take the pill", recurring=False)
+
+    queue_fn.assert_called_once_with("Take the pill")
+    # The row is still removed — the retry queue owns the job now, and a live
+    # row would hot-loop through the reload poll.
+    assert "Take the pill" not in vault.read_file("system/schedule.md")
+
+
+async def test_fire_does_not_queue_recurring_on_outage(vault: VaultTools) -> None:
+    from unittest.mock import MagicMock
+
+    from assistant.copilot import CopilotUnavailableError
+
+    queue_fn = MagicMock()
+    scheduler = Scheduler(
+        vault_tools=vault,
+        run_job_fn=AsyncMock(side_effect=CopilotUnavailableError("HTTP 502")),
+        tz_name="UTC",
+        queue_job_fn=queue_fn,
+    )
+    scheduler.schedule("0 8 * * *", "Morning brief", True)
+    entries, _ = scheduler._read_table()
+
+    await scheduler._fire(entries[0].id, "Morning brief", recurring=True)
+
+    # Recurring jobs self-heal: `next` stays past, catch_up retries at startup.
+    queue_fn.assert_not_called()
+
+
+# ------------------------------------------------------------------
 # Input hardening: footguns the prompt used to merely warn about
 # ------------------------------------------------------------------
 
