@@ -47,6 +47,39 @@ async def test_transcribe_auth_error_mentions_api_key(transcriber: Transcriber) 
 
 
 @respx.mock
+async def test_transcribe_strips_whitespace_around_api_key() -> None:
+    """A trailing newline in ELEVENLABS_API_KEY must not become an illegal header."""
+    route = respx.post(_ENDPOINT).mock(return_value=httpx.Response(200, json={"text": "hi"}))
+
+    await Transcriber(api_key="  xi-secret\n").transcribe(b"OGG")
+
+    assert route.calls.last.request.headers["xi-api-key"] == "xi-secret"
+
+
+@respx.mock
+async def test_transcribe_exhausted_quota_is_not_reported_as_bad_key(
+    transcriber: Transcriber,
+) -> None:
+    """ElevenLabs reports used-up credits as a 401 with detail.status quota_exceeded."""
+    respx.post(_ENDPOINT).mock(
+        return_value=httpx.Response(
+            401,
+            json={
+                "detail": {
+                    "status": "quota_exceeded",
+                    "message": "This request exceeds your quota of 10000.",
+                }
+            },
+        )
+    )
+
+    with pytest.raises(TranscriptionError, match="credit") as excinfo:
+        await transcriber.transcribe(b"OGG")
+
+    assert "ELEVENLABS_API_KEY" not in str(excinfo.value)
+
+
+@respx.mock
 async def test_transcribe_rate_limit_error(transcriber: Transcriber) -> None:
     respx.post(_ENDPOINT).mock(return_value=httpx.Response(429, text="rate limited"))
 
@@ -59,6 +92,16 @@ async def test_transcribe_other_http_error(transcriber: Transcriber) -> None:
     respx.post(_ENDPOINT).mock(return_value=httpx.Response(400, text="bad audio"))
 
     with pytest.raises(TranscriptionError, match="HTTP 400"):
+        await transcriber.transcribe(b"OGG")
+
+
+@respx.mock
+async def test_transcribe_non_json_success_body_raises_transcription_error(
+    transcriber: Transcriber,
+) -> None:
+    respx.post(_ENDPOINT).mock(return_value=httpx.Response(200, text="<html>gateway</html>"))
+
+    with pytest.raises(TranscriptionError, match="unexpected"):
         await transcriber.transcribe(b"OGG")
 
 

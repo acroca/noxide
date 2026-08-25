@@ -499,7 +499,8 @@ class TelegramBot:
             await msg.reply_text("Couldn't process that audio, sorry.", message_thread_id=thread_id)
             return
 
-        await msg.reply_text(f"🎙 {transcript}", message_thread_id=thread_id)
+        for chunk in _split_message(f"🎙 {transcript}"):
+            await msg.reply_text(chunk, message_thread_id=thread_id)
         await self._run_agent_and_reply(msg, ctx, transcript, thread_id)
 
     async def _handle_photo(

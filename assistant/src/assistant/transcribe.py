@@ -26,11 +26,24 @@ class TranscriptionError(RuntimeError):
     """Audio could not be transcribed."""
 
 
+def _detail_status(r: httpx.Response) -> str:
+    """The `detail.status` code of an ElevenLabs error body, or ""."""
+    try:
+        detail = r.json().get("detail")
+    except ValueError:
+        return ""
+    if isinstance(detail, dict):
+        return str(detail.get("status") or "")
+    return ""
+
+
 class Transcriber:
     """Transcribes audio bytes to text using ElevenLabs Scribe."""
 
     def __init__(self, api_key: str, model: str = _MODEL) -> None:
-        self._api_key = api_key
+        # Stripped defensively: stray whitespace from a copy-pasted .env value
+        # would otherwise become an illegal header at send time.
+        self._api_key = api_key.strip()
         self._model = model
 
     async def transcribe(self, audio: bytes) -> str:
@@ -50,20 +63,34 @@ class Transcriber:
             except httpx.HTTPError as exc:
                 raise TranscriptionError(f"ElevenLabs request failed: {exc}") from exc
 
-        if r.status_code in (401, 403):
-            raise TranscriptionError(
-                "ElevenLabs rejected the API key — check that ELEVENLABS_API_KEY is set "
-                "to a valid key from elevenlabs.io"
-            )
-        if r.status_code == 429:
-            raise TranscriptionError(
-                "ElevenLabs rate limit reached — try again in a little while"
-            )
         if r.status_code >= 400:
             logger.error("ElevenLabs error %d: %.500s", r.status_code, r.text)
+            # Exhausted credits arrive as a 401 with detail.status
+            # "quota_exceeded" — without this check they would be
+            # misreported as a bad API key.
+            if _detail_status(r) == "quota_exceeded":
+                raise TranscriptionError(
+                    "ElevenLabs transcription credits are used up — top up or "
+                    "wait for the monthly reset"
+                )
+            if r.status_code in (401, 403):
+                raise TranscriptionError(
+                    "ElevenLabs rejected the API key — check that ELEVENLABS_API_KEY "
+                    "is set to a valid key from elevenlabs.io"
+                )
+            if r.status_code == 429:
+                raise TranscriptionError(
+                    "ElevenLabs rate limit reached — try again in a little while"
+                )
             raise TranscriptionError(f"ElevenLabs returned HTTP {r.status_code}")
 
-        transcript = (r.json().get("text") or "").strip()
+        try:
+            transcript = (r.json().get("text") or "").strip()
+        except ValueError:
+            logger.error("ElevenLabs non-JSON 200 body: %.500s", r.text)
+            raise TranscriptionError(
+                "ElevenLabs returned an unexpected response"
+            ) from None
         if not transcript:
             raise TranscriptionError("transcription came back empty")
         return transcript
