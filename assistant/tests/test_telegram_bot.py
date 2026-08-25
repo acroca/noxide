@@ -327,7 +327,7 @@ async def test_voice_without_transcriber_replies_setup_hint() -> None:
     await bot._handle_message(update, ctx)
 
     agent.run.assert_not_awaited()
-    assert "GITHUB_TOKEN" in _replies(update.message)[0]
+    assert "ELEVENLABS_API_KEY" in _replies(update.message)[0]
 
 
 async def test_voice_transcription_error_replies_and_skips_agent() -> None:

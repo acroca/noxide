@@ -54,7 +54,7 @@ assistant/
     web.py          ← quarantined research sub-agent
     fanout.py       ← concurrent read-only worker sub-agents
     extract.py      ← PDF/image content extraction
-    transcribe.py   ← voice notes via GitHub Models
+    transcribe.py   ← voice notes via ElevenLabs Scribe
     usage.py        ← token accounting
     lifecycle.py    ← signals and graceful shutdown
     config.py       ← TOML + env config

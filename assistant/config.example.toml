@@ -18,8 +18,8 @@ default_model = "sonnet"
 sonnet = "claude-sonnet-5"
 # opus = "claude-opus-4.8"
 
-# Voice transcription (optional): set GITHUB_TOKEN env var to a fine-grained
-# PAT with the `models: read` permission to enable Telegram voice messages.
+# Voice transcription (optional): set ELEVENLABS_API_KEY env var to an
+# ElevenLabs API key to enable Telegram voice messages.
 
 [web]
 # Optional: base URL of a 4get instance (docs/deployment.md has a Compose

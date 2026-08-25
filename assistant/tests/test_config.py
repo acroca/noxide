@@ -53,27 +53,31 @@ def test_load_config_without_file_does_not_raise(tmp_path: Path) -> None:
     assert cfg.telegram_bot_token == ""
 
 
-def test_github_token_read_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GITHUB_TOKEN", "github_pat_abc")
+def test_elevenlabs_api_key_read_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "xi-abc")
 
     cfg = load_config(tmp_path / "does-not-exist.toml")
 
-    assert cfg.github_token == "github_pat_abc"
+    assert cfg.elevenlabs_api_key == "xi-abc"
 
 
-def test_github_token_defaults_to_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+def test_elevenlabs_api_key_defaults_to_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
 
     cfg = load_config(tmp_path / "does-not-exist.toml")
 
-    assert cfg.github_token == ""
+    assert cfg.elevenlabs_api_key == ""
 
 
-def test_validate_passes_without_github_token(state_dir: Path) -> None:
-    """Voice transcription is optional — no GITHUB_TOKEN must not block startup."""
+def test_validate_passes_without_elevenlabs_api_key(state_dir: Path) -> None:
+    """Voice transcription is optional — no ELEVENLABS_API_KEY must not block startup."""
     _write_oauth_token(state_dir)
 
-    _config(state_dir, github_token="").validate_for_run()  # should not raise
+    _config(state_dir, elevenlabs_api_key="").validate_for_run()  # should not raise
 
 
 # ------------------------------------------------------------------

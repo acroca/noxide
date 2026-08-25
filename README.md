@@ -50,7 +50,7 @@ not a product. There is no multi-tenancy and no web UI.
 | **Notes & memory** | Writes what you tell it into a raw journal + compiled wiki; searches before creating; never edits history |
 | **Reminders & jobs** | One-off (`"in 10 minutes"`, `"tomorrow at 9am"`) and recurring cron jobs, in a markdown table you can hand-edit |
 | **Web research** | Optional, via a self-hosted [4get](https://git.lolcat.ca/lolcat/4get); runs in an isolated sub-agent with no vault access |
-| **Voice notes** | Transcribed via GitHub Models; optional, needs a free PAT |
+| **Voice notes** | Transcribed via ElevenLabs Scribe; optional, needs an API key |
 | **Photos** | Sent to the vision model and filed in the vault, driven by your caption |
 | **Documents** | PDFs, scans and text files stored and read on demand — digital PDFs parsed locally, scans transcribed via vision |
 | **Rooms** | Telegram forum topics become separate rooms with their own history and prompt, handled in parallel, sharing one vault |

@@ -339,7 +339,7 @@ class TelegramBot:
         voice_line = (
             "• You can send me voice messages too.\n"
             if self._transcriber
-            else "• Voice messages are disabled (set GITHUB_TOKEN to enable them).\n"
+            else "• Voice messages are disabled (set ELEVENLABS_API_KEY to enable them).\n"
         )
         await update.message.reply_text(
             "Hi! I'm your personal AI assistant backed by GitHub Copilot.\n\n"
@@ -470,8 +470,8 @@ class TelegramBot:
         """Transcribe a voice note or audio file and feed the transcript to the agent."""
         if self._transcriber is None:
             await msg.reply_text(
-                "Voice messages aren't set up — set GITHUB_TOKEN to a fine-grained "
-                "PAT with the `models: read` permission and restart the bot.",
+                "Voice messages aren't set up — set ELEVENLABS_API_KEY to an API key "
+                "from elevenlabs.io and restart the bot.",
                 message_thread_id=thread_id,
             )
             return

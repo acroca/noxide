@@ -40,7 +40,7 @@ services:
       ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-sonnet}
       TIMEZONE: ${TIMEZONE:-UTC}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
     volumes:
       - ./vault:/data/vault
       - ./state:/data/state
@@ -61,7 +61,7 @@ ALLOWED_USER_IDS=123456789
 TIMEZONE=Europe/Madrid
 # DEFAULT_MODEL=sonnet
 # Optional — enables voice messages, see below
-# GITHUB_TOKEN=github_pat_...
+# ELEVENLABS_API_KEY=...
 ```
 
 Multiple users go in `ALLOWED_USER_IDS` separated by commas. Then:
@@ -116,20 +116,18 @@ Next: set up your vault — see [vault.md](vault.md#starting-a-vault).
 
 ### Voice messages
 
-The Copilot API has no audio modality, so voice notes go through
-[GitHub Models](https://docs.github.com/en/github-models) (Phi-4-multimodal)
-on the same GitHub account — no extra vendor or billing:
+The Copilot API has no audio modality, so voice notes go through the
+[ElevenLabs](https://elevenlabs.io) speech-to-text API (Scribe), which takes
+Telegram's OGG/Opus voice notes directly and auto-detects the language:
 
-1. Create a fine-grained PAT at
-   <https://github.com/settings/personal-access-tokens/new> with **no
-   repository access** and the account permission **Models: read-only**
-2. Set it as `GITHUB_TOKEN` in `.env` and restart
+1. Create an API key at <https://elevenlabs.io/app/settings/api-keys>
+2. Set it as `ELEVENLABS_API_KEY` in `.env` and restart
 
 The bot echoes what it heard (`🎙 …`) before answering, so mis-transcriptions
-are obvious. Without the token, voice messages get a setup hint instead.
+are obvious. Without the key, voice messages get a setup hint instead.
 
-GitHub Models has a rate-limited free tier — fine for personal voice notes, and
-the bot tells you when it hits the limit.
+The ElevenLabs free tier includes some transcription hours per month — fine
+for personal voice notes, and the bot tells you when it hits the limit.
 
 ### Web research
 

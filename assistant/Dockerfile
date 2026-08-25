@@ -1,6 +1,5 @@
 # Named stages keep copied tool images visible to Dependabot.
 FROM ghcr.io/astral-sh/uv:0.12.3@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc AS uv
-FROM mwader/static-ffmpeg:9.0@sha256:b90574a4e2ae62b763c39c384526689e7eb435da6398f4fb3f6c3f1c6a14ce33 AS ffmpeg
 
 FROM python:3.14-slim AS builder
 
@@ -20,11 +19,6 @@ RUN uv sync --frozen --no-dev --no-editable
 
 
 FROM python:3.14-slim
-
-# ffmpeg converts Telegram voice notes (OGG/Opus) to MP3 for transcription.
-# A static binary instead of Debian's ffmpeg package, whose dependency
-# tree (libLLVM, Mesa, codec libs) adds ~400MB.
-COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 
 # git powers the optional vault backup (local-only commit history)
 RUN apt-get update \

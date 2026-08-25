@@ -60,8 +60,8 @@ async def send_with_retries(send, what: str) -> httpx.Response:
     exponential backoff. Non-5xx responses (including 4xx) are returned
     as-is for the caller to handle.
 
-    Public because `transcribe` shares it: both talk to a GitHub HTTP API
-    with the same transient-failure profile.
+    Public because `transcribe` shares it: the ElevenLabs API has the same
+    transient-failure profile.
     """
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:

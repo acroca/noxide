@@ -29,9 +29,9 @@ class Config(BaseSettings):
     default_model: str = "sonnet"
     models: dict[str, str] = Field(default_factory=lambda: {"sonnet": "claude-sonnet-5"})
 
-    # GitHub Models (voice transcription) — optional; a fine-grained PAT
-    # with the `models: read` permission, read from GITHUB_TOKEN
-    github_token: str = ""
+    # ElevenLabs (voice transcription) — optional; an API key from
+    # elevenlabs.io, read from ELEVENLABS_API_KEY
+    elevenlabs_api_key: str = ""
 
     # Web research (optional) — base URL of a 4get instance; empty disables
     # the research tool entirely

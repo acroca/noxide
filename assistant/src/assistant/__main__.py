@@ -65,11 +65,13 @@ async def _run(config_path: Path | None) -> None:
             "backup.enabled not set — vault git backup disabled"
         )
 
-    # Voice transcription is optional — enabled when GITHUB_TOKEN is set
-    transcriber = Transcriber(cfg.github_token) if cfg.github_token.strip() else None
+    # Voice transcription is optional — enabled when ELEVENLABS_API_KEY is set
+    transcriber = (
+        Transcriber(cfg.elevenlabs_api_key) if cfg.elevenlabs_api_key.strip() else None
+    )
     if transcriber is None:
         logging.getLogger(__name__).info(
-            "GITHUB_TOKEN not set — voice messages disabled"
+            "ELEVENLABS_API_KEY not set — voice messages disabled"
         )
 
     # Outage retry queue: messages and one-off jobs that failed because
