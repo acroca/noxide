@@ -1,4 +1,4 @@
-"""Tests for web research: SearXNG search, guarded page fetch, quarantined researcher."""
+"""Tests for web research: 4get search, guarded page fetch, quarantined researcher."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from assistant.agent import Agent
 from assistant.tools import VaultTools
 from assistant.web import Researcher, WebTools
 
-_SEARXNG_URL = "http://searxng:8080"
+_FOURGET_URL = "http://fourget"
 
 
 def _make_text_response(content: str) -> dict:
@@ -56,7 +56,11 @@ def _make_tool_call_response(tool_name: str, tool_args: dict, call_id: str = "tc
 
 @pytest.fixture
 def web() -> WebTools:
-    return WebTools(_SEARXNG_URL)
+    return WebTools(_FOURGET_URL)
+
+
+def _search_response(results: list[dict]) -> httpx.Response:
+    return httpx.Response(200, json={"status": "ok", "npt": "tok", "web": results})
 
 
 @pytest.fixture
@@ -75,24 +79,19 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @respx.mock
 async def test_web_search_formats_results(web: WebTools) -> None:
-    respx.get(f"{_SEARXNG_URL}/search").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {
-                        "title": "Best e-bike locks",
-                        "url": "https://example.com/locks",
-                        "content": "A review of the toughest locks.",
-                    },
-                    {
-                        "title": "Lock test 2026",
-                        "url": "https://example.org/test",
-                        "content": "Independent lab results.",
-                    },
-                ]
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(
+        return_value=_search_response([
+            {
+                "title": "Best e-bike locks",
+                "url": "https://example.com/locks",
+                "description": "A review of the toughest locks.",
             },
-        )
+            {
+                "title": "Lock test 2026",
+                "url": "https://example.org/test",
+                "description": "Independent lab results.",
+            },
+        ])
     )
 
     out = await web.web_search("best e-bike locks")
@@ -106,12 +105,10 @@ async def test_web_search_formats_results(web: WebTools) -> None:
 @respx.mock
 async def test_web_search_limits_result_count(web: WebTools) -> None:
     many = [
-        {"title": f"Result {i}", "url": f"https://example.com/{i}", "content": "x"}
+        {"title": f"Result {i}", "url": f"https://example.com/{i}", "description": "x"}
         for i in range(30)
     ]
-    respx.get(f"{_SEARXNG_URL}/search").mock(
-        return_value=httpx.Response(200, json={"results": many})
-    )
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(return_value=_search_response(many))
 
     out = await web.web_search("anything")
 
@@ -120,10 +117,50 @@ async def test_web_search_limits_result_count(web: WebTools) -> None:
 
 
 @respx.mock
-async def test_web_search_no_results(web: WebTools) -> None:
-    respx.get(f"{_SEARXNG_URL}/search").mock(
-        return_value=httpx.Response(200, json={"results": []})
+async def test_web_search_falls_back_to_second_scraper_on_error_status(
+    web: WebTools,
+) -> None:
+    fallback = respx.get(
+        f"{_FOURGET_URL}/api/v1/web", params={"scraper": "brave"}
+    ).mock(
+        return_value=_search_response(
+            [{"title": "Via brave", "url": "https://example.com/b", "description": "d"}]
+        )
     )
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(
+        return_value=httpx.Response(
+            200, json={"status": "Too many requests, try again later"}
+        )
+    )
+
+    out = await web.web_search("anything")
+
+    assert "Via brave" in out
+    assert fallback.called
+
+
+@respx.mock
+async def test_web_search_falls_back_to_second_scraper_on_empty_results(
+    web: WebTools,
+) -> None:
+    fallback = respx.get(
+        f"{_FOURGET_URL}/api/v1/web", params={"scraper": "brave"}
+    ).mock(
+        return_value=_search_response(
+            [{"title": "Via brave", "url": "https://example.com/b", "description": "d"}]
+        )
+    )
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(return_value=_search_response([]))
+
+    out = await web.web_search("anything")
+
+    assert "Via brave" in out
+    assert fallback.called
+
+
+@respx.mock
+async def test_web_search_no_results_from_either_scraper(web: WebTools) -> None:
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(return_value=_search_response([]))
 
     out = await web.web_search("gibberish qzxv")
 
@@ -131,8 +168,20 @@ async def test_web_search_no_results(web: WebTools) -> None:
 
 
 @respx.mock
+async def test_web_search_error_status_returns_error_string(web: WebTools) -> None:
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(
+        return_value=httpx.Response(200, json={"status": "This scraper requires 4play"})
+    )
+
+    out = await web.web_search("anything")
+
+    assert out.startswith("[tool error:")
+    assert "4play" in out
+
+
+@respx.mock
 async def test_web_search_backend_error_returns_error_string(web: WebTools) -> None:
-    respx.get(f"{_SEARXNG_URL}/search").mock(return_value=httpx.Response(500))
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(return_value=httpx.Response(500))
 
     out = await web.web_search("anything")
 
@@ -141,7 +190,7 @@ async def test_web_search_backend_error_returns_error_string(web: WebTools) -> N
 
 @respx.mock
 async def test_web_search_backend_unreachable_returns_error_string(web: WebTools) -> None:
-    respx.get(f"{_SEARXNG_URL}/search").mock(side_effect=httpx.ConnectError("refused"))
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(side_effect=httpx.ConnectError("refused"))
 
     out = await web.web_search("anything")
 
@@ -303,10 +352,9 @@ async def test_fetch_page_http_error_returns_error_string(web: WebTools, public_
 
 @respx.mock
 async def test_researcher_searches_then_summarizes(web: WebTools) -> None:
-    respx.get(f"{_SEARXNG_URL}/search").mock(
-        return_value=httpx.Response(
-            200,
-            json={"results": [{"title": "T", "url": "https://e.com", "content": "snippet"}]},
+    respx.get(f"{_FOURGET_URL}/api/v1/web").mock(
+        return_value=_search_response(
+            [{"title": "T", "url": "https://e.com", "description": "snippet"}]
         )
     )
     mock_client = MagicMock()
@@ -471,7 +519,7 @@ async def test_agent_dispatches_research_tool(vault: VaultTools) -> None:
 # ------------------------------------------------------------------
 
 async def test_research_records_usage_event() -> None:
-    researcher = Researcher(WebTools(_SEARXNG_URL))
+    researcher = Researcher(WebTools(_FOURGET_URL))
     mock_client = MagicMock()
     response = _make_text_response("answer")
     response["model"] = "claude-sonnet-4.6"

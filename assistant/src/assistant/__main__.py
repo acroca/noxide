@@ -135,15 +135,15 @@ async def _run(config_path: Path | None) -> None:
         queue_message_fn=retry_queue.enqueue_message,
     )
 
-    # Web research is optional — enabled when a SearXNG URL is configured
+    # Web research is optional — enabled when a 4get URL is configured
     researcher = None
-    if cfg.searxng_url.strip():
+    if cfg.fourget_url.strip():
         from .web import Researcher, WebTools
 
-        researcher = Researcher(WebTools(cfg.searxng_url))
+        researcher = Researcher(WebTools(cfg.fourget_url))
     else:
         logging.getLogger(__name__).info(
-            "web.searxng_url not set — web research disabled"
+            "web.fourget_url not set — web research disabled"
         )
 
     # Attachment content extraction (local parse, vision fallback via Copilot)

@@ -19,7 +19,8 @@ config.toml
 tests/
 Makefile
 
-# A user's own Compose/SearXNG files, copied out of docs/deployment.md
+# A user's own Compose files, copied out of docs/deployment.md (searxng/ is
+# the pre-4get search backend's config dir, still ignored for older setups)
 compose.y*ml
 docker-compose.y*ml
 searxng/

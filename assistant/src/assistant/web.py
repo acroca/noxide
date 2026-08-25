@@ -1,4 +1,4 @@
-"""Web research: SearXNG search + guarded page fetch, run by a quarantined sub-agent.
+"""Web research: 4get search + guarded page fetch, run by a quarantined sub-agent.
 
 Security model: raw web content only ever enters the Researcher's context. The
 Researcher has no vault, schedule, or messaging tools, and its context contains
@@ -39,6 +39,10 @@ _WEB_TOOL_TIMEOUT = 30.0
 _USER_AGENT = "Mozilla/5.0 (compatible; Noxide/1.0)"
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
+# Second scraper to try when the instance default (ddg out of the box) errors
+# or comes back empty. Verified working alongside ddg on a residential IP.
+_FALLBACK_SCRAPER = "brave"
+
 
 async def _resolve_host(host: str) -> list[str]:
     """Resolve *host* to its IP addresses (module-level so tests can stub it)."""
@@ -52,7 +56,7 @@ async def _check_url(url: str) -> tuple[str, None] | tuple[None, str]:
 
     Blocks non-HTTP schemes and anything resolving to a non-global address
     (private ranges, loopback, link-local/cloud-metadata) — the fetcher shares
-    a network with SearXNG and possibly other internal services. The returned
+    a network with 4get and possibly other internal services. The returned
     address is the one the caller must connect to: connecting by hostname would
     let httpx re-resolve it, reopening a DNS-rebinding window.
     """
@@ -100,33 +104,49 @@ def _pin_request(url: str, address: str) -> tuple[str, dict[str, str], dict[str,
 
 
 class WebTools:
-    """Search via SearXNG and fetch readable page text. Used only by the Researcher."""
+    """Search via 4get and fetch readable page text. Used only by the Researcher."""
 
-    def __init__(self, searxng_url: str) -> None:
-        self._searxng_url = searxng_url.rstrip("/")
+    def __init__(self, fourget_url: str) -> None:
+        self._fourget_url = fourget_url.rstrip("/")
 
     async def web_search(self, query: str) -> str:
-        """Query SearXNG's JSON API and return formatted top results."""
+        """Query 4get's JSON API and return formatted top results.
+
+        4get queries one upstream scraper per request (the instance default,
+        DuckDuckGo out of the box). Upstream engines intermittently wall off
+        scrapers with captchas and rate limits, so an error or an empty result
+        set retries once on the fallback scraper before giving up.
+        """
         logger.info("web_search query=%r", query)
+        first = await self._search_once(query)
+        if not first.startswith("["):
+            return first
+        logger.info("web_search retrying scraper=%s after %r", _FALLBACK_SCRAPER, first[:80])
+        fallback = await self._search_once(query, scraper=_FALLBACK_SCRAPER)
+        return fallback if not fallback.startswith("[") else first
+
+    async def _search_once(self, query: str, scraper: str | None = None) -> str:
+        params = {"s": query} if scraper is None else {"s": query, "scraper": scraper}
         try:
             async with httpx.AsyncClient(timeout=_SEARCH_TIMEOUT) as client:
-                r = await client.get(
-                    f"{self._searxng_url}/search",
-                    params={"q": query, "format": "json"},
-                )
+                r = await client.get(f"{self._fourget_url}/api/v1/web", params=params)
                 r.raise_for_status()
                 data = r.json()
         except (httpx.HTTPError, json.JSONDecodeError) as e:
             return f"[tool error: search failed: {e}]"
 
-        results = data.get("results") or []
+        # 4get reports scraper-level failures as a non-"ok" status message.
+        status = data.get("status")
+        if status != "ok":
+            return f"[tool error: search failed: {status}]"
+        results = data.get("web") or []
         if not results:
             return "[no results]"
         lines: list[str] = []
         for i, res in enumerate(results[:_MAX_SEARCH_RESULTS], 1):
             lines.append(f"{i}. {res.get('title', '')}")
             lines.append(f"   {res.get('url', '')}")
-            snippet = (res.get("content") or "").strip()
+            snippet = (res.get("description") or "").strip()
             if snippet:
                 lines.append(f"   {snippet}")
         return "\n".join(lines)

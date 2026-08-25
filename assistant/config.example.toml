@@ -22,10 +22,10 @@ sonnet = "claude-sonnet-5"
 # PAT with the `models: read` permission to enable Telegram voice messages.
 
 [web]
-# Optional: base URL of a SearXNG instance (docs/deployment.md has a Compose
+# Optional: base URL of a 4get instance (docs/deployment.md has a Compose
 # service to copy). When set, the assistant gains a `research` tool that runs
 # web searches in an isolated sub-agent. Leave unset to disable.
-# searxng_url = "http://searxng:8080"
+# fourget_url = "http://fourget"
 
 [backup]
 # Optional: local-only git history of the vault. Every interaction that

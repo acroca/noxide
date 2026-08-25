@@ -33,9 +33,9 @@ class Config(BaseSettings):
     # with the `models: read` permission, read from GITHUB_TOKEN
     github_token: str = ""
 
-    # Web research (optional) — base URL of a SearXNG instance; empty disables
+    # Web research (optional) — base URL of a 4get instance; empty disables
     # the research tool entirely
-    searxng_url: str = ""
+    fourget_url: str = ""
 
     # Assistant. The path defaults are relative to the working directory, which
     # suits a local checkout; a packaged deployment points them at its own
@@ -122,7 +122,7 @@ _TOML_FIELDS = (
     ("telegram", "default_chat_id", "default_chat_id"),
     ("copilot", "default_model", "default_model"),
     ("copilot", "models", "models"),
-    ("web", "searxng_url", "searxng_url"),
+    ("web", "fourget_url", "fourget_url"),
     ("assistant", "timezone", "timezone"),
     ("assistant", "vault_path", "vault_path"),
     ("assistant", "state_dir", "state_dir"),
@@ -136,7 +136,7 @@ _ENV_FIELDS = {
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
     "DEFAULT_CHAT_ID": "default_chat_id",
     "DEFAULT_MODEL": "default_model",
-    "SEARXNG_URL": "searxng_url",
+    "FOURGET_URL": "fourget_url",
     "TIMEZONE": "timezone",
     "VAULT_PATH": "vault_path",
     "STATE_DIR": "state_dir",

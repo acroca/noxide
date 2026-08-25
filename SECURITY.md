@@ -91,7 +91,7 @@ allowlist is the only gate. An allowlisted user can burn your Copilot quota.
   `.gitignore` files do this) and `chmod 600` your `.env`.
 - Never commit a real vault. `/vault/` and `assistant/vault/` are gitignored;
   `vault.template/` is the only vault content in the repo and holds no data.
-- Set `SEARXNG_SECRET` if you enable web research. SearXNG publishes no ports,
-  but running it with an empty secret key is needless.
+- The 4get service for web research publishes no ports — keep it that way, so
+  it is only reachable from the Compose network.
 - Pin a release tag (`ghcr.io/acroca/noxide:v1.0.0`) rather than `latest` if
   you care about knowing what you're running.

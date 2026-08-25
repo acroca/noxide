@@ -133,58 +133,41 @@ the bot tells you when it hits the limit.
 
 ### Web research
 
-Needs a SearXNG instance. Run one alongside the bot, on the same Compose
-network and with no published ports.
+Needs a [4get](https://git.lolcat.ca/lolcat/4get) instance. Run one alongside
+the bot, on the same Compose network and with no published ports.
 
 **1.** Add the service to your `compose.yml`. The `research` profile keeps it
 out of a plain `docker compose up`:
 
 ```yaml
-  searxng:
-    image: searxng/searxng:latest
+  fourget:
+    image: luuul/4get:latest
+    # The image ships amd64 only; arm64 hosts (Apple Silicon) run it emulated.
+    platform: linux/amd64
     profiles: [research]
     restart: unless-stopped
-    volumes:
-      - ./searxng:/etc/searxng
     environment:
-      - SEARXNG_BASE_URL=http://searxng:8080/
-      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+      - FOURGET_SERVER_NAME=fourget
+      - FOURGET_PROTO=http
 ```
 
-**2.** Create `./searxng/settings.yml`. This is **not** optional decoration —
-each line is load-bearing:
+No config file or secret is needed. Leave `FOURGET_BOT_PROTECTION` unset: it
+gates the API behind a captcha the assistant cannot solve, and the service is
+only reachable from the Compose network anyway.
 
-```yaml
-use_default_settings: true
-
-server:
-  # Placeholder — SearXNG's entrypoint substitutes $SEARXNG_SECRET here.
-  secret_key: "ultrasecretkey"
-  # The limiter is bot detection; left on, it blocks the assistant's own
-  # requests.
-  limiter: false
-  image_proxy: false
-
-search:
-  # The assistant talks to the JSON API, which SearXNG disables by default.
-  # Without this, research returns errors.
-  formats:
-    - html
-    - json
-```
-
-**3.** Generate the secret and start it:
+**2.** Start it, then point the bot at it — `FOURGET_URL=http://fourget` in
+`.env`, or `[web] fourget_url` in `config.toml` — and restart the assistant:
 
 ```bash
-echo "SEARXNG_SECRET=$(openssl rand -hex 32)" >> .env
 docker compose --profile research up -d
 ```
 
-**4.** Point the bot at it: `SEARXNG_URL=http://searxng:8080` in `.env`, or
-`[web] searxng_url` in `config.toml`. Restart the assistant.
-
-SearXNG will write runtime files into `./searxng/` next to your `settings.yml`;
-that is expected.
+4get scrapes one upstream engine per query — DuckDuckGo on its default
+settings, and the assistant retries through Brave when that errors or comes
+back empty. Both scrapers impersonate a real browser's fingerprint, which is
+what keeps self-hosting on a residential IP viable where those engines
+captcha plainer clients (SearXNG, this setup's predecessor, lost DuckDuckGo,
+Startpage and Brave to captcha walls in one afternoon).
 
 See [the README](../README.md#web-research) for how research is isolated from
 your vault, and [SECURITY.md](../SECURITY.md) for the threat model.

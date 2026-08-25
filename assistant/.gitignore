@@ -16,7 +16,8 @@ config.toml
 vault/
 
 # Deployment is documented, not shipped: docs/deployment.md holds the Compose
-# and SearXNG config to copy. A local copy stays local.
+# config to copy. A local copy stays local. (searxng/ is the pre-4get search
+# backend's config dir, still ignored for older local setups.)
 compose.yml
 compose.yaml
 docker-compose.yml

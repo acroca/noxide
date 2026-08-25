@@ -30,7 +30,7 @@ start one.
 | `copilot.default_model` | `DEFAULT_MODEL` | `sonnet` | Which alias from `copilot.models` to start with. Must be a key of that table |
 | `copilot.models` | — | `{sonnet = "claude-sonnet-5"}` | Alias → model id map, offered by `/model`. File-only: defining extra models needs a mounted `config.toml` |
 | — | `GITHUB_TOKEN` | unset | Fine-grained PAT with `models: read`, enabling voice transcription. Env-only, deliberately: it is a credential, not configuration |
-| `web.searxng_url` | `SEARXNG_URL` | unset | Base URL of a SearXNG instance. Unset disables the `research` tool entirely |
+| `web.fourget_url` | `FOURGET_URL` | unset | Base URL of a [4get](https://git.lolcat.ca/lolcat/4get) instance. Unset disables the `research` tool entirely |
 | `assistant.timezone` | `TIMEZONE` | `UTC` | IANA name, e.g. `Europe/Madrid`. Drives every local time the bot writes or says, and cron interpretation |
 | `assistant.vault_path` | `VAULT_PATH` | `./vault` | Vault directory. The Docker image sets this to `/data/vault` |
 | `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, usage JSONL. The image sets this to `/data/state` |
@@ -74,7 +74,7 @@ sonnet = "claude-sonnet-5"
 opus = "claude-opus-4.8"
 
 [web]
-# searxng_url = "http://searxng:8080"
+# fourget_url = "http://fourget"
 
 [assistant]
 timezone = "Europe/Madrid"

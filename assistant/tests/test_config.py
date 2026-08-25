@@ -180,29 +180,29 @@ def test_default_chat_id_env_override(tmp_path: Path, monkeypatch: pytest.Monkey
     assert cfg.default_chat_id == 999
 
 
-def test_searxng_url_from_toml(tmp_path: Path) -> None:
+def test_fourget_url_from_toml(tmp_path: Path) -> None:
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text('[web]\nsearxng_url = "http://searxng:8080"\n')
+    cfg_file.write_text('[web]\nfourget_url = "http://fourget"\n')
 
     cfg = load_config(cfg_file)
 
-    assert cfg.searxng_url == "http://searxng:8080"
+    assert cfg.fourget_url == "http://fourget"
 
 
-def test_searxng_url_defaults_to_empty(tmp_path: Path) -> None:
+def test_fourget_url_defaults_to_empty(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "does-not-exist.toml")
 
-    assert cfg.searxng_url == ""
+    assert cfg.fourget_url == ""
 
 
-def test_searxng_url_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SEARXNG_URL", "http://other:9999")
+def test_fourget_url_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FOURGET_URL", "http://other:9999")
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text('[web]\nsearxng_url = "http://searxng:8080"\n')
+    cfg_file.write_text('[web]\nfourget_url = "http://fourget"\n')
 
     cfg = load_config(cfg_file)
 
-    assert cfg.searxng_url == "http://other:9999"
+    assert cfg.fourget_url == "http://other:9999"
 
 
 def test_validate_rejects_default_model_not_in_models(state_dir: Path) -> None:
