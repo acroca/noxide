@@ -51,6 +51,19 @@ _ERROR_RESULT_RX = re.compile(
 # finds its purpose already met; run_job then delivers nothing.
 _SILENT_SENTINEL = "[silent]"
 
+# Tool results from *finished* runs are trimmed to this many characters at the
+# start of the next run: heavy outputs (check_vault reports, full-page reads)
+# otherwise sit in the deque for up to history_size messages and get re-paid,
+# cold, on every later request. The marker carries no lengths so re-trimming
+# is byte-identical — a shifting history would defeat the provider's prompt
+# cache. Trimming drops read_file's trailing version token, which is a
+# feature: a rewrite in a later run must re-read anyway.
+_HISTORY_TOOL_RESULT_CAP = 2000
+_HISTORY_TRIM_MARKER = (
+    "\n[older tool output trimmed from history — call the tool again "
+    "if you need the full content]"
+)
+
 # A proactive sender: delivers text (optionally into a forum topic) and
 # returns the chat id it delivered to, or None when the message was dropped.
 # The chat id is how run_job learns the real conversation key when mirroring
@@ -248,6 +261,29 @@ class ConversationHistory:
         while msgs and msgs[0].get("role") == "tool":
             msgs.pop(0)
         return msgs
+
+    def compact_tool_results(self) -> None:
+        """Trim stored tool results beyond ``_HISTORY_TOOL_RESULT_CAP`` chars.
+
+        Called at run start, under the conversation's run lock, so every
+        message in the deque belongs to a finished run — the live run keeps
+        its own tool outputs intact. Trimming is idempotent (the marker holds
+        no lengths), keeping compacted history byte-stable across runs for
+        the provider's prompt cache. Entries are replaced, not mutated: the
+        original dicts may still be referenced by an in-flight backup commit
+        or a retry-queue peek.
+        """
+        for i, msg in enumerate(self._history):
+            content = msg.get("content")
+            if (
+                msg.get("role") == "tool"
+                and isinstance(content, str)
+                and len(content) > _HISTORY_TOOL_RESULT_CAP
+            ):
+                self._history[i] = {
+                    **msg,
+                    "content": content[:_HISTORY_TOOL_RESULT_CAP] + _HISTORY_TRIM_MARKER,
+                }
 
     def pop_if_last(self, msg: dict[str, Any]) -> bool:
         """Remove ``msg`` if it is (by identity) the newest entry.
@@ -736,6 +772,10 @@ class Agent:
         """
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
+        # Everything already in history belongs to finished runs (this run
+        # holds the conversation lock): shed the heavy tool outputs before
+        # they ride every request of this run, cold.
+        history.compact_tool_results()
         touched: set[str] = set()
 
         # Messages a scheduled run delivered to this conversation since its

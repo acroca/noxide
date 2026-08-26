@@ -16,6 +16,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from assistant.agent import (
+    _HISTORY_TOOL_RESULT_CAP,
+    _HISTORY_TRIM_MARKER,
     _JOB_CLOSE_RESPONSE_FORMAT,
     Agent,
     ConversationHistory,
@@ -648,6 +650,110 @@ def test_history_drops_orphaned_leading_tool_messages() -> None:
 
     assert messages[0]["role"] != "tool"
     assert [m["role"] for m in messages] == ["user", "assistant"]
+
+
+# ------------------------------------------------------------------
+# History compaction: tool results from finished runs are trimmed
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_prior_run_tool_results_are_trimmed_on_next_run(
+    agent: Agent, vault: VaultTools, tmp_path: Path
+) -> None:
+    """A heavy tool result from a finished run is trimmed before the next run."""
+    big = "x" * (_HISTORY_TOOL_RESULT_CAP * 3)
+    (tmp_path / "big.md").write_text(big)
+    responses = [
+        _make_tool_call_response("read_file", {"path": "big.md"}),
+        _make_text_response("Read it"),
+        _make_text_response("OK"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="Read the big file")
+        await agent.run(chat_id=1, user_message="Thanks")
+
+    next_run_messages = mock_client.chat.call_args_list[2][0][0]
+    tool_msgs = [m for m in next_run_messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    content = tool_msgs[0]["content"]
+    assert content.endswith(_HISTORY_TRIM_MARKER)
+    assert len(content) == _HISTORY_TOOL_RESULT_CAP + len(_HISTORY_TRIM_MARKER)
+    assert content.startswith("x" * 100)
+
+
+@pytest.mark.asyncio
+async def test_tool_results_stay_full_within_a_run(
+    agent: Agent, vault: VaultTools, tmp_path: Path
+) -> None:
+    """The running turn keeps its own tool output intact — only *finished*
+    runs get compacted, or the model would lose content it just asked for."""
+    big = "x" * (_HISTORY_TOOL_RESULT_CAP * 3)
+    (tmp_path / "big.md").write_text(big)
+    responses = [
+        _make_tool_call_response("read_file", {"path": "big.md"}),
+        _make_text_response("Read it"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="Read the big file")
+
+    same_run_messages = mock_client.chat.call_args_list[1][0][0]
+    tool_msgs = [m for m in same_run_messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert big in tool_msgs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_trimmed_tool_results_are_byte_stable_across_runs(
+    agent: Agent, vault: VaultTools, tmp_path: Path
+) -> None:
+    """Re-compacting an already-trimmed result must not change its bytes —
+    a shifting history prefix would defeat the provider's prompt cache."""
+    big = "x" * (_HISTORY_TOOL_RESULT_CAP * 3)
+    (tmp_path / "big.md").write_text(big)
+    responses = [
+        _make_tool_call_response("read_file", {"path": "big.md"}),
+        _make_text_response("Read it"),
+        _make_text_response("OK"),
+        _make_text_response("OK again"),
+    ]
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=responses)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="Read the big file")
+        await agent.run(chat_id=1, user_message="Thanks")
+        await agent.run(chat_id=1, user_message="Thanks again")
+
+    second_run = mock_client.chat.call_args_list[2][0][0]
+    third_run = mock_client.chat.call_args_list[3][0][0]
+    second_tool = [m for m in second_run if m.get("role") == "tool"]
+    third_tool = [m for m in third_run if m.get("role") == "tool"]
+    assert second_tool[0]["content"] == third_tool[0]["content"]
+
+
+def test_compact_tool_results_only_trims_long_tool_results() -> None:
+    """Short tool results and non-tool messages are left untouched."""
+    history = ConversationHistory(max_size=10)
+    history.append(
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "tc1"}, {"id": "tc2"}]}
+    )
+    history.append({"role": "tool", "tool_call_id": "tc1", "content": "short"})
+    history.append({"role": "tool", "tool_call_id": "tc2", "content": "y" * 9000})
+    long_user = "x" * 9000
+    history.append({"role": "user", "content": long_user})
+
+    history.compact_tool_results()
+
+    msgs = history.messages()
+    assert msgs[1]["content"] == "short"
+    assert msgs[2]["content"] == "y" * _HISTORY_TOOL_RESULT_CAP + _HISTORY_TRIM_MARKER
+    assert msgs[3]["content"] == long_user
 
 
 # ------------------------------------------------------------------
