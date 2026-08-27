@@ -302,24 +302,7 @@ async def test_voice_message_is_transcribed_and_fed_to_agent() -> None:
 
     transcriber.transcribe.assert_awaited_once_with(b"OGGBYTES")
     agent.run.assert_awaited_once_with(777, "buy milk tomorrow", thread_id=None, on_research=ANY)
-    replies = _replies(update.message)
-    assert replies[0] == "🎙 buy milk tomorrow"
-    assert replies[1] == "agent reply"
-
-
-async def test_long_voice_transcript_echo_is_split() -> None:
-    """A transcript past Telegram's message cap must not blow up reply_text."""
-    transcriber = _transcriber("x" * 9000)
-    bot, agent = _bot(transcriber)
-    update, ctx = _update(voice=_voice())
-
-    await bot._handle_message(update, ctx)
-
-    replies = _replies(update.message)
-    echo_chunks = replies[:-1]  # last reply is the agent's
-    assert all(len(chunk) <= 4000 for chunk in echo_chunks)
-    assert "".join(echo_chunks) == "🎙 " + "x" * 9000
-    agent.run.assert_awaited_once()
+    assert _replies(update.message) == ["agent reply"]
 
 
 async def test_voice_in_forum_topic_replies_into_topic() -> None:

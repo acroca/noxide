@@ -123,8 +123,8 @@ Telegram's OGG/Opus voice notes directly and auto-detects the language:
 1. Create an API key at <https://elevenlabs.io/app/settings/api-keys>
 2. Set it as `ELEVENLABS_API_KEY` in `.env` and restart
 
-The bot echoes what it heard (`🎙 …`) before answering, so mis-transcriptions
-are obvious. Without the key, voice messages get a setup hint instead.
+The bot replies to the transcript directly, without echoing it back. Without
+the key, voice messages get a setup hint instead.
 
 The ElevenLabs free tier includes some transcription hours per month — fine
 for personal voice notes, and the bot tells you when it hits the limit.
