@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from telegram import Message
 
     from .agent import Agent
+    from .models import ModelOption
     from .transcribe import Transcriber
 
 logger = logging.getLogger(__name__)
@@ -148,9 +149,10 @@ class TelegramBot:
         agent: Agent,
         transcriber: Transcriber | None = None,
         save_attachment_fn: Callable[[bytes, str], str] | None = None,
-        models: dict[str, str] | None = None,
+        models: dict[str, ModelOption] | None = None,
         default_model: str = "",
         set_model_fn: Callable[[str], None] | None = None,
+        refresh_models_fn: Callable[[], Awaitable[dict[str, ModelOption]]] | None = None,
         state_dir: Path | None = None,
         default_chat_id: int | None = None,
         queue_message_fn: Callable[[int, int | None, str], None] | None = None,
@@ -163,6 +165,7 @@ class TelegramBot:
         self._models = models or {}
         self._default_model = default_model
         self._set_model_fn = set_model_fn
+        self._refresh_models_fn = refresh_models_fn
         self._queue_message_fn = queue_message_fn
         # No persistence: selection resets to the default on every restart
         self._current_alias = default_model
@@ -359,7 +362,7 @@ class TelegramBot:
         )
 
     def _model_button_label(self, alias: str) -> str:
-        label = alias
+        label = self._models[alias].label
         if alias == self._default_model:
             label += " (default)"
         if alias == self._current_alias:
@@ -388,6 +391,19 @@ class TelegramBot:
             await msg.reply_text("No models configured.", message_thread_id=thread_id)
             return
 
+        if self._refresh_models_fn is not None:
+            try:
+                fresh = await self._refresh_models_fn()
+            except Exception:
+                logger.warning("Model catalog refresh failed; showing cached list", exc_info=True)
+            else:
+                # Keep the current selection and the default visible even when
+                # the fetched catalog no longer lists them.
+                for alias in (self._current_alias, self._default_model):
+                    if alias and alias not in fresh and alias in self._models:
+                        fresh[alias] = self._models[alias]
+                self._models = fresh
+
         keyboard = [
             [
                 InlineKeyboardButton(
@@ -398,7 +414,7 @@ class TelegramBot:
             for alias in self._models
         ]
         await msg.reply_text(
-            f"Current: {self._current_alias} → {self._models[self._current_alias]}",
+            f"Current: {self._current_alias} → {self._models[self._current_alias].id}",
             message_thread_id=thread_id,
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -415,9 +431,9 @@ class TelegramBot:
             await query.edit_message_text(f"Unknown model {alias!r}.")
             return
 
-        self._set_model_fn(self._models[alias])
+        self._set_model_fn(self._models[alias].id)
         self._current_alias = alias
-        reply = f"Switched to {alias} ({self._models[alias]})."
+        reply = f"Switched to {alias} ({self._models[alias].id})."
         note = await self._set_group_title(alias)
         if note:
             reply += f"\n{note}"

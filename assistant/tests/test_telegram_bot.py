@@ -18,6 +18,7 @@ from telegram.error import InvalidToken, NetworkError, TimedOut
 from telegram.ext import MessageHandler
 
 from assistant import telegram_bot
+from assistant.models import ModelOption
 from assistant.telegram_bot import TelegramBot
 from assistant.transcribe import TranscriptionError
 
@@ -720,10 +721,16 @@ async def test_photo_in_forum_topic_threads_replies() -> None:
 # Model selection
 # ------------------------------------------------------------------
 
-_MODELS = {"sonnet": "claude-sonnet-4.6", "opus": "claude-opus-41"}
+_MODELS = {
+    "sonnet": ModelOption(id="claude-sonnet-4.6", label="sonnet"),
+    "opus": ModelOption(id="claude-opus-41", label="opus"),
+}
 
 
-def _model_bot(title: str = "Family") -> tuple[TelegramBot, MagicMock]:
+def _model_bot(
+    title: str = "Family",
+    refresh_models_fn: AsyncMock | None = None,
+) -> tuple[TelegramBot, MagicMock]:
     agent = MagicMock()
     agent.run = AsyncMock(return_value="agent reply")
     set_model_fn = MagicMock()
@@ -731,9 +738,10 @@ def _model_bot(title: str = "Family") -> tuple[TelegramBot, MagicMock]:
         token="tg-token",
         allowed_user_ids=[_USER_ID],
         agent=agent,
-        models=_MODELS,
+        models=dict(_MODELS),
         default_model="sonnet",
         set_model_fn=set_model_fn,
+        refresh_models_fn=refresh_models_fn,
     )
     bot._chat_id = 777
     bot._app = MagicMock()
@@ -759,6 +767,51 @@ def _mock_app(title: str = "Family") -> MagicMock:
     app.bot.get_chat = AsyncMock(return_value=chat)
     app.bot.set_chat_title = AsyncMock()
     return app
+
+
+def _picker_labels(msg: MagicMock) -> list[str]:
+    return [text for text, _data in _picker_buttons(msg)]
+
+
+async def test_model_cmd_refetches_the_catalog_before_showing_the_picker() -> None:
+    fresh = {
+        "sonnet": ModelOption(id="claude-sonnet-4.6", label="sonnet"),
+        "fable-5": ModelOption(id="claude-fable-5", label="Claude Fable 5"),
+    }
+    refresh = AsyncMock(return_value=fresh)
+    bot, _ = _model_bot(refresh_models_fn=refresh)
+    update, ctx = _update(text="/model")
+
+    await bot._model_cmd(update, ctx)
+
+    refresh.assert_awaited_once()
+    labels = _picker_labels(update.message)
+    assert "Claude Fable 5" in labels
+    assert not any("opus" in label for label in labels)
+
+
+async def test_model_cmd_keeps_cached_catalog_when_refresh_fails() -> None:
+    refresh = AsyncMock(side_effect=RuntimeError("copilot down"))
+    bot, _ = _model_bot(refresh_models_fn=refresh)
+    update, ctx = _update(text="/model")
+
+    await bot._model_cmd(update, ctx)
+
+    labels = _picker_labels(update.message)
+    assert "✓ sonnet (default)" in labels
+    assert "opus" in labels
+
+
+async def test_model_cmd_retains_current_selection_missing_from_refresh() -> None:
+    fresh = {"sonnet": ModelOption(id="claude-sonnet-4.6", label="sonnet")}
+    refresh = AsyncMock(return_value=fresh)
+    bot, _ = _model_bot(refresh_models_fn=refresh)
+    bot._current_alias = "opus"
+    update, ctx = _update(text="/model")
+
+    await bot._model_cmd(update, ctx)
+
+    assert "✓ opus" in _picker_labels(update.message)
 
 
 def test_strip_alias_suffix_removes_known_alias() -> None:

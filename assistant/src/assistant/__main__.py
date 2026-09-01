@@ -39,8 +39,34 @@ async def _run(config_path: Path | None) -> None:
     cfg.vault_path.mkdir(parents=True, exist_ok=True)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
 
-    # Init Copilot client
+    # Init Copilot client with the configured default, then try the live model
+    # catalog: it feeds the /model picker and, when default_family is set,
+    # promotes the newest model of that family to default. Best-effort — a
+    # failed fetch leaves the configured models in charge.
+    from .models import ModelOption, merge_options, resolve_startup
+
     copilot.init(cfg.state_dir, cfg.models[cfg.default_model])
+    model_options = merge_options(cfg.models, [])
+    default_alias = cfg.default_model
+    try:
+        fetched = await copilot.get_client().list_models(cfg.model_vendors)
+        model_options, default_alias, default_id = resolve_startup(
+            cfg.models, cfg.default_model, fetched, cfg.default_family
+        )
+        if default_id is not None:
+            copilot.get_client().set_model(default_id)
+            logging.getLogger(__name__).info(
+                "Default model resolved from family %r: %s", cfg.default_family, default_id
+            )
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Model catalog fetch failed; using configured models only", exc_info=True
+        )
+
+    async def refresh_models() -> dict[str, ModelOption]:
+        return merge_options(
+            cfg.models, await copilot.get_client().list_models(cfg.model_vendors)
+        )
 
     # Init usage tracking (JSONL store + vault view, flushed off the critical path)
     from . import usage
@@ -129,9 +155,10 @@ async def _run(config_path: Path | None) -> None:
         agent=None,  # type: ignore[arg-type]  — set below
         transcriber=transcriber,
         save_attachment_fn=vault.save_attachment,
-        models=cfg.models,
-        default_model=cfg.default_model,
+        models=model_options,
+        default_model=default_alias,
         set_model_fn=copilot.get_client().set_model,
+        refresh_models_fn=refresh_models,
         state_dir=cfg.state_dir,
         default_chat_id=cfg.default_chat_id,
         queue_message_fn=retry_queue.enqueue_message,

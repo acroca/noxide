@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .models import DEFAULT_VENDORS
+
 
 class ConfigError(RuntimeError):
     """The loaded config is not ready to run the service."""
@@ -28,6 +30,12 @@ class Config(BaseSettings):
     # Copilot — alias → model id map, and the alias used by default
     default_model: str = "sonnet"
     models: dict[str, str] = Field(default_factory=lambda: {"sonnet": "claude-sonnet-5"})
+    # Optional: id prefix of a model family (e.g. "claude-opus"). When set and
+    # the startup catalog fetch succeeds, the newest model of that family
+    # becomes the default instead of default_model (which stays the fallback).
+    default_family: str = ""
+    # Vendors offered by the dynamic /model picker
+    model_vendors: list[str] = Field(default_factory=lambda: list(DEFAULT_VENDORS))
 
     # ElevenLabs (voice transcription) — optional; an API key from
     # elevenlabs.io, read from ELEVENLABS_API_KEY
@@ -122,6 +130,8 @@ _TOML_FIELDS = (
     ("telegram", "default_chat_id", "default_chat_id"),
     ("copilot", "default_model", "default_model"),
     ("copilot", "models", "models"),
+    ("copilot", "default_family", "default_family"),
+    ("copilot", "vendors", "model_vendors"),
     ("web", "fourget_url", "fourget_url"),
     ("assistant", "timezone", "timezone"),
     ("assistant", "vault_path", "vault_path"),
@@ -136,6 +146,7 @@ _ENV_FIELDS = {
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
     "DEFAULT_CHAT_ID": "default_chat_id",
     "DEFAULT_MODEL": "default_model",
+    "DEFAULT_FAMILY": "default_family",
     "FOURGET_URL": "fourget_url",
     "TIMEZONE": "timezone",
     "VAULT_PATH": "vault_path",

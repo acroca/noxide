@@ -149,6 +149,29 @@ def test_models_default_when_absent(tmp_path: Path) -> None:
     assert cfg.models == {"sonnet": "claude-sonnet-5"}
 
 
+def test_default_family_and_vendors_from_toml(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        '[copilot]\n'
+        'default_family = "claude-opus"\n'
+        'vendors = ["Anthropic"]\n'
+    )
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.default_family == "claude-opus"
+    assert cfg.model_vendors == ["Anthropic"]
+
+
+def test_default_family_and_vendors_defaults(tmp_path: Path) -> None:
+    from assistant.models import DEFAULT_VENDORS
+
+    cfg = load_config(tmp_path / "does-not-exist.toml")
+
+    assert cfg.default_family == ""
+    assert cfg.model_vendors == list(DEFAULT_VENDORS)
+
+
 def test_default_model_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DEFAULT_MODEL", "opus")
     cfg_file = tmp_path / "config.toml"

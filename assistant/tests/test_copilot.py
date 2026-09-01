@@ -745,3 +745,63 @@ def test_set_model_changes_model_for_subsequent_chats(auth: CopilotAuth) -> None
     client.set_model("model-b")
 
     assert client.model == "model-b"
+
+
+# ------------------------------------------------------------------
+# Dynamic model catalog (/models)
+# ------------------------------------------------------------------
+
+def _catalog_payload() -> dict:
+    return {
+        "data": [
+            {
+                "id": "claude-fable-5",
+                "name": "Claude Fable 5",
+                "vendor": "Anthropic",
+                "model_picker_enabled": True,
+                "policy": {"state": "enabled"},
+                "capabilities": {"supports": {"structured_outputs": True}},
+            },
+            {
+                "id": "grok-4.6",
+                "name": "Grok 4.6",
+                "vendor": "xAI",
+                "model_picker_enabled": True,
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_models_returns_filtered_catalog(auth: CopilotAuth) -> None:
+    client = CopilotClient(auth, "claude-sonnet-5")
+    auth._bearer = "bearer"
+    auth._bearer_expires = time.time() + 3600
+    response = MagicMock()
+    response.json.return_value = _catalog_payload()
+    response.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        models = await client.list_models(["Anthropic"])
+
+    assert [(m.id, m.name) for m in models] == [("claude-fable-5", "Claude Fable 5")]
+
+
+@pytest.mark.asyncio
+async def test_list_models_refreshes_structured_outputs_map(auth: CopilotAuth) -> None:
+    """The catalog fetch carries the capability map too — one request, both caches."""
+    client = CopilotClient(auth, "claude-sonnet-5")
+    auth._bearer = "bearer"
+    auth._bearer_expires = time.time() + 3600
+    response = MagicMock()
+    response.json.return_value = _catalog_payload()
+    response.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await client.list_models(["Anthropic"])
+
+    assert client._structured_outputs == {"claude-fable-5": True, "grok-4.6": False}

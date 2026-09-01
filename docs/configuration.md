@@ -27,8 +27,10 @@ start one.
 | `telegram.bot_token` | `TELEGRAM_BOT_TOKEN` | — | **Required.** From [@BotFather](https://t.me/BotFather) |
 | `telegram.allowed_user_ids` | `ALLOWED_USER_IDS` | — | **Required.** Telegram user ids allowed to talk to the bot. TOML takes an array (`[123, 456]`), the env var a comma-separated list (`123,456`). Everyone else is silently ignored |
 | `telegram.default_chat_id` | `DEFAULT_CHAT_ID` | unset | Home chat for proactive sends (startup notices, scheduled jobs). Persisted state, then this value, then the first incoming message establishes it; messages in other chats cannot retarget it. For a direct chat this is your own user id |
-| `copilot.default_model` | `DEFAULT_MODEL` | `sonnet` | Which alias from `copilot.models` to start with. Must be a key of that table |
-| `copilot.models` | — | `{sonnet = "claude-sonnet-5"}` | Alias → model id map, offered by `/model`. File-only: defining extra models needs a mounted `config.toml` |
+| `copilot.default_model` | `DEFAULT_MODEL` | `sonnet` | Which alias from `copilot.models` to start with. Must be a key of that table. When `default_family` resolves, this is only the fallback |
+| `copilot.models` | — | `{sonnet = "claude-sonnet-5"}` | Alias → model id map, always offered by `/model`. Also the offline fallback: the picker adds every current model fetched live from Copilot's catalog (refreshed each time `/model` opens) |
+| `copilot.default_family` | `DEFAULT_FAMILY` | unset | Model-id prefix, e.g. `claude-opus`. At startup the newest fetched model of that family becomes the default (so a new Opus release is picked up on the next restart). Unset keeps `default_model` |
+| `copilot.vendors` | — | `["Anthropic", "OpenAI", "Azure OpenAI"]` | Vendors the dynamic picker offers. Copilot's own picker flag already filters out legacy and non-chat models |
 | — | `ELEVENLABS_API_KEY` | unset | [ElevenLabs](https://elevenlabs.io) API key, enabling voice transcription. Env-only, deliberately: it is a credential, not configuration |
 | `web.fourget_url` | `FOURGET_URL` | unset | Base URL of a [4get](https://git.lolcat.ca/lolcat/4get) instance. Unset disables the `research` tool entirely |
 | `assistant.timezone` | `TIMEZONE` | `UTC` | IANA name, e.g. `Europe/Madrid`. Drives every local time the bot writes or says, and cron interpretation |

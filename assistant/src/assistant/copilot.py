@@ -12,10 +12,13 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from .models import DEFAULT_VENDORS, FetchedModel, parse_models
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,17 @@ _COPILOT_HEADERS = {
     "Copilot-Integration-Id": "vscode-chat",
     "User-Agent": "GitHubCopilotChat/0.22.4",
 }
+
+
+def _structured_outputs_map(data: dict[str, Any]) -> dict[str, bool]:
+    """model id → structured-output support, from a /models response."""
+    return {
+        m["id"]: bool(
+            ((m.get("capabilities") or {}).get("supports") or {}).get("structured_outputs")
+        )
+        for m in data.get("data", [])
+        if m.get("id")
+    }
 
 
 class CopilotUnavailableError(RuntimeError):
@@ -389,27 +403,37 @@ class CopilotClient:
 
     async def _fetch_structured_outputs(self) -> dict[str, bool]:
         try:
-            bearer = await self._auth.get_bearer()
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    _MODELS_URL,
-                    headers={**_COPILOT_HEADERS, "Authorization": "Bearer " + bearer},
-                    timeout=15,
-                )
-                r.raise_for_status()
-                data = r.json()
+            data = await self._get_models_payload()
         except Exception:
             logger.warning(
                 "Model capability fetch failed; response_format disabled", exc_info=True
             )
             return {}
-        return {
-            m["id"]: bool(
-                ((m.get("capabilities") or {}).get("supports") or {}).get("structured_outputs")
+        return _structured_outputs_map(data)
+
+    async def _get_models_payload(self) -> dict[str, Any]:
+        bearer = await self._auth.get_bearer()
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                _MODELS_URL,
+                headers={**_COPILOT_HEADERS, "Authorization": "Bearer " + bearer},
+                timeout=15,
             )
-            for m in data.get("data", [])
-            if m.get("id")
-        }
+            r.raise_for_status()
+            return r.json()
+
+    async def list_models(
+        self, vendors: Sequence[str] = DEFAULT_VENDORS
+    ) -> list[FetchedModel]:
+        """Fetch the selectable-model catalog from /models.
+
+        The same payload carries the structured-output capability map, so a
+        successful fetch refreshes that cache too. Raises on failure — callers
+        treat the catalog as best-effort and keep their previous list.
+        """
+        data = await self._get_models_payload()
+        self._structured_outputs = _structured_outputs_map(data)
+        return parse_models(data, vendors)
 
     async def _chat_once(self, payload: dict[str, Any], initiator: str) -> dict[str, Any]:
         bearer = await self._auth.get_bearer()

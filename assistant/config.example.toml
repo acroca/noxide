@@ -11,9 +11,15 @@ allowed_user_ids = [123456789]   # Your Telegram user IDs (find yours by messagi
 
 [copilot]
 # Alias of the model used by default (a key of [copilot.models]).
-# Switch at runtime from Telegram with /model <alias>.
+# Switch at runtime from Telegram with /model.
 default_model = "sonnet"
+# Optional: always default to the newest model of a family instead. When set,
+# the newest fetched model whose id starts with this prefix wins at startup
+# and default_model is only the offline fallback.
+# default_family = "claude-opus"
 
+# Always-offered aliases and the offline fallback. The /model picker also
+# lists every current Anthropic/OpenAI model fetched live from Copilot.
 [copilot.models]
 sonnet = "claude-sonnet-5"
 # opus = "claude-opus-4.8"
