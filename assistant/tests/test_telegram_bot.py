@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock
 
@@ -12,8 +13,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from telegram import BotCommand
+from telegram import BotCommand, Chat, ForumTopicEdited, Message, Update, User
 from telegram.error import InvalidToken, NetworkError, TimedOut
+from telegram.ext import MessageHandler
 
 from assistant import telegram_bot
 from assistant.telegram_bot import TelegramBot
@@ -439,6 +441,58 @@ async def test_photo_without_save_fn_gets_fallback_reply() -> None:
 
     agent.run.assert_not_awaited()
     assert len(_replies(update.message)) == 1
+
+
+# ------------------------------------------------------------------
+# Service messages (topic icon changes, pins, joins, …) must be
+# filtered out before the handler — the bot once replied "text, voice,
+# photos and files only for now" to a topic-icon change.
+# ------------------------------------------------------------------
+
+
+def _real_update(**msg_kwargs) -> Update:
+    """A real telegram Update, not a mock: filters read message attributes,
+    and a MagicMock answers every attribute truthy."""
+    msg = Message(
+        message_id=1,
+        date=datetime.now(UTC),
+        chat=Chat(id=777, type=Chat.SUPERGROUP),
+        from_user=User(id=_USER_ID, first_name="A", is_bot=False),
+        **msg_kwargs,
+    )
+    return Update(update_id=1, message=msg)
+
+
+def test_topic_icon_change_is_filtered_out() -> None:
+    update = _real_update(forum_topic_edited=ForumTopicEdited(icon_custom_emoji_id="5"))
+
+    assert not telegram_bot._MESSAGE_FILTER.check_update(update)
+
+
+def test_pinned_message_is_filtered_out() -> None:
+    update = _real_update(pinned_message=_real_update(text="pinned").message)
+
+    assert not telegram_bot._MESSAGE_FILTER.check_update(update)
+
+
+def test_plain_text_passes_the_message_filter() -> None:
+    assert telegram_bot._MESSAGE_FILTER.check_update(_real_update(text="hola"))
+
+
+def test_chat_migration_passes_the_message_filter() -> None:
+    """Migration service messages are the exception: _handle_message consumes
+    them to re-pin the home chat."""
+    assert telegram_bot._MESSAGE_FILTER.check_update(_real_update(migrate_to_chat_id=888))
+
+
+def test_build_wires_the_message_handler_with_the_filter() -> None:
+    bot, _ = _bot()
+    app = bot.build()
+
+    message_handlers = [
+        h for group in app.handlers.values() for h in group if isinstance(h, MessageHandler)
+    ]
+    assert [h.filters for h in message_handlers] == [telegram_bot._MESSAGE_FILTER]
 
 
 def _mock_app() -> MagicMock:

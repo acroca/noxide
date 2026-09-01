@@ -55,6 +55,13 @@ _REPLY_QUOTE_MAX_CHARS = 300
 # call just turns that into a crash-loop, so startup waits the outage out.
 _STARTUP_RETRY_INITIAL = 1.0
 _STARTUP_RETRY_MAX = 30.0
+# Service messages (topic icon changes, pins, joins, …) carry no user content;
+# without this exclusion they fell through to the "text, voice, photos and
+# files only" fallback reply. Migration is the exception: _handle_message
+# consumes it to re-pin the home chat.
+_MESSAGE_FILTER = (
+    ~filters.COMMAND & (~filters.StatusUpdate.ALL | filters.StatusUpdate.MIGRATE)
+)
 
 
 async def _network_retry(
@@ -678,7 +685,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("model", self._model_cmd))
         app.add_handler(CommandHandler("clear", self._clear_cmd))
         app.add_handler(CallbackQueryHandler(self._model_callback, pattern=f"^{_MODEL_CB_PREFIX}"))
-        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self._handle_message))
+        app.add_handler(MessageHandler(_MESSAGE_FILTER, self._handle_message))
         self._app = app
         return app
 
