@@ -78,20 +78,22 @@ def merge_options(
 ) -> dict[str, ModelOption]:
     """Combine config aliases with the fetched catalog into picker options.
 
-    Config aliases come first and keep their short names (the alias doubles as
-    the label). Fetched models append with slug aliases and API display names,
-    skipping ids the config already aliases; on a slug collision the config
-    alias wins. Fetched entries sort Anthropic first for a stable picker.
+    Catalog models show under their API display names with slug aliases.
+    Config aliases survive only for ids the catalog does not list — pinned
+    custom models, and the whole map when the fetch failed (empty catalog) —
+    keeping the alias as the label. On a slug collision the config alias
+    wins. Fetched entries sort Anthropic first for a stable picker.
     """
+    ordered = sorted(fetched, key=lambda m: (m.vendor != "Anthropic", m.vendor, m.id))
+    fetched_ids = {m.id for m in ordered}
     options = {
         alias: ModelOption(id=model_id, label=alias)
         for alias, model_id in config_models.items()
+        if model_id not in fetched_ids
     }
-    known_ids = set(config_models.values())
-    ordered = sorted(fetched, key=lambda m: (m.vendor != "Anthropic", m.vendor, m.id))
     for m in ordered:
         slug = slug_for(m.id)
-        if m.id in known_ids or slug in options:
+        if slug in options:
             continue
         options[slug] = ModelOption(id=m.id, label=m.name)
     return options

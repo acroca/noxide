@@ -183,12 +183,16 @@ def test_merge_config_aliases_come_first_and_keep_their_names() -> None:
     assert options["fable-5"] == ModelOption(id="claude-fable-5", label="Claude Fable 5")
 
 
-def test_merge_skips_fetched_ids_already_aliased_in_config() -> None:
+def test_merge_replaces_config_alias_with_the_fetched_display_entry() -> None:
+    """A model present in the live catalog shows under its API display name;
+    the config alias for the same id only serves as the offline fallback."""
     fetched = [FetchedModel(id="claude-sonnet-5", name="Claude Sonnet 5", vendor="Anthropic")]
 
     options = merge_options({"sonnet": "claude-sonnet-5"}, fetched)
 
-    assert list(options) == ["sonnet"]
+    assert options == {
+        "sonnet-5": ModelOption(id="claude-sonnet-5", label="Claude Sonnet 5")
+    }
 
 
 def test_merge_never_overwrites_an_existing_alias() -> None:
@@ -230,12 +234,12 @@ def test_resolve_startup_picks_latest_of_family() -> None:
     assert options[alias].id == "claude-opus-5"
 
 
-def test_resolve_startup_prefers_config_alias_owning_that_id() -> None:
+def test_resolve_startup_uses_the_fetched_slug_even_when_config_aliases_the_id() -> None:
     options, alias, model_id = resolve_startup(
         {"opus": "claude-opus-5"}, "opus", _opus("5"), "claude-opus"
     )
 
-    assert alias == "opus"
+    assert alias == "opus-5"
     assert model_id == "claude-opus-5"
 
 

@@ -18,8 +18,9 @@ default_model = "sonnet"
 # and default_model is only the offline fallback.
 # default_family = "claude-opus"
 
-# Always-offered aliases and the offline fallback. The /model picker also
-# lists every current Anthropic/OpenAI model fetched live from Copilot.
+# Offline fallback (and pinned custom ids). The /model picker itself is the
+# live Copilot catalog under its own display names; entries here only show
+# by alias when their id is missing from the catalog.
 [copilot.models]
 sonnet = "claude-sonnet-5"
 # opus = "claude-opus-4.8"
