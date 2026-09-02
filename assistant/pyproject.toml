@@ -13,7 +13,7 @@ dependencies = [
     "trafilatura>=2.2.0",
     "watchfiles>=0.21",
     "tomli>=2.0; python_version < '3.11'",
-    "pypdf>=6.15.0",
+    "pypdf>=6.16.1",
     "pypdfium2>=5.12.1",
     "pillow>=12.3.0",
 ]
