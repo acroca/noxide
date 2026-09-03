@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .atomic import atomic_write_text
 from .copilot import CopilotUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -229,10 +229,8 @@ class RetryQueue:
         # rewritten from memory every time, so the next successful persist
         # heals; until then the queue lives in memory only.
         try:
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            tmp.write_text(
-                "".join(item.to_json() + "\n" for item in self._items), encoding="utf-8"
+            atomic_write_text(
+                self._path, "".join(item.to_json() + "\n" for item in self._items)
             )
-            os.replace(tmp, self._path)
         except OSError:
             logger.exception("Could not persist retry queue to %s", self._path)

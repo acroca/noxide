@@ -49,7 +49,9 @@ assistant/
     telegram_bot.py ← long polling, handlers, allowlist
     tools.py        ← vault file tools (path-jailed)
     vault_check.py  ← deterministic wiki consistency checks
+    vault_check_pages.py ← page hygiene checks (links, sections, status stubs)
     schedule.py     ← APScheduler over system/schedule.md
+    maintenance.py  ← built-in compile/lint jobs and their last-run state
     skills.py       ← skill discovery and loading
     web.py          ← quarantined research sub-agent
     fanout.py       ← concurrent read-only worker sub-agents

@@ -371,3 +371,61 @@ def test_validate_requires_git_binary_when_backup_enabled(
 
     with pytest.raises(ConfigError, match="git"):
         cfg.validate_for_run()
+
+
+# ------------------------------------------------------------------
+# Built-in maintenance jobs: [maintenance] compile / lint crons
+# ------------------------------------------------------------------
+
+def test_maintenance_jobs_default_on(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path / "missing.toml")
+
+    assert cfg.maintenance_compile == "0 3 * * *"
+    assert cfg.maintenance_lint == "0 4 * * SUN"
+
+
+def test_maintenance_toml_section(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('[maintenance]\ncompile = "30 2 * * *"\nlint = ""\n')
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.maintenance_compile == "30 2 * * *"
+    assert cfg.maintenance_lint == ""
+
+
+def test_maintenance_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAINTENANCE_COMPILE", "0 5 * * *")
+    monkeypatch.setenv("MAINTENANCE_LINT", "0 6 * * MON")
+
+    cfg = load_config(tmp_path / "missing.toml")
+
+    assert cfg.maintenance_compile == "0 5 * * *"
+    assert cfg.maintenance_lint == "0 6 * * MON"
+
+
+def test_validate_rejects_invalid_maintenance_cron(state_dir: Path) -> None:
+    _write_oauth_token(state_dir)
+
+    with pytest.raises(ConfigError, match="maintenance.compile"):
+        _config(state_dir, maintenance_compile="every night").validate_for_run()
+
+
+def test_validate_rejects_numeric_weekday_in_maintenance_cron(state_dir: Path) -> None:
+    _write_oauth_token(state_dir)
+
+    with pytest.raises(ConfigError, match="maintenance.lint"):
+        _config(state_dir, maintenance_lint="0 4 * * 0").validate_for_run()
+
+
+def test_validate_accepts_a_disabled_maintenance_job(state_dir: Path) -> None:
+    _write_oauth_token(state_dir)
+
+    _config(state_dir, maintenance_lint="").validate_for_run()
+
+
+def test_maintenance_crons_are_whitespace_stripped(state_dir: Path) -> None:
+    cfg = _config(state_dir, maintenance_compile=" 0 3 * * * ", maintenance_lint="  ")
+
+    assert cfg.maintenance_compile == "0 3 * * *"
+    assert cfg.maintenance_lint == ""

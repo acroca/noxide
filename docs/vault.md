@@ -113,13 +113,16 @@ projects gone quiet, and only the user's yes triggers it.
 missed, recomputes every routine's next-due date, rebuilds `now.md` in full,
 reconciles `index.md` against the pages on disk (archived pages under
 `## Archived`), verifies the result with `check_vault` (see below), logs to
-`log.md`, and flags any task whose deadline lapsed since the previous compile.
+`log.md`, and flags the tasks the checker's report marks as lapsed since the
+previous compile.
 
-**Lint** — weekly. Starts from a `check_vault` report, then surfaces projects
-with no journal mention in 30+ days (proposing to archive them), tasks
-open 21+ days, contradictions between a page's status and recent entries,
-scheduled jobs referencing missing files, and the same task tracked on more
-than one page.
+**Lint** — weekly. Starts from a `check_vault` report, escalates the tasks it
+lists as overdue a week or more with a reschedule-or-drop proposal, then
+reviews every live project and area page (one fan-out worker per page):
+status paragraphs against the
+page body and the last two weeks of journal, projects with no journal mention
+in 30+ days (proposing to archive them), tasks open 21+ days, scheduled jobs
+referencing missing files, and the same task tracked on more than one page.
 
 Both jobs lean on **`check_vault`**, a deterministic consistency checker built
 into the bot: pure code, no model involved. It enumerates every open task on
@@ -129,12 +132,24 @@ each routine's next-due date against last-done + frequency, reconciles every
 page against the index (orphan pages, dead index links), cross-checks reminder
 markers with the pending schedule, flags schedule rows carrying hand-written
 run plumbing or numeric cron weekdays, and reports leaked `[version: …]`
-tokens. The model fixes what the checker finds instead of being trusted to
+tokens. It also lists every open task whose due date has passed, with its age
+and whether it lapsed since the last compile (those need the user's decision,
+so the heading says escalate rather than fix); warns when the log's last
+compile entry is more than two days old or its last lint entry more than two
+weeks old, for the jobs enabled in config; and catches page hygiene — dead
+relative links, empty sections, duplicated bullets, more than fifteen done
+tasks outside an archive section, and empty or placeholder Status paragraphs.
+The model fixes what the checker finds instead of being trusted to
 re-discover it — an enumerated sweep can't skip a page, and code can't
 miscompute a date.
 
-Compile and lint are ordinary scheduled jobs, not built-in machinery — see
-[scheduling](#scheduling) below.
+Compile and lint are built into the bot. They run on the crons under
+`[maintenance]` in the config (03:00 nightly and Sunday 04:00 by default, on
+your local clock — see [configuration.md](configuration.md)), remember their
+last successful run so a missed one fires once after downtime, and never
+appear in `system/schedule.md`; the job listing shows them as built-in. A
+vault upgraded from a version where they were ordinary rows should cancel
+those rows, or the job runs twice.
 
 **Backup** — optional but recommended: with `[backup] enabled` the bot keeps a
 local git history of the vault, one commit per interaction that changed it,
@@ -184,8 +199,8 @@ Ask in plain language: *"schedule a daily morning brief at 8am"*. The bot
 manages `system/schedule.md`, a markdown table, and you can list, change or
 cancel jobs conversationally.
 
-Two housekeeping jobs are worth setting once: a nightly **compile** and a
-weekly **lint**.
+The nightly **compile** and weekly **lint** are built in and need no row
+here — their timing lives in the config.
 
 `when` accepts:
 

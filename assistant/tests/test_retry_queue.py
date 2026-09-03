@@ -246,7 +246,7 @@ def test_enqueue_survives_persist_failure(
     the file is rewritten from memory on the next successful persist."""
     q = _queue(state_dir)
     monkeypatch.setattr(
-        retry_queue.os, "replace", MagicMock(side_effect=OSError("disk full"))
+        retry_queue, "atomic_write_text", MagicMock(side_effect=OSError("disk full"))
     )
 
     q.enqueue_message(5, None, "hello")
@@ -262,7 +262,7 @@ async def test_drain_survives_persist_failure(
     q.enqueue_message(5, None, "first")
     q.enqueue_message(5, None, "second")
     monkeypatch.setattr(
-        retry_queue.os, "replace", MagicMock(side_effect=OSError("disk full"))
+        retry_queue, "atomic_write_text", MagicMock(side_effect=OSError("disk full"))
     )
 
     task = asyncio.create_task(q.run())

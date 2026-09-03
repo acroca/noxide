@@ -43,6 +43,13 @@ sonnet = "claude-sonnet-5"
 # enabled = true
 # git_dir = "/path/outside/the/vault/vault.git"
 
+[maintenance]
+# Built-in vault housekeeping (docs/vault.md): the nightly compile and the
+# weekly lint. Cron expressions on your local clock, weekdays by name
+# (SUN, MON, ...), never numbers. Set one to "" to disable it.
+# compile = "0 3 * * *"
+# lint = "0 4 * * SUN"
+
 [assistant]
 timezone = "Europe/Madrid"
 history_size = 40

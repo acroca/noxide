@@ -132,23 +132,25 @@ If `move_file` returns an error, fix the call and retry, or report the failure a
 
 Archived pages stay readable and searchable but are never listed as live work. Reviving a project is the same move in reverse: back to `wiki/projects/`, index line restored to the live list, journal entry.
 
-### Compile (nightly scheduled job)
+### Compile (nightly built-in job)
 
 1. Read today's and yesterday's journal; verify the wiki reflects every event (apply anything ingest missed).
 2. Recompute **Next due** for every routine.
 3. Rebuild `wiki/now.md` in full — its **Tasks** section by sweeping every wiki page's `## Tasks`, so a task ingest failed to mirror still reaches the dashboard within a day.
 4. Reconcile `wiki/index.md` against the pages on disk — pages under `wiki/archive/` belong in its `## Archived` section, everything else in the live list.
-5. Run `check_vault` and fix every finding. It re-verifies the rebuild mechanically — the task mirror by enumeration, weekday labels against the calendar — so a page the sweep in step 3 missed surfaces tonight instead of at the next lint. A clean report is the expected outcome, not a wasted call.
-6. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and a deadline lapsing is the canonical case: flag any task whose due date passed since the previous compile (the date of which is in `wiki/log.md`). Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job.
+5. Run `check_vault` and fix every finding, except those under **Overdue tasks** and **Maintenance**, which are for step 6. It re-verifies the rebuild mechanically — the task mirror by enumeration, weekday labels against the calendar, dead links, empty sections, placeholder Status paragraphs — so a page the sweep in step 3 missed surfaces tonight instead of at the next lint. A clean report is the expected outcome, not a wasted call.
+6. Append a compile entry to `wiki/log.md`. Message the user only if something needs attention — and the report's **Overdue tasks** section is the canonical case: every task it marks as *lapsed since the last compile* gets flagged tonight, by name and due date. Older overdue tasks stay visible in **Today** but are not re-announced nightly; escalating them is the lint's job. A **Maintenance** finding is also for the user — say plainly which job stopped completing and since when — unless this is a catch-up run and the finding is about the compile itself: that gap is the one you are closing now.
 
-### Lint (weekly scheduled job, or on demand)
+### Lint (weekly built-in job, or on demand)
 
-- Start with `check_vault` and fix its findings: the mechanical sweeps — task-mirror gaps and weekday labels beside dates — come from the tool, which enumerates where a read-through samples. The judgment checks below stay yours.
-- Projects with no journal mention in 30+ days → propose archiving (see Archive above); never archive without the user's yes.
-- Open tasks or `now.md` mentions on a page under `wiki/archive/` → the page was retired too early; surface it.
-- Tasks open 21+ days → surface them.
-- Contradictions between a page's status and recent journal entries; schedule jobs referencing missing files.
-- Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
-- The same task tracked on more than one page → close or consolidate to one owning page (`now.md`'s mirror lines are the mechanism, not a duplicate — but do verify **Tasks** lists exactly the open tasks the pages hold).
-- Non-ISO dates in `wiki/` — day/month forms, month names, relative dates (`tomorrow`, `next Sunday`), weekday labels outside `now.md` → rewrite to `YYYY-MM-DD`. Skip `wiki/log.md`, which is append-only like the journal. Then check every weekday label that legitimately remains against the date beside it, and every relative date for having gone stale; both are how a wrong day survives in the wiki.
+- Start with `check_vault` and fix its findings: the mechanical sweeps — task-mirror gaps, weekday labels beside dates, dead links, empty sections, duplicate lines, placeholder Status paragraphs, pages past the done-task archive threshold — come from the tool, which enumerates where a read-through samples. The judgment checks below stay yours.
+- The report's **Overdue tasks** are the user's decisions, not yours: escalate every task overdue 7+ days with a concrete proposal (a new date, or dropping it), and never close or reschedule one unasked.
+- Then review every live project and area page. When `fan_out` is available, use it — one worker per page, each asked to compare the page's **Status** paragraph against its own body and against the last 14 days of journal, to name open tasks the journal shows as done or moot, and to report proposed edits; apply the edits yourself. Without `fan_out`, read the pages in turn. Look for:
+  - Projects with no journal mention in 30+ days → propose archiving (see Archive above); never archive without the user's yes.
+  - Open tasks or `now.md` mentions on a page under `wiki/archive/` → the page was retired too early; surface it.
+  - Tasks open 21+ days → surface them.
+  - Contradictions between a page's status and recent journal entries, or between its status and its own body; schedule jobs referencing missing files.
+  - Reminders noted on a wiki item whose underlying fact has since changed → reword or cancel the stale job.
+  - The same task tracked on more than one page → close or consolidate to one owning page (`now.md`'s mirror lines are the mechanism, not a duplicate — but do verify **Tasks** lists exactly the open tasks the pages hold).
+  - Non-ISO dates in `wiki/` — day/month forms, month names, relative dates (`tomorrow`, `next Sunday`), weekday labels outside `now.md` → rewrite to `YYYY-MM-DD`. Skip `wiki/log.md`, which is append-only like the journal. Then check every weekday label that legitimately remains against the date beside it, and every relative date for having gone stale; both are how a wrong day survives in the wiki.
 - Apply safe fixes, append a lint entry to `wiki/log.md`, and message findings — stay silent if everything is clean.

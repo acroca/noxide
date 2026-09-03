@@ -6,14 +6,16 @@ weekdays by arithmetic it is explicitly told not to trust. Each check returns
 ``path:line`` findings for the agent to fix; the module never writes to the
 vault.
 
-Scope is ``wiki/`` minus ``wiki/log.md``: ``raw/`` and ``system/`` are
-append-only or bot-managed, and ``log.md`` is append-only like the journal —
-a finding in any of them would nag forever with no fix allowed. Archived
-pages (``wiki/archive/``) stay in scope for the weekday check (they remain
-editable, so a wrong label there is fixable) but are exempt from the task
-mirror, which covers live work only. The reminder-marker check additionally
-*reads* ``system/schedule.md`` as input (the pending-job list) — findings
-still point at wiki pages or at the schedule row to fix.
+Pages under edit scope are ``wiki/`` minus ``wiki/log.md``: ``raw/`` and
+``system/`` are append-only or bot-managed, and ``log.md`` is append-only like
+the journal — a finding asking to edit any of them would nag forever with no
+fix allowed. Archived pages (``wiki/archive/``) stay in scope for the weekday
+check (they remain editable, so a wrong label there is fixable) but are exempt
+from the task mirror, which covers live work only. Two bot-managed files are
+still *read as input*: ``system/schedule.md`` (the pending-job list for the
+reminder-marker check) and ``wiki/log.md`` (the last compile date for the
+overdue check, and the maintenance-freshness evidence) — findings about them
+say what to run or check, never what line to edit.
 """
 
 from __future__ import annotations
@@ -21,12 +23,15 @@ from __future__ import annotations
 import calendar
 import posixpath
 import re
+from collections.abc import Iterable
 from datetime import date, timedelta
 from pathlib import Path
 
+from .vault_check_pages import _LINK_RX, _NOW_PATH, page_findings, resolve_link
+
 _MAX_FINDINGS = 100
 
-_NOW_PATH = "wiki/now.md"
+MAINTENANCE_KINDS = ("compile", "lint")
 
 # Weekday names per language, Monday-first to match date.weekday(). The
 # canonical spelling (used in corrections) comes first; extra lookup-only
@@ -63,20 +68,33 @@ _DATE_THEN_WEEKDAY = re.compile(
 _OPEN_TASK = re.compile(r"^\s*- \[ \]\s+(?P<text>.+?)\s*$")
 
 
-def run_checks(root: Path) -> str:
+def run_checks(
+    root: Path,
+    today: date | None = None,
+    maintenance: Iterable[str] = MAINTENANCE_KINDS,
+) -> str:
     """Run every check over the vault at *root* and return a findings report.
 
-    Returns the sentinel ``"[no findings]"`` when the vault is consistent.
+    *today* is the user's local date (the overdue check compares against it);
+    it defaults to the host's date. *maintenance* names the built-in jobs that
+    are enabled — only those are held to their cadence. Returns the sentinel
+    ``"[no findings]"`` when the vault is consistent.
     """
+    if today is None:
+        today = date.today()
     wiki_files = _wiki_files(root)
+    log_dates = _log_dates(root)
     findings = (
         _mirror_findings(root, wiki_files)
+        + _overdue_findings(wiki_files, today, (log_dates or {}).get("compile"))
+        + _maintenance_findings(log_dates, today, maintenance)
         + _weekday_findings(wiki_files)
         + _reminder_findings(root, wiki_files)
         + _schedule_hygiene_findings(root)
         + _routine_findings(root)
         + _index_findings(root)
         + _version_token_findings(wiki_files)
+        + page_findings(root, wiki_files)
     )
     if not findings:
         return "[no findings]"
@@ -178,6 +196,122 @@ def _mirror_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> lis
                 f"{_NOW_PATH}:{i}: mirror line matches no open task on any "
                 f'wiki page: "{text}"',
             ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Overdue tasks: an open task whose due date has passed. Not something the
+# agent fixes on its own — the user decides (reschedule, drop, keep) — so the
+# heading says "escalate". The compile's "flag deadlines that lapsed since the
+# previous compile" rule used to be prompt-enforced and was followed on one
+# night in nine; here the lapsed-since-last-compile ones are marked by code,
+# with the last compile date read from wiki/log.md.
+# ---------------------------------------------------------------------------
+
+_OVERDUE_HEADING = "Overdue tasks (need the user's decision — escalate, never silently fix)"
+
+_LOG_PATH = "wiki/log.md"
+_LOG_ENTRY_RX = re.compile(
+    r"^## \[(?P<date>\d{4}-\d{2}-\d{2})\] (?P<kind>compile|lint)\b", re.IGNORECASE
+)
+# The due marker's *shape* — one word, then the date: "(due 2026-08-05)",
+# "(para ~2026-08-24)", "(pour 2026-08-05)". Vaults localize the word freely,
+# so the word is not enumerated. A date deeper inside a parenthetical
+# ("shared by X, 2026-07-28") is not a deadline.
+_DUE_RX = re.compile(r"\(\w+\s+~?(?P<date>\d{4}-\d{2}-\d{2})[^)]*\)")
+
+
+def _iso_date(text: str) -> date | None:
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _log_dates(root: Path) -> dict[str, date] | None:
+    """Latest entry date per kind (compile/lint) in wiki/log.md; None when absent."""
+    try:
+        lines = (root / _LOG_PATH).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    latest: dict[str, date] = {}
+    for line in lines:
+        m = _LOG_ENTRY_RX.match(line)
+        if m is None:
+            continue
+        kind = m.group("kind").lower()
+        d = _iso_date(m.group("date"))
+        if d is not None and d > latest.get(kind, date.min):
+            latest[kind] = d
+    return latest
+
+
+def _overdue_findings(
+    wiki_files: list[tuple[str, list[str]]], today: date, last_compile: date | None
+) -> list[tuple[str, str]]:
+    findings = []
+    for rel, lines in wiki_files:
+        # now.md mirrors every task: reporting its copy would double each finding.
+        if rel == _NOW_PATH or rel.startswith("wiki/archive/"):
+            continue
+        for i, line in enumerate(lines, 1):
+            m = _OPEN_TASK.match(line)
+            if m is None:
+                continue
+            text = m.group("text")
+            due_match = _DUE_RX.search(text)
+            if due_match is None:
+                continue
+            due = _iso_date(due_match.group("date"))
+            if due is None or due >= today:
+                continue
+            age = (today - due).days
+            # A deadline day ends after that day's compile ran, so a task due
+            # on the last compile's date lapsed after it — still new.
+            note = ""
+            if last_compile is not None and due >= last_compile:
+                note = f" — lapsed since the last compile ({last_compile})"
+            findings.append((
+                _OVERDUE_HEADING,
+                f'{rel}:{i}: overdue {age} day{"s" if age != 1 else ""} (due {due}): "{text}"{note}',
+            ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Maintenance freshness: a compile/lint entry in wiki/log.md is the evidence
+# that the *procedure* completed — the scheduler's own record only says the
+# run returned. The lint's judgment sweep (stale status paragraphs, tasks
+# open for weeks) has no other enforcement, and a vault once went 41 days
+# without one before anyone noticed. Only an entry that exists and went
+# stale is a finding: a fresh vault has compile entries days before its
+# first Sunday lint, and a job disabled in config is not held to a cadence.
+# ---------------------------------------------------------------------------
+
+_MAINTENANCE_HEADING = "Maintenance (wiki/log.md)"
+
+# Days since the last entry beyond which the job is judged not to be
+# completing: the nightly job gets two nights of slack, the weekly one a week.
+_MAX_AGE_DAYS = {"compile": 2, "lint": 14}
+_CADENCE = {"compile": "nightly", "lint": "weekly"}
+
+
+def _maintenance_findings(
+    latest: dict[str, date] | None, today: date, enabled: Iterable[str]
+) -> list[tuple[str, str]]:
+    if latest is None:
+        return []
+    findings = []
+    for kind in enabled:
+        last = latest.get(kind)
+        if last is None or (today - last).days <= _MAX_AGE_DAYS[kind]:
+            continue
+        findings.append((
+            _MAINTENANCE_HEADING,
+            f"{_LOG_PATH}: last {kind} entry is from {last}, {(today - last).days} days ago "
+            f"(expected {_CADENCE[kind]}) — unless this run is the catch-up closing that "
+            f"gap, the {kind} is not completing; tell the user",
+        ))
     return findings
 
 
@@ -409,7 +543,6 @@ def _routine_findings(root: Path) -> list[tuple[str, str]]:
 _INDEX_HEADING = "Index (wiki/index.md vs pages on disk)"
 
 _TOP_INDEX = "wiki/index.md"
-_INDEX_LINK_RX = re.compile(r"\]\(([^)#\s]+\.md)\)")
 
 
 def _index_findings(root: Path) -> list[tuple[str, str]]:
@@ -425,11 +558,12 @@ def _index_findings(root: Path) -> list[tuple[str, str]]:
             lines = (root / rel).read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-        base = posixpath.dirname(rel)
         for i, line in enumerate(lines, 1):
-            for target in _INDEX_LINK_RX.findall(line):
-                resolved = posixpath.normpath(posixpath.join(base, target))
-                if not resolved.startswith("wiki/"):
+            for target in _LINK_RX.findall(line):
+                resolved = resolve_link(rel, target)
+                if resolved is None or not (
+                    resolved.startswith("wiki/") and resolved.endswith(".md")
+                ):
                     continue
                 linked.add(resolved)
                 if resolved not in pages:

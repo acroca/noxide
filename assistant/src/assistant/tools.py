@@ -12,6 +12,7 @@ import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from assistant import vault_check
 
@@ -62,9 +63,20 @@ def slug_from_name(name: str) -> str:
 class VaultTools:
     """File-system tools operating within a vault directory."""
 
-    def __init__(self, vault_root: Path) -> None:
+    def __init__(
+        self,
+        vault_root: Path,
+        tz_name: str = "UTC",
+        maintenance: tuple[str, ...] = vault_check.MAINTENANCE_KINDS,
+    ) -> None:
         self._root = vault_root.resolve()
         self._root.mkdir(parents=True, exist_ok=True)
+        # The user's clock: check_vault judges due dates by the local date,
+        # not the (typically UTC) container clock.
+        self._tz = ZoneInfo(tz_name)
+        # Which built-in maintenance jobs are enabled — check_vault holds only
+        # those to their cadence.
+        self._maintenance = maintenance
 
     # ------------------------------------------------------------------
     # Path safety
@@ -304,7 +316,11 @@ class VaultTools:
 
     def check_vault(self) -> str:
         """Run the deterministic wiki consistency checks; see vault_check.py."""
-        return vault_check.run_checks(self._root)
+        return vault_check.run_checks(
+            self._root,
+            today=datetime.now(tz=self._tz).date(),
+            maintenance=self._maintenance,
+        )
 
     def save_attachment(self, data: bytes, ext: str = "jpg") -> str:
         """Save binary *data* under attachments/ and return the vault-relative path.

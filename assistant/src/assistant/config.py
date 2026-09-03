@@ -58,12 +58,36 @@ class Config(BaseSettings):
     backup_enabled: bool = False
     backup_git_dir: Path | None = None
 
+    # Built-in maintenance jobs (see maintenance.py) — cron expressions on the
+    # user's local clock; an empty string disables the job. On by default: a
+    # vault whose lint was left for the user to schedule once went six weeks
+    # without one.
+    maintenance_compile: str = "0 3 * * *"
+    maintenance_lint: str = "0 4 * * SUN"
+
     @field_validator("vault_path", "state_dir", "backup_git_dir", mode="before")
     @classmethod
     def expand_path(cls, v: str | Path | None) -> Path | None:
         if v is None:
             return None
         return Path(v).expanduser().resolve()
+
+    @field_validator("maintenance_compile", "maintenance_lint")
+    @classmethod
+    def strip_cron(cls, v: str) -> str:
+        return v.strip()
+
+    def _maintenance_problems(self) -> list[str]:
+        from .schedule import cron_problem
+
+        problems = []
+        for key, cron in (("compile", self.maintenance_compile), ("lint", self.maintenance_lint)):
+            if cron and (problem := cron_problem(cron)):
+                problems.append(
+                    f"maintenance.{key}: {problem} — fix the cron in config.toml, "
+                    'or set it to "" to disable the job'
+                )
+        return problems
 
     def resolved_backup_git_dir(self) -> Path:
         return self.backup_git_dir or self.state_dir / "vault.git"
@@ -117,6 +141,8 @@ class Config(BaseSettings):
                     "leave it unset to use <state_dir>/vault.git"
                 )
 
+        problems.extend(self._maintenance_problems())
+
         if problems:
             raise ConfigError(
                 "Not ready to run:\n" + "\n".join(f"  - {p}" for p in problems)
@@ -139,6 +165,8 @@ _TOML_FIELDS = (
     ("assistant", "history_size", "history_size"),
     ("backup", "enabled", "backup_enabled"),
     ("backup", "git_dir", "backup_git_dir"),
+    ("maintenance", "compile", "maintenance_compile"),
+    ("maintenance", "lint", "maintenance_lint"),
 )
 
 # Env var → Config field name. Applied after the TOML file so env always wins.
@@ -154,6 +182,8 @@ _ENV_FIELDS = {
     "HISTORY_SIZE": "history_size",
     "BACKUP_ENABLED": "backup_enabled",
     "BACKUP_GIT_DIR": "backup_git_dir",
+    "MAINTENANCE_COMPILE": "maintenance_compile",
+    "MAINTENANCE_LINT": "maintenance_lint",
 }
 
 

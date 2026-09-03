@@ -73,8 +73,18 @@ async def _run(config_path: Path | None) -> None:
 
     tracker = usage.init(cfg.state_dir, cfg.vault_path, cfg.timezone)
 
+    # Built-in maintenance jobs (nightly compile, weekly lint): the scheduler
+    # runs them, and check_vault holds the enabled ones to their cadence.
+    from .maintenance import STATE_FILENAME, MaintenanceState, builtin_jobs
+
+    maintenance_jobs = builtin_jobs(cfg.maintenance_compile, cfg.maintenance_lint)
+
     # Init vault tools
-    vault = VaultTools(cfg.vault_path)
+    vault = VaultTools(
+        cfg.vault_path,
+        tz_name=cfg.timezone,
+        maintenance=tuple(job.id for job in maintenance_jobs),
+    )
 
     # Vault backup (optional) — local-only git history of the vault, in a git
     # dir outside it. The startup sweep commits anything from before this boot.
@@ -199,11 +209,15 @@ async def _run(config_path: Path | None) -> None:
     async def run_job(prompt: str) -> None:
         await agent.run_job(prompt)
 
+    # The built-ins ride the same scheduler as the table's rows; their
+    # last-success bookkeeping lives in the state dir.
     scheduler = Scheduler(
         vault_tools=vault,
         run_job_fn=run_job,
         tz_name=cfg.timezone,
         queue_job_fn=retry_queue.enqueue_job,
+        builtins=maintenance_jobs,
+        maintenance_state=MaintenanceState(cfg.state_dir / STATE_FILENAME),
     )
 
     # Init agent

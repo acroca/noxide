@@ -57,13 +57,12 @@ Use the localized headings from step 3 if the vault is not in English.
 Do not create `projects/`, `areas/` or `people/` pages — those appear when
 there is something real to put in them.
 
-## 5. Offer the maintenance jobs
+## 5. Mention the maintenance jobs
 
-Ask whether to schedule the two housekeeping runs, and schedule them only if
-they say yes:
-
-- nightly **compile** (a good default is 03:00 local)
-- weekly **lint**
+The nightly **compile** and weekly **lint** are built in — they run on their
+own (03:00 and Sunday 04:00 local by default, set under `[maintenance]` in
+the bot's config). Do not schedule them as jobs; one sentence that they exist
+is enough.
 
 ## 6. Confirm
 

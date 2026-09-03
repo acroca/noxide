@@ -697,3 +697,32 @@ def test_append_only_predicate_uses_resolved_path(vault: VaultTools) -> None:
     result = vault.edit_file("wiki/../raw/journal/2026-08-01.md", "x", "y")
     assert result.startswith("[edit error:")
     assert "append-only" in result
+
+
+def test_check_vault_judges_due_dates_by_the_configured_timezone(tmp_path: Path) -> None:
+    """The overdue check needs the user's local date: the host clock is UTC
+    in a container, and a task due 'today' must not read as overdue at 23:00
+    local. UTC-12 and UTC+14 are 26 hours apart, so their dates always differ."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    due = datetime.now(ZoneInfo("Etc/GMT+12")).date()  # the earlier of the two dates
+    (tmp_path / "wiki" / "areas").mkdir(parents=True)
+    (tmp_path / "wiki" / "areas" / "casa.md").write_text(f"## Tasks\n- [ ] alfombra (due {due})\n")
+    (tmp_path / "wiki" / "now.md").write_text(f"## Tasks\n- [ ] alfombra (due {due})\n")
+
+    west = VaultTools(tmp_path, tz_name="Etc/GMT+12")
+    east = VaultTools(tmp_path, tz_name="Pacific/Kiritimati")
+
+    assert "overdue" not in west.check_vault()
+    assert "overdue" in east.check_vault()
+
+
+def test_check_vault_skips_maintenance_jobs_that_are_disabled(tmp_path: Path) -> None:
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "log.md").write_text(
+        "## [2026-01-01] compile | rebuilt\n## [2026-01-01] lint | clean\n"
+    )
+
+    assert "lint" not in VaultTools(tmp_path, maintenance=("compile",)).check_vault()
+    assert "lint" in VaultTools(tmp_path).check_vault()

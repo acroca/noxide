@@ -99,9 +99,12 @@ system/                      ← the bot's own files: schedule, skills, topics, 
 ```
 
 New information is journalled, filed on the one page that owns it, and
-reconciled into `now.md` in the same turn. A nightly *compile* rebuilds the
-dashboard and recomputes routine due dates; a weekly *lint* surfaces stale
-projects and contradictions.
+reconciled into `now.md` in the same turn. A built-in nightly *compile*
+rebuilds the dashboard and recomputes routine due dates; a built-in weekly
+*lint* surfaces stale projects and contradictions. Both start from a
+deterministic checker that enumerates what drifted — overdue tasks, mirror
+gaps, dead links, placeholder status paragraphs — so the model fixes findings
+instead of hunting for them.
 
 The design, the conventions and how to start a vault:
 **[docs/vault.md](docs/vault.md)**.

@@ -39,6 +39,8 @@ start one.
 | `assistant.history_size` | `HISTORY_SIZE` | `40` | Messages kept in memory per chat/topic. Bigger means more context and more tokens per turn |
 | `backup.enabled` | `BACKUP_ENABLED` | `false` | Local-only git history of the vault: one commit per interaction that changed it, plus a periodic sweep for edits arriving from outside the bot. Nothing is ever pushed. See [deployment.md](deployment.md#backups) |
 | `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
+| `maintenance.compile` | `MAINTENANCE_COMPILE` | `0 3 * * *` | Cron for the built-in nightly vault compile, on the local clock, weekdays by name. `""` disables it. See [vault.md](vault.md#operations) |
+| `maintenance.lint` | `MAINTENANCE_LINT` | `0 4 * * SUN` | Cron for the built-in weekly vault lint. `""` disables it |
 
 Paths are expanded and resolved, so `~/vault` and relative paths both work.
 To intentionally move proactive delivery, stop the bot, delete
@@ -56,6 +58,8 @@ at once rather than failing on the first:
 - `state_dir/oauth_token` exists — run `assistant auth` if not
 - with `backup.enabled`: a `git` binary is on `PATH` and `backup.git_dir` is
   not inside the vault
+- `maintenance.compile` and `maintenance.lint` are valid cron expressions with
+  named weekdays, or empty
 
 A malformed `ALLOWED_USER_IDS` (non-numeric entry) fails the same way rather
 than raising a traceback.
@@ -81,6 +85,10 @@ opus = "claude-opus-4.8"
 [assistant]
 timezone = "Europe/Madrid"
 history_size = 40
+
+[maintenance]
+compile = "30 2 * * *"
+lint = "0 4 * * SUN"
 ```
 
 ## Model selection

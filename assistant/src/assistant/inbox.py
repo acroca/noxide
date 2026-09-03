@@ -14,12 +14,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .agent import MAX_ITERATIONS_REPLY
+from .atomic import atomic_write_text
 
 if TYPE_CHECKING:
     from .backup import VaultBackup
@@ -77,9 +77,7 @@ def clear_processed(vault_path: Path, snapshot: str) -> str:
 
 def _replace_content(path: Path, text: str) -> None:
     """Atomic rewrite — a crash mid-clear must not delete unprocessed entries."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, text)
 
 
 async def ingest(

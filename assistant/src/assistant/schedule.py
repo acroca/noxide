@@ -26,8 +26,8 @@ import contextlib
 import logging
 import re
 import secrets
-from collections.abc import Callable, Coroutine
-from datetime import UTC, datetime
+from collections.abc import Callable, Coroutine, Iterable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from .copilot import CopilotUnavailableError
+from .maintenance import BuiltinJob, MaintenanceState
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,25 @@ def _has_numeric_cron_dow(cron: str) -> bool:
     """True when a 5-field cron expression's day-of-week field contains digits."""
     fields = cron.split()
     return len(fields) == 5 and bool(re.search(r"\d", fields[4]))
+
+
+# APScheduler numbers weekdays from Monday=0 while classic cron uses
+# Sunday=0, so a numeric day-of-week silently fires on the wrong day.
+_NUMERIC_DOW_PROBLEM = (
+    "cron day-of-week must use names (SUN, MON, ...), never numbers — "
+    "the numbering is ambiguous and fires on the wrong day"
+)
+
+
+def cron_problem(cron: str) -> str | None:
+    """Why *cron* is not acceptable as a recurring schedule, or None if it is."""
+    try:
+        CronTrigger.from_crontab(cron)
+    except ValueError as exc:
+        return f"invalid cron expression {cron!r}: {exc}"
+    if _has_numeric_cron_dow(cron):
+        return _NUMERIC_DOW_PROBLEM
+    return None
 
 
 def _escape_cell(value: str) -> str:
@@ -154,6 +174,8 @@ class Scheduler:
         run_job_fn: Callable[[str], Coroutine[Any, Any, None]],
         tz_name: str = "UTC",
         queue_job_fn: Callable[[str], None] | None = None,
+        builtins: Iterable[BuiltinJob] = (),
+        maintenance_state: MaintenanceState | None = None,
     ) -> None:
         self._vault = vault_tools
         self._run_job = run_job_fn
@@ -164,6 +186,16 @@ class Scheduler:
         self._tz = tz_name
         self._apscheduler = AsyncIOScheduler(timezone=tz_name)
         self._entries: dict[str, ScheduleEntry] = {}
+        # Built-in maintenance jobs (maintenance.py): not rows in schedule.md,
+        # so reload() never sees or removes them; their missed-run bookkeeping
+        # is `maintenance_state` instead of the `next` column — required with
+        # them, or nothing would ever catch up.
+        self._builtins: dict[str, BuiltinJob] = {job.id: job for job in builtins}
+        if self._builtins and maintenance_state is None:
+            raise ValueError("built-in jobs need a maintenance_state to record runs in")
+        self._maintenance = maintenance_state
+        for job in self._builtins.values():
+            self._add_cron_job(job.id, job.cron, job.prompt)
         # Jobs run outside the Telegram update queue, so shutdown has to wait
         # on them separately or a mid-run reminder dies with the process.
         self._inflight: set[asyncio.Task[None]] = set()
@@ -223,7 +255,17 @@ class Scheduler:
                 continue
             if in_table and stripped.startswith("|"):
                 entry = ScheduleEntry.from_row(stripped)
-                if entry:
+                if entry and entry.id in self._builtins:
+                    # Ids are free text in a hand-edited file; a row named like
+                    # a built-in would silently replace it in APScheduler.
+                    # Keep the row (never lose a write) but never register it.
+                    unparsed.append(stripped)
+                    logger.warning(
+                        "Ignoring row in %s whose id %r is reserved for a built-in job",
+                        _SCHEDULE_FILE,
+                        entry.id,
+                    )
+                elif entry:
                     entries.append(entry)
                 else:
                     unparsed.append(stripped)
@@ -272,38 +314,48 @@ class Scheduler:
             existing.remove()
 
         if entry.recurring:
-            try:
-                trigger = CronTrigger.from_crontab(entry.when, timezone=self._tz)
-            except ValueError as exc:
-                # APScheduler numbers weekdays 0=Mon..6=Sun, so crontab's Sunday
-                # `7` is out of range and raises. Unguarded that aborted the rest
-                # of the reload pass and crashed startup, where reload() has no
-                # try around it — one typo took the whole schedule down.
-                logger.warning(
-                    "Invalid cron expression for job %s (%r): %s", job_id, entry.when, exc
-                )
-                return
-        else:
-            dt = parse_when(entry.when, self._tz)
-            if dt is None:
-                logger.warning("Cannot parse 'when' for job %s: %r", job_id, entry.when)
-                return
-            now = datetime.now(tz=UTC)
-            age = (now - dt).total_seconds()
-            if age > _MISFIRE_GRACE:
-                logger.info("Dropping stale job %s (overdue by %.0fs)", job_id, age)
-                return
-            trigger = DateTrigger(run_date=dt)
+            self._add_cron_job(job_id, entry.when, entry.prompt)
+            return
 
+        dt = parse_when(entry.when, self._tz)
+        if dt is None:
+            logger.warning("Cannot parse 'when' for job %s: %r", job_id, entry.when)
+            return
+        now = datetime.now(tz=UTC)
+        age = (now - dt).total_seconds()
+        if age > _MISFIRE_GRACE:
+            logger.info("Dropping stale job %s (overdue by %.0fs)", job_id, age)
+            return
+        self._apscheduler.add_job(
+            self._fire,
+            trigger=DateTrigger(run_date=dt),
+            id=job_id,
+            args=[entry.id, entry.prompt, False],
+            misfire_grace_time=_MISFIRE_GRACE,
+            replace_existing=True,
+        )
+        logger.info("Registered job %s (one-off) at %r", job_id, entry.when)
+
+    def _add_cron_job(self, job_id: str, cron: str, prompt: str) -> None:
+        """Register a recurring job (table row or built-in) with APScheduler."""
+        try:
+            trigger = CronTrigger.from_crontab(cron, timezone=self._tz)
+        except ValueError as exc:
+            # APScheduler numbers weekdays 0=Mon..6=Sun, so crontab's Sunday
+            # `7` is out of range and raises. Unguarded that aborted the rest
+            # of the reload pass and crashed startup, where reload() has no
+            # try around it — one typo took the whole schedule down.
+            logger.warning("Invalid cron expression for job %s (%r): %s", job_id, cron, exc)
+            return
         self._apscheduler.add_job(
             self._fire,
             trigger=trigger,
             id=job_id,
-            args=[entry.id, entry.prompt, entry.recurring],
+            args=[job_id, prompt, True],
             misfire_grace_time=_MISFIRE_GRACE,
             replace_existing=True,
         )
-        logger.info("Registered job %s (%s) at %r", job_id, "recurring" if entry.recurring else "one-off", entry.when)
+        logger.info("Registered job %s (recurring) at %r", job_id, cron)
 
     async def _fire(self, job_id: str, prompt: str, recurring: bool) -> None:
         if job_id in self._running:
@@ -343,6 +395,9 @@ class Scheduler:
                 # would re-register and hot-loop a persistently failing one-off
                 # every minute for the rest of its 12h grace.
                 self._remove_entry(job_id)
+            elif completed and job_id in self._builtins:
+                # Never None alongside built-ins — enforced in __init__.
+                self._maintenance.mark_success(job_id, datetime.now(tz=UTC))  # type: ignore[union-attr]
             elif completed:
                 # Advanced only on success: a past `next` is the missed-run
                 # evidence catch_up() reads, and a failed run must not consume
@@ -365,11 +420,15 @@ class Scheduler:
 
     def _next_occurrence(self, cron: str) -> datetime | None:
         """Next occurrence of a cron expression from now, UTC-aware."""
+        return self._next_after(cron, datetime.now(tz=UTC))
+
+    def _next_after(self, cron: str, moment: datetime) -> datetime | None:
+        """First occurrence of *cron* at or after *moment*, UTC-aware."""
         try:
             trigger = CronTrigger.from_crontab(cron, timezone=self._tz)
         except ValueError:
             return None
-        fire = trigger.get_next_fire_time(None, datetime.now(tz=UTC))
+        fire = trigger.get_next_fire_time(None, moment)
         return fire.astimezone(UTC) if fire is not None else None
 
     def _parse_next(self, value: str) -> datetime | None:
@@ -420,19 +479,40 @@ class Scheduler:
             nxt = self._parse_next(entry.next)
             if nxt is None or nxt > now:
                 continue
-            due_local = nxt.astimezone(ZoneInfo(self._tz)).strftime("%Y-%m-%d %H:%M")
-            prompt = (
-                f"[catch-up: this job was due at {due_local} but the assistant "
-                f"was offline] {entry.prompt}"
-            )
-            logger.info("Catch-up fire for job %s (was due %s)", entry.id, due_local)
-            fire_task = asyncio.create_task(self._fire(entry.id, prompt, recurring=True))
-            # _fire tracks itself in _inflight, but only once it starts running;
-            # holding the task here keeps it referenced (and drainable) until then.
-            self._inflight.add(fire_task)
-            fire_task.add_done_callback(self._inflight.discard)
+            self._fire_late(entry.id, entry.prompt, nxt)
+            fired += 1
+        state = self._maintenance
+        for job in self._builtins.values():
+            if state is None or job.id in self._running:
+                continue
+            last = state.last_success(job.id)
+            if last is None:
+                # No baseline means nothing counts as missed — establish one
+                # so a *later* downtime is detectable (the `next` backfill's
+                # twin for rows).
+                state.mark_success(job.id, now)
+                continue
+            # The first occurrence strictly after the last success is the one
+            # that had to fire since; past now, it was missed.
+            nxt = self._next_after(job.cron, last + timedelta(microseconds=1))
+            if nxt is None or nxt > now:
+                continue
+            self._fire_late(job.id, job.prompt, nxt)
             fired += 1
         return fired
+
+    def _fire_late(self, job_id: str, prompt: str, due: datetime) -> None:
+        due_local = due.astimezone(ZoneInfo(self._tz)).strftime("%Y-%m-%d %H:%M")
+        prompt = (
+            f"[catch-up: this job was due at {due_local} but the assistant "
+            f"was offline] {prompt}"
+        )
+        logger.info("Catch-up fire for job %s (was due %s)", job_id, due_local)
+        fire_task = asyncio.create_task(self._fire(job_id, prompt, recurring=True))
+        # _fire tracks itself in _inflight, but only once it starts running;
+        # holding the task here keeps it referenced (and drainable) until then.
+        self._inflight.add(fire_task)
+        fire_task.add_done_callback(self._inflight.discard)
 
     # ------------------------------------------------------------------
     # Startup reload
@@ -499,13 +579,8 @@ class Scheduler:
                 '[error: the prompt restates the close contract ("[silent]") — '
                 "it applies to every scheduled run on its own; drop it and reschedule]"
             )
-        # APScheduler numbers weekdays from Monday=0 while classic cron uses
-        # Sunday=0, so a numeric day-of-week silently fires on the wrong day.
-        if recurring and _has_numeric_cron_dow(when):
-            return (
-                "[error: cron day-of-week must use names (SUN, MON, ...), never "
-                "numbers — the numbering is ambiguous and fires on the wrong day]"
-            )
+        if recurring and (problem := cron_problem(when)):
+            return f"[error: {problem}]"
 
         job_id = _generate_id()
         now_iso = datetime.now(tz=UTC).isoformat()
@@ -518,10 +593,6 @@ class Scheduler:
                 return f"[error: could not parse time: {when!r}]"
             when_stored = dt.isoformat()
         else:
-            try:
-                CronTrigger.from_crontab(when, timezone=self._tz)
-            except ValueError as exc:
-                return f"[error: invalid cron expression {when!r}: {exc}]"
             when_stored = when  # store cron expression as-is
             nxt = self._next_occurrence(when)
             if nxt is not None:
@@ -544,12 +615,20 @@ class Scheduler:
 
     def list_scheduled(self) -> str:
         entries = self._read_entries()
-        if not entries:
-            return "[no scheduled jobs]"
         lines = [f"{e.id}: [{('recurring' if e.recurring else 'one-off')}] {e.when!r} → {e.prompt!r}" for e in entries]
+        lines.extend(
+            f"{job.id}: [built-in] {job.cron!r} → {job.prompt!r}" for job in self._builtins.values()
+        )
+        if not lines:
+            return "[no scheduled jobs]"
         return "\n".join(lines)
 
     def cancel_scheduled(self, job_id: str) -> str:
+        if job_id in self._builtins:
+            return (
+                f"[job {job_id!r} is built-in — it is configured under [maintenance] in "
+                f"config.toml, not scheduled here; set its cron to \"\" there to disable it]"
+            )
         entries, preserved = self._read_table()
         original_count = len(entries)
         entries = [e for e in entries if e.id != job_id]
