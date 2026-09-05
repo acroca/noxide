@@ -1,9 +1,10 @@
-"""GitHub Copilot authentication and chat completions.
+"""GitHub Copilot authentication and model turns.
 
 Auth chain:
 1. Device flow (one-time) → persists OAuth token to state_dir/oauth_token
 2. Copilot token exchange → short-lived bearer, cached in memory
-3. Chat completions via https://api.githubcopilot.com/chat/completions
+3. Streaming turns via https://api.githubcopilot.com/chat/completions, or
+   /responses for models the catalog serves only there (see responses.py)
 """
 
 from __future__ import annotations
@@ -18,7 +19,14 @@ from typing import Any
 
 import httpx
 
-from .models import DEFAULT_VENDORS, FetchedModel, parse_models
+from . import responses
+from .models import (
+    DEFAULT_VENDORS,
+    FetchedModel,
+    ModelCapabilities,
+    parse_capabilities,
+    parse_models,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +38,18 @@ _DEVICE_CODE_URL = "https://github.com/login/device/code"
 _OAUTH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 _COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
 _CHAT_URL = "https://api.githubcopilot.com/chat/completions"
+_RESPONSES_URL = "https://api.githubcopilot.com/responses"
 _MODELS_URL = "https://api.githubcopilot.com/models"
+
+# What a model gets when the catalog is unavailable or doesn't list it:
+# today's behavior — chat completions, no response_format.
+_UNKNOWN_CAPABILITIES = ModelCapabilities(structured_outputs=False, endpoints=())
+
+# After a failed catalog fetch, how long later chats wait before trying
+# again. A broken /models must not be hit per request, but the failure must
+# not be cached for the process either: that would pin a Responses-only
+# model to the wrong endpoint (400 on every turn) until restart.
+_CAPABILITIES_RETRY_DELAY = 60.0
 
 OAUTH_TOKEN_FILENAME = "oauth_token"
 
@@ -44,17 +63,6 @@ _COPILOT_HEADERS = {
     "Copilot-Integration-Id": "vscode-chat",
     "User-Agent": "GitHubCopilotChat/0.22.4",
 }
-
-
-def _structured_outputs_map(data: dict[str, Any]) -> dict[str, bool]:
-    """model id → structured-output support, from a /models response."""
-    return {
-        m["id"]: bool(
-            ((m.get("capabilities") or {}).get("supports") or {}).get("structured_outputs")
-        )
-        for m in data.get("data", [])
-        if m.get("id")
-    }
 
 
 class CopilotUnavailableError(RuntimeError):
@@ -321,9 +329,11 @@ class CopilotClient:
     def __init__(self, auth: CopilotAuth, model: str) -> None:
         self._auth = auth
         self._model = model
-        # model id -> whether /models reports structured-output support;
-        # fetched lazily on first use, None until then.
-        self._structured_outputs: dict[str, bool] | None = None
+        # model id -> what /models reports (endpoints, structured outputs);
+        # fetched lazily on first use, None until then (and after a failure,
+        # which is retried once _capabilities_retry_at has passed).
+        self._capabilities: dict[str, ModelCapabilities] | None = None
+        self._capabilities_retry_at: float = 0.0
 
     @property
     def model(self) -> str:
@@ -340,7 +350,11 @@ class CopilotClient:
         initiator: str | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """POST to chat/completions (streaming); returns an aggregated response dict.
+        """Run one model turn (streaming); returns a chat-completions-shaped dict.
+
+        Messages and the result are always chat-completions shaped. Models
+        the catalog serves only on the Responses endpoint are translated at
+        this boundary (``responses.py``); everything above stays unaware.
 
         Streaming is required: the non-streaming endpoint drops tool calls for
         reasoning models (message arrives with reasoning_* but no tool_calls).
@@ -354,16 +368,16 @@ class CopilotClient:
         enforced (the endpoint accepts and ignores it today) and always parse
         the reply tolerantly.
         """
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-            "stream": True,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        if response_format and await self._supports_structured_outputs(payload["model"]):
-            payload["response_format"] = response_format
+        model = self._model
+        capabilities = await self._model_capabilities(model)
+        if not capabilities.structured_outputs:
+            response_format = None
+        if capabilities.uses_responses:
+            url = _RESPONSES_URL
+            payload = responses.build_payload(model, messages, tools, response_format)
+        else:
+            url = _CHAT_URL
+            payload = _chat_payload(model, messages, tools, response_format)
 
         # Copilot bills premium requests only for user-initiated calls; the
         # X-Initiator header marks agent-loop follow-ups (tool results) so
@@ -373,10 +387,10 @@ class CopilotClient:
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                response = await self._chat_once(payload, initiator)
+                response = await self._chat_once(url, payload, initiator)
                 # Stamp the model actually used so call sites can attribute
                 # usage accurately across /model switches mid-flight.
-                response["model"] = payload["model"]
+                response["model"] = model
                 return response
             except (httpx.TransportError, _TransientServerError) as exc:
                 if attempt == _MAX_ATTEMPTS:
@@ -389,27 +403,27 @@ class CopilotClient:
                 await asyncio.sleep(delay)
         raise AssertionError("unreachable")
 
-    async def _supports_structured_outputs(self, model: str) -> bool:
-        """Whether /models reports structured-output support for ``model``.
+    async def _model_capabilities(self, model: str) -> ModelCapabilities:
+        """What /models reports for ``model``; unknown models get the defaults.
 
-        The capability map is fetched once and cached for the process. A
-        failed fetch caches an empty map: response_format is advisory today,
-        so degrading to prompt-only beats re-hitting a broken endpoint on
-        every request.
+        The capability map is fetched once and cached for the process
+        (``list_models`` refreshes it on every picker open). While a fetch
+        keeps failing, chats degrade to today's behavior — chat completions,
+        prompt-only structured output — and the fetch is retried after
+        ``_CAPABILITIES_RETRY_DELAY`` rather than on every request.
         """
-        if self._structured_outputs is None:
-            self._structured_outputs = await self._fetch_structured_outputs()
-        return self._structured_outputs.get(model, False)
-
-    async def _fetch_structured_outputs(self) -> dict[str, bool]:
-        try:
-            data = await self._get_models_payload()
-        except Exception:
-            logger.warning(
-                "Model capability fetch failed; response_format disabled", exc_info=True
-            )
-            return {}
-        return _structured_outputs_map(data)
+        if self._capabilities is None and time.monotonic() >= self._capabilities_retry_at:
+            try:
+                self._capabilities = parse_capabilities(await self._get_models_payload())
+            except Exception:
+                self._capabilities_retry_at = time.monotonic() + _CAPABILITIES_RETRY_DELAY
+                logger.warning(
+                    "Model capability fetch failed; assuming chat completions and "
+                    "no response_format until the next attempt in %.0fs",
+                    _CAPABILITIES_RETRY_DELAY,
+                    exc_info=True,
+                )
+        return (self._capabilities or {}).get(model, _UNKNOWN_CAPABILITIES)
 
     async def _get_models_payload(self) -> dict[str, Any]:
         bearer = await self._auth.get_bearer()
@@ -432,15 +446,17 @@ class CopilotClient:
         treat the catalog as best-effort and keep their previous list.
         """
         data = await self._get_models_payload()
-        self._structured_outputs = _structured_outputs_map(data)
+        self._capabilities = parse_capabilities(data)
         return parse_models(data, vendors)
 
-    async def _chat_once(self, payload: dict[str, Any], initiator: str) -> dict[str, Any]:
+    async def _chat_once(
+        self, url: str, payload: dict[str, Any], initiator: str
+    ) -> dict[str, Any]:
         bearer = await self._auth.get_bearer()
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST",
-                _CHAT_URL,
+                url,
                 json=payload,
                 headers={
                     **_COPILOT_HEADERS,
@@ -459,7 +475,39 @@ class CopilotClient:
                         r.status_code, self._model, body,
                     )
                 r.raise_for_status()
+                if url == _RESPONSES_URL:
+                    try:
+                        return await responses.read_sse(r)
+                    except responses.StreamError as exc:
+                        raise _TransientServerError(str(exc)) from exc
                 return await _read_sse_message(r)
+
+
+def _chat_payload(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    response_format: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """A chat/completions request body.
+
+    Assistant messages are copied without the private key a /responses turn
+    leaves on them, so a conversation started on a Responses-only model
+    continues cleanly after a switch to a chat one.
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {k: v for k, v in m.items() if k != responses.OUTPUT_KEY} for m in messages
+        ],
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    if response_format:
+        payload["response_format"] = response_format
+    return payload
 
 
 # ------------------------------------------------------------------

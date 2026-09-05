@@ -16,6 +16,11 @@ from dataclasses import dataclass
 # the picker flag filters out, but it also hosts current ones (gpt-5-mini).
 DEFAULT_VENDORS = ("Anthropic", "OpenAI", "Azure OpenAI")
 
+# The two API dialects the client speaks. Newer OpenAI models are served on
+# the Responses endpoint only; everything else still lists chat completions.
+CHAT_ENDPOINT = "/chat/completions"
+RESPONSES_ENDPOINT = "/responses"
+
 
 @dataclass(frozen=True)
 class FetchedModel:
@@ -32,18 +37,56 @@ class ModelOption:
     label: str
 
 
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """What /models reports for one model id: structured-output support and
+    the endpoints it is served on (empty when the catalog omits the field)."""
+
+    structured_outputs: bool
+    endpoints: tuple[str, ...]
+
+    @property
+    def uses_responses(self) -> bool:
+        """Chat completions stays the default whenever the model lists it."""
+        return RESPONSES_ENDPOINT in self.endpoints and CHAT_ENDPOINT not in self.endpoints
+
+
+def parse_capabilities(payload: dict) -> dict[str, ModelCapabilities]:
+    """model id → capabilities, from a /models response."""
+    return {
+        m["id"]: ModelCapabilities(
+            structured_outputs=bool(
+                ((m.get("capabilities") or {}).get("supports") or {}).get("structured_outputs")
+            ),
+            endpoints=tuple(m.get("supported_endpoints") or ()),
+        )
+        for m in payload.get("data", [])
+        if m.get("id")
+    }
+
+
+def _speaks_our_dialect(m: dict) -> bool:
+    """Whether the client can drive this model at all; a catalog without the
+    ``supported_endpoints`` field is not held to it."""
+    endpoints = m.get("supported_endpoints")
+    if endpoints is None:
+        return True
+    return CHAT_ENDPOINT in endpoints or RESPONSES_ENDPOINT in endpoints
+
+
 def parse_models(payload: dict, vendors: Sequence[str]) -> list[FetchedModel]:
     """Extract selectable chat models from a /models response.
 
     Keeps models that are picker-enabled (Copilot's own curation — this drops
-    embeddings and legacy ids), from a whitelisted vendor, and not gated by a
-    disabled account policy (a missing policy object means no gating).
+    embeddings and legacy ids), from a whitelisted vendor, served on an
+    endpoint the client speaks, and not gated by a disabled account policy
+    (a missing policy object means no gating).
     """
     models: list[FetchedModel] = []
     for m in payload.get("data", []):
         if not m.get("id") or not m.get("model_picker_enabled"):
             continue
-        if m.get("vendor") not in vendors:
+        if m.get("vendor") not in vendors or not _speaks_our_dialect(m):
             continue
         policy = m.get("policy")
         if policy is not None and policy.get("state") != "enabled":

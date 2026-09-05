@@ -14,7 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import httpx
 
-from assistant.copilot import CopilotAuth, CopilotClient, CopilotUnavailableError
+from assistant.copilot import (
+    _CHAT_URL,
+    _RESPONSES_URL,
+    CopilotAuth,
+    CopilotClient,
+    CopilotUnavailableError,
+)
+from assistant.responses import OUTPUT_KEY
 
 
 @pytest.fixture
@@ -300,6 +307,14 @@ def _chat_client(auth: CopilotAuth) -> CopilotClient:
     return CopilotClient(auth, model="test-model")
 
 
+def _offline_chat_client(auth: CopilotAuth) -> CopilotClient:
+    """A client whose capability map is already (emptily) cached, for tests
+    about streaming and retries that don't stub /models."""
+    client = _chat_client(auth)
+    client._capabilities = {}
+    return client
+
+
 @pytest.mark.asyncio
 async def test_chat_streams_and_aggregates_tool_calls(
     auth: CopilotAuth, state_dir: Path
@@ -321,7 +336,7 @@ async def test_chat_streams_and_aggregates_tool_calls(
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(chunks)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "init vault"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "init vault"}])
 
     choice = result["choices"][0]
     msg = choice["message"]
@@ -350,7 +365,7 @@ async def test_chat_text_only_stream(auth: CopilotAuth, state_dir: Path) -> None
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(chunks)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "hi"}])
 
     msg = result["choices"][0]["message"]
     assert msg["content"] == "Hello"
@@ -368,7 +383,7 @@ async def test_chat_response_includes_model(auth: CopilotAuth, state_dir: Path) 
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(chunks)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "hi"}])
 
     assert result["model"] == "test-model"  # _chat_client constructs with model="test-model"
 
@@ -457,18 +472,44 @@ async def test_chat_drops_response_format_when_capability_fetch_fails(
 
 
 @pytest.mark.asyncio
-async def test_chat_skips_capability_fetch_without_response_format(
+async def test_chat_defaults_to_chat_completions_on_malformed_catalog(
     auth: CopilotAuth, state_dir: Path
 ) -> None:
-    """Plain chat runs must not pay a /models round-trip."""
+    """A /models body that isn't the expected shape degrades like a failed fetch."""
     _write_oauth_token(state_dir, "oauth")
     mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(200, ["not", "a", "catalog"]))
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(_TEXT_CHUNKS)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+        result = await _chat_client(auth).chat(
+            [{"role": "user", "content": "hi"}], response_format=_RESPONSE_FORMAT
+        )
 
-    mock_client.get.assert_not_awaited()
+    assert mock_client.stream.call_args.args[1] == _CHAT_URL
+    assert "response_format" not in mock_client.stream.call_args.kwargs["json"]
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_chat_fetches_capabilities_once_for_the_process(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """Endpoint routing needs the catalog for every chat, so it is fetched on
+    the first one and cached — never a /models round-trip per request."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(200, _models_payload(None)))
+    mock_client.stream = MagicMock(
+        side_effect=lambda *a, **k: _stream_cm(200, _sse_lines(_TEXT_CHUNKS))
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        client = _chat_client(auth)
+        await client.chat([{"role": "user", "content": "hi"}])
+        await client.chat([{"role": "user", "content": "hi"}])
+
+    assert mock_client.get.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -482,7 +523,7 @@ async def test_chat_marks_user_initiated_requests(auth: CopilotAuth, state_dir: 
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(chunks)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+        await _offline_chat_client(auth).chat([{"role": "user", "content": "hi"}])
 
     headers = mock_client.stream.call_args.kwargs["headers"]
     assert headers["X-Initiator"] == "user"
@@ -509,7 +550,7 @@ async def test_chat_marks_tool_followups_as_agent_initiated(
         {"role": "tool", "tool_call_id": "tc1", "content": "Buy milk"},
     ]
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        await _chat_client(auth).chat(messages)
+        await _offline_chat_client(auth).chat(messages)
 
     headers = mock_client.stream.call_args.kwargs["headers"]
     assert headers["X-Initiator"] == "agent"
@@ -529,7 +570,7 @@ async def test_chat_honors_explicit_initiator_override(
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(chunks)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        await _chat_client(auth).chat(
+        await _offline_chat_client(auth).chat(
             [{"role": "user", "content": "question"}], initiator="agent"
         )
 
@@ -565,7 +606,7 @@ async def test_chat_retries_truncated_stream(auth: CopilotAuth, state_dir: Path)
         patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "go"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "go"}])
 
     assert mock_client.stream.call_count == 2
     tc = result["choices"][0]["message"]["tool_calls"][0]
@@ -600,7 +641,7 @@ async def test_chat_retries_on_malformed_tool_arguments(
         patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "go"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "go"}])
 
     assert mock_client.stream.call_count == 2
     tc = result["choices"][0]["message"]["tool_calls"][0]
@@ -623,7 +664,7 @@ async def test_chat_normalizes_empty_tool_arguments(
     mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(chunks)))
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "list"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "list"}])
 
     tc = result["choices"][0]["message"]["tool_calls"][0]
     assert tc["function"]["arguments"] == "{}"
@@ -642,7 +683,7 @@ async def test_chat_retries_on_5xx(auth: CopilotAuth, state_dir: Path) -> None:
         patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
-        result = await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+        result = await _offline_chat_client(auth).chat([{"role": "user", "content": "hello"}])
 
     assert result["choices"][0]["message"]["content"] == "hi"
     assert mock_client.stream.call_count == 2
@@ -659,7 +700,7 @@ async def test_chat_gives_up_after_max_attempts(auth: CopilotAuth, state_dir: Pa
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
         with pytest.raises(RuntimeError, match="502"):
-            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+            await _offline_chat_client(auth).chat([{"role": "user", "content": "hello"}])
 
     assert mock_client.stream.call_count == 3
 
@@ -681,7 +722,7 @@ async def test_chat_5xx_exhaustion_raises_unavailable(
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
         with pytest.raises(CopilotUnavailableError):
-            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+            await _offline_chat_client(auth).chat([{"role": "user", "content": "hello"}])
 
 
 @pytest.mark.asyncio
@@ -697,7 +738,7 @@ async def test_chat_network_exhaustion_raises_unavailable(
         patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
     ):
         with pytest.raises(CopilotUnavailableError):
-            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+            await _offline_chat_client(auth).chat([{"role": "user", "content": "hello"}])
 
     assert mock_client.stream.call_count == 3
 
@@ -711,7 +752,7 @@ async def test_chat_4xx_is_not_unavailable(auth: CopilotAuth, state_dir: Path) -
 
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
         with pytest.raises(httpx.HTTPStatusError) as excinfo:
-            await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+            await _offline_chat_client(auth).chat([{"role": "user", "content": "hello"}])
 
     assert not isinstance(excinfo.value, CopilotUnavailableError)
 
@@ -790,7 +831,7 @@ async def test_list_models_returns_filtered_catalog(auth: CopilotAuth) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_models_refreshes_structured_outputs_map(auth: CopilotAuth) -> None:
+async def test_list_models_refreshes_capability_map(auth: CopilotAuth) -> None:
     """The catalog fetch carries the capability map too — one request, both caches."""
     client = CopilotClient(auth, "claude-sonnet-5")
     auth._bearer = "bearer"
@@ -804,4 +845,299 @@ async def test_list_models_refreshes_structured_outputs_map(auth: CopilotAuth) -
     with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
         await client.list_models(["Anthropic"])
 
-    assert client._structured_outputs == {"claude-fable-5": True, "grok-4.6": False}
+    assert client._capabilities is not None
+    assert client._capabilities["claude-fable-5"].structured_outputs is True
+    assert client._capabilities["grok-4.6"].structured_outputs is False
+
+
+# ------------------------------------------------------------------
+# Endpoint routing: /chat/completions vs /responses
+# ------------------------------------------------------------------
+
+_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {"name": "read_file", "description": "Read.", "parameters": {"type": "object"}},
+}
+
+_TEXT_OUTPUT = [
+    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}
+]
+
+
+def _catalog(endpoints: list[str] | None, structured_outputs: bool = True) -> dict:
+    entry: dict = {
+        "id": "test-model",
+        "capabilities": {"supports": {"structured_outputs": structured_outputs}},
+    }
+    if endpoints is not None:
+        entry["supported_endpoints"] = endpoints
+    return {"data": [entry]}
+
+
+def _responses_sse_lines(output: list[dict] | None) -> list[str]:
+    """A /responses event stream; ``None`` output means cut off before completion."""
+    lines = ["event: response.created", 'data: {"type":"response.created","response":{}}', ""]
+    if output is None:
+        return lines
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": output,
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+        },
+    }
+    return lines + ["event: response.completed", f"data: {json.dumps(completed)}", ""]
+
+
+def _routing_client(endpoints: list[str] | None, streams: list[MagicMock]) -> AsyncMock:
+    mock_client = AsyncMock()
+    if endpoints is None:
+        mock_client.get = AsyncMock(return_value=_response(500))
+    else:
+        mock_client.get = AsyncMock(return_value=_response(200, _catalog(endpoints)))
+    mock_client.stream = MagicMock(side_effect=streams)
+    return mock_client
+
+
+@pytest.mark.asyncio
+async def test_chat_routes_responses_only_models_to_responses_endpoint(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(
+        ["/responses", "ws:/responses"],
+        [_stream_cm(200, _responses_sse_lines(_TEXT_OUTPUT))],
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        result = await _chat_client(auth).chat(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+            tools=[_TOOL_SCHEMA],
+        )
+
+    args, kwargs = mock_client.stream.call_args
+    assert args[1] == _RESPONSES_URL
+    assert kwargs["json"]["instructions"] == "sys"
+    assert kwargs["json"]["input"] == [{"role": "user", "content": "hi"}]
+    assert "messages" not in kwargs["json"]
+    assert kwargs["json"]["tools"][0]["name"] == "read_file"
+    assert kwargs["headers"]["X-Initiator"] == "user"
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert result["usage"]["prompt_tokens"] == 3
+    assert result["model"] == "test-model"
+
+
+@pytest.mark.asyncio
+async def test_chat_prefers_chat_completions_when_model_lists_both(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(
+        ["/responses", "/chat/completions"], [_stream_cm(200, _sse_lines(_TEXT_CHUNKS))]
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+
+    args, kwargs = mock_client.stream.call_args
+    assert args[1] == _CHAT_URL
+    assert kwargs["json"]["messages"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_chat_defaults_to_chat_completions_without_catalog(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """A failed /models fetch must leave today's behavior intact."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(None, [_stream_cm(200, _sse_lines(_TEXT_CHUNKS))])
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        result = await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+
+    assert mock_client.stream.call_args.args[1] == _CHAT_URL
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_chat_defaults_to_chat_completions_for_unlisted_models(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """A pinned config alias the catalog doesn't know keeps the chat endpoint."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(
+        return_value=_response(200, {"data": [{"id": "other", "supported_endpoints": ["/responses"]}]})
+    )
+    mock_client.stream = MagicMock(return_value=_stream_cm(200, _sse_lines(_TEXT_CHUNKS)))
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+
+    assert mock_client.stream.call_args.args[1] == _CHAT_URL
+
+
+@pytest.mark.asyncio
+async def test_chat_sends_text_format_on_responses_endpoint(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(
+        ["/responses"], [_stream_cm(200, _responses_sse_lines(_TEXT_OUTPUT))]
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await _chat_client(auth).chat(
+            [{"role": "user", "content": "hi"}], response_format=_RESPONSE_FORMAT
+        )
+
+    payload = mock_client.stream.call_args.kwargs["json"]
+    assert payload["text"]["format"]["name"] == "job_close"
+    assert "response_format" not in payload
+
+
+@pytest.mark.asyncio
+async def test_chat_strips_responses_reasoning_from_chat_payload(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """History produced on /responses must continue cleanly on a chat model."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(
+        ["/chat/completions"], [_stream_cm(200, _sse_lines(_TEXT_CHUNKS))]
+    )
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ],
+        OUTPUT_KEY: [{"type": "reasoning", "encrypted_content": "ENC"}],
+    }
+    messages = [
+        {"role": "user", "content": "hi"},
+        assistant,
+        {"role": "tool", "tool_call_id": "c", "content": "r"},
+    ]
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        await _chat_client(auth).chat(messages)
+
+    sent = mock_client.stream.call_args.kwargs["json"]["messages"]
+    assert OUTPUT_KEY not in sent[1]
+    assert sent[1]["tool_calls"] == assistant["tool_calls"]
+    assert OUTPUT_KEY in assistant  # the caller's history is left untouched
+
+
+@pytest.mark.asyncio
+async def test_chat_retries_truncated_responses_stream(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(
+        ["/responses"],
+        [
+            _stream_cm(200, _responses_sse_lines(None)),
+            _stream_cm(200, _responses_sse_lines(_TEXT_OUTPUT)),
+        ],
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)), patch(
+        "asyncio.sleep", new=AsyncMock()
+    ):
+        result = await _chat_client(auth).chat([{"role": "user", "content": "hi"}])
+
+    assert mock_client.stream.call_count == 2
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_chat_does_not_refetch_capabilities_within_the_retry_delay(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """A broken /models must not be hit on every request."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = _routing_client(
+        None,
+        [_stream_cm(200, _sse_lines(_TEXT_CHUNKS)), _stream_cm(200, _sse_lines(_TEXT_CHUNKS))],
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        client = _chat_client(auth)
+        await client.chat([{"role": "user", "content": "hi"}])
+        await client.chat([{"role": "user", "content": "hi"}])
+
+    assert mock_client.get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_refetches_capabilities_after_a_failed_fetch(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """A failed catalog fetch must not pin a Responses-only model to the chat
+    endpoint for the rest of the process: once the retry delay has passed the
+    next chat fetches again and routes correctly."""
+    _write_oauth_token(state_dir, "oauth")
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(
+        side_effect=[_response(500), _response(200, _catalog(["/responses"]))]
+    )
+    mock_client.stream = MagicMock(
+        side_effect=[
+            _stream_cm(200, _sse_lines(_TEXT_CHUNKS)),
+            _stream_cm(200, _responses_sse_lines(_TEXT_OUTPUT)),
+        ]
+    )
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        client = _chat_client(auth)
+        await client.chat([{"role": "user", "content": "hi"}])
+        client._capabilities_retry_at = 0.0  # the delay has elapsed
+        await client.chat([{"role": "user", "content": "hi"}])
+
+    assert mock_client.get.await_count == 2
+    assert [c.args[1] for c in mock_client.stream.call_args_list] == [_CHAT_URL, _RESPONSES_URL]
+
+
+@pytest.mark.asyncio
+async def test_chat_round_trips_a_responses_turn_through_history(
+    auth: CopilotAuth, state_dir: Path
+) -> None:
+    """The reply of one /responses turn, appended to history the way the agent
+    does, replays verbatim in the next request ahead of the tool result."""
+    _write_oauth_token(state_dir, "oauth")
+    output = [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": []},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": '{"path": "a.md"}',
+            "status": "completed",
+        },
+    ]
+    mock_client = _routing_client(
+        ["/responses"],
+        [
+            _stream_cm(200, _responses_sse_lines(output)),
+            _stream_cm(200, _responses_sse_lines(_TEXT_OUTPUT)),
+        ],
+    )
+    history = [{"role": "user", "content": "read a.md"}]
+
+    with patch("httpx.AsyncClient", _mock_client_cls(mock_client)):
+        client = _chat_client(auth)
+        first = await client.chat(history, tools=[_TOOL_SCHEMA])
+        reply = first["choices"][0]["message"]
+        history.append(reply)
+        history.append({"role": "tool", "tool_call_id": reply["tool_calls"][0]["id"], "content": "# A"})
+        second = await client.chat(history, tools=[_TOOL_SCHEMA])
+
+    assert reply["tool_calls"][0]["function"]["name"] == "read_file"
+    assert mock_client.stream.call_args_list[1].kwargs["json"]["input"] == [
+        {"role": "user", "content": "read a.md"},
+        *output,
+        {"type": "function_call_output", "call_id": "call_1", "output": "# A"},
+    ]
+    assert second["choices"][0]["message"]["content"] == "ok"

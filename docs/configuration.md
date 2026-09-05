@@ -30,7 +30,7 @@ start one.
 | `copilot.default_model` | `DEFAULT_MODEL` | `sonnet` | Which alias from `copilot.models` to start with. Must be a key of that table. When `default_family` resolves, this is only the fallback |
 | `copilot.models` | — | `{sonnet = "claude-sonnet-5"}` | Alias → model id map: the offline fallback, and pinned custom ids. The `/model` picker is otherwise the live Copilot catalog (refreshed each time it opens) under the API display names — a config alias whose id the catalog lists is shown as the catalog entry |
 | `copilot.default_family` | `DEFAULT_FAMILY` | unset | Model-id prefix, e.g. `claude-opus`. At startup the newest fetched model of that family becomes the default (so a new Opus release is picked up on the next restart). Unset keeps `default_model` |
-| `copilot.vendors` | — | `["Anthropic", "OpenAI", "Azure OpenAI"]` | Vendors the dynamic picker offers. Copilot's own picker flag already filters out legacy and non-chat models |
+| `copilot.vendors` | — | `["Anthropic", "OpenAI", "Azure OpenAI"]` | Vendors the dynamic picker offers. Copilot's own picker flag already filters out legacy and non-chat models. Models Copilot serves only on its Responses endpoint (the newer OpenAI ones) are offered too — the bot picks the endpoint per model from the catalog |
 | — | `ELEVENLABS_API_KEY` | unset | [ElevenLabs](https://elevenlabs.io) API key, enabling voice transcription. Env-only, deliberately: it is a credential, not configuration |
 | `web.fourget_url` | `FOURGET_URL` | unset | Base URL of a [4get](https://git.lolcat.ca/lolcat/4get) instance. Unset disables the `research` tool entirely |
 | `assistant.timezone` | `TIMEZONE` | `UTC` | IANA name, e.g. `Europe/Madrid`. Drives every local time the bot writes or says, and cron interpretation |

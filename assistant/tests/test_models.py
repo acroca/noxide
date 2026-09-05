@@ -10,9 +10,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from assistant.models import (
     DEFAULT_VENDORS,
     FetchedModel,
+    ModelCapabilities,
     ModelOption,
     latest_of_family,
     merge_options,
+    parse_capabilities,
     parse_models,
     resolve_startup,
     slug_for,
@@ -257,3 +259,73 @@ def test_resolve_startup_family_not_found_keeps_config_default() -> None:
 
     assert alias == "sonnet"
     assert model_id is None
+
+
+# ------------------------------------------------------------------
+# supported_endpoints
+# ------------------------------------------------------------------
+
+
+def _endpoint_payload() -> dict:
+    return {
+        "data": [
+            {
+                "id": "claude-fable-5",
+                "vendor": "Anthropic",
+                "model_picker_enabled": True,
+                "supported_endpoints": ["/v1/messages", "/chat/completions"],
+            },
+            {
+                "id": "gpt-6-astra",
+                "vendor": "OpenAI",
+                "model_picker_enabled": True,
+                "supported_endpoints": ["/responses", "ws:/responses"],
+            },
+            # filtered: neither endpoint the client speaks
+            {
+                "id": "gpt-embed",
+                "vendor": "OpenAI",
+                "model_picker_enabled": True,
+                "supported_endpoints": ["/embeddings"],
+            },
+            # kept: catalog shape without the field means no gating
+            {"id": "gpt-5-mini", "vendor": "Azure OpenAI", "model_picker_enabled": True},
+        ]
+    }
+
+
+def test_parse_models_keeps_models_on_either_supported_endpoint() -> None:
+    models = parse_models(_endpoint_payload(), DEFAULT_VENDORS)
+
+    assert [m.id for m in models] == ["claude-fable-5", "gpt-6-astra", "gpt-5-mini"]
+
+
+def test_parse_capabilities_reads_endpoints_and_structured_outputs() -> None:
+    payload = {
+        "data": [
+            {
+                "id": "gpt-6-astra",
+                "capabilities": {"supports": {"structured_outputs": True}},
+                "supported_endpoints": ["/responses", "ws:/responses"],
+            },
+            {"id": "claude-fable-5", "supported_endpoints": ["/chat/completions"]},
+            {"name": "no id"},
+        ]
+    }
+
+    caps = parse_capabilities(payload)
+
+    assert caps == {
+        "gpt-6-astra": ModelCapabilities(
+            structured_outputs=True, endpoints=("/responses", "ws:/responses")
+        ),
+        "claude-fable-5": ModelCapabilities(
+            structured_outputs=False, endpoints=("/chat/completions",)
+        ),
+    }
+
+
+def test_capabilities_use_responses_only_without_chat_completions() -> None:
+    assert ModelCapabilities(False, ("/responses",)).uses_responses is True
+    assert ModelCapabilities(False, ("/responses", "/chat/completions")).uses_responses is False
+    assert ModelCapabilities(False, ()).uses_responses is False

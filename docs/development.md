@@ -45,7 +45,10 @@ assistant/
   src/assistant/
     __main__.py     ← entry point; wires everything together
     agent.py        ← the tool-calling loop
-    copilot.py      ← auth + chat completions (streaming)
+    copilot.py      ← auth + model turns (streaming), routed per model to
+                      chat completions or the Responses endpoint
+    responses.py    ← chat-completions ⇄ Responses API translation
+    models.py       ← /models catalog parsing: picker options, capabilities
     telegram_bot.py ← long polling, handlers, allowlist
     tools.py        ← vault file tools (path-jailed)
     vault_check.py  ← deterministic wiki consistency checks
