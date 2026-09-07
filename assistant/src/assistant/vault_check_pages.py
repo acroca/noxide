@@ -15,10 +15,23 @@ from __future__ import annotations
 
 import posixpath
 import re
+from datetime import date
 from pathlib import Path
 from urllib.parse import unquote
 
 _NOW_PATH = "wiki/now.md"
+
+
+def _normalize(text: str) -> str:
+    """Whitespace-collapsed, casefolded text — how the mirrors decide "same text"."""
+    return " ".join(text.split()).casefold()
+
+
+def _iso_date(text: str) -> date | None:
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
 
 _FENCE_RX = re.compile(r"^\s*(```|~~~)")
 _HEADING_RX = re.compile(r"^(?P<hashes>#{1,6})\s+\S")

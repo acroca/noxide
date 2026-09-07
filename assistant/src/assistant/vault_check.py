@@ -27,7 +27,15 @@ from collections.abc import Iterable
 from datetime import date, timedelta
 from pathlib import Path
 
-from .vault_check_pages import _LINK_RX, _NOW_PATH, page_findings, resolve_link
+from .vault_check_events import event_findings
+from .vault_check_pages import (
+    _LINK_RX,
+    _NOW_PATH,
+    _iso_date,
+    _normalize,
+    page_findings,
+    resolve_link,
+)
 
 _MAX_FINDINGS = 100
 
@@ -66,6 +74,14 @@ _DATE_THEN_WEEKDAY = re.compile(
 )
 
 _OPEN_TASK = re.compile(r"^\s*- \[ \]\s+(?P<text>.+?)\s*$")
+# now.md's Upcoming form — "- Tuesday — text (2026-09-08) [reminder:…]": the
+# weekday opens the bullet and the date closes it, with the event text in
+# between. Paired only on now.md, where the prompt mandates this shape;
+# elsewhere a leading weekday is prose ("Monday notes (2026-08-01)").
+_LABELLED_LINE = re.compile(
+    rf"^\s*- (?P<wd>{_NAMES_ALT})\b.*\((?P<date>{_DATE})\)(?:\s*\[reminder:[0-9a-f]{{8}}\])*\s*$",
+    re.IGNORECASE,
+)
 
 
 def run_checks(
@@ -86,6 +102,7 @@ def run_checks(
     log_dates = _log_dates(root)
     findings = (
         _mirror_findings(root, wiki_files)
+        + event_findings(wiki_files, today)
         + _overdue_findings(wiki_files, today, (log_dates or {}).get("compile"))
         + _maintenance_findings(log_dates, today, maintenance)
         + _weekday_findings(wiki_files)
@@ -140,10 +157,6 @@ def _wiki_files(root: Path) -> list[tuple[str, list[str]]]:
 # ---------------------------------------------------------------------------
 
 _MIRROR_HEADING = "Task mirror (wiki/now.md vs wiki pages)"
-
-
-def _normalize(text: str) -> str:
-    return " ".join(text.split()).casefold()
 
 
 def _mirror_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
@@ -219,13 +232,6 @@ _LOG_ENTRY_RX = re.compile(
 # so the word is not enumerated. A date deeper inside a parenthetical
 # ("shared by X, 2026-07-28") is not a deadline.
 _DUE_RX = re.compile(r"\(\w+\s+~?(?P<date>\d{4}-\d{2}-\d{2})[^)]*\)")
-
-
-def _iso_date(text: str) -> date | None:
-    try:
-        return date.fromisoformat(text)
-    except ValueError:
-        return None
 
 
 def _log_dates(root: Path) -> dict[str, date] | None:
@@ -322,14 +328,26 @@ def _maintenance_findings(
 _WEEKDAY_HEADING = "Weekday labels"
 
 
+def _weekday_pairs(rel: str, line: str) -> list[tuple[str, str]]:
+    """(weekday, ISO date) pairs the line claims — adjacent anywhere, or, on
+    now.md, a bullet opening with the weekday and closing with the date."""
+    pairs = [
+        (m.group("wd"), m.group("date"))
+        for rx in (_WEEKDAY_THEN_DATE, _DATE_THEN_WEEKDAY)
+        for m in rx.finditer(line)
+    ]
+    if not pairs and rel == _NOW_PATH and (m := _LABELLED_LINE.match(line)):
+        pairs.append((m.group("wd"), m.group("date")))
+    return pairs
+
+
 def _weekday_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
     findings = []
     for rel, lines in wiki_files:
         for i, line in enumerate(lines, 1):
-            for rx in (_WEEKDAY_THEN_DATE, _DATE_THEN_WEEKDAY):
-                for m in rx.finditer(line):
-                    if issue := _check_pair(m.group("wd"), m.group("date")):
-                        findings.append((_WEEKDAY_HEADING, f"{rel}:{i}: {issue}"))
+            for weekday, iso in _weekday_pairs(rel, line):
+                if issue := _check_pair(weekday, iso):
+                    findings.append((_WEEKDAY_HEADING, f"{rel}:{i}: {issue}"))
     return findings
 
 

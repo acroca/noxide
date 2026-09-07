@@ -982,3 +982,236 @@ def test_index_link_with_a_fragment_still_counts_as_indexed(tmp_path: Path) -> N
     )
 
     assert _check(tmp_path) == "[no findings]"
+
+
+# ---------------------------------------------------------------------------
+# Upcoming events: every dated event bullet on a live page within the next
+# 14 days must appear in wiki/now.md with its date and text
+# ---------------------------------------------------------------------------
+
+
+def _now_with(root: Path, *sections: str) -> None:
+    """now.md with the clean vault's Tasks mirror plus the given section bodies."""
+    body = "".join(f"{section}\n\n" for section in sections)
+    _write(
+        root,
+        "wiki/now.md",
+        f"# Now — Monday — 2026-08-03\n\n{body}## Tasks\n[garden](projects/garden.md)\n"
+        "- [ ] buy compost (due 2026-08-05)\n",
+    )
+
+
+def _family(root: Path, *events: str) -> None:
+    bullets = "".join(f"- {event}\n" for event in events)
+    _write(root, "wiki/areas/family.md", f"# Family\n\n## School calendar\n{bullets}")
+
+
+def test_dated_event_within_two_weeks_missing_from_now_md_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — First day of school")
+
+    report = _check(tmp_path)
+
+    assert "wiki/areas/family.md:4" in report
+    assert "First day of school" in report
+    assert "wiki/now.md" in report
+
+
+def test_event_mirrored_with_its_date_needs_no_finding(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — First day of school")
+    _now_with(tmp_path, "## Upcoming\n- 2026-08-10 — First day of school")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_weekday_labelled_mirror_line_counts_when_it_keeps_the_iso_date(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — First day of school")
+    _now_with(tmp_path, "## Upcoming\n- Monday — First day of school (2026-08-10)")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_mirror_line_with_the_text_but_another_date_does_not_satisfy_the_event(
+    tmp_path: Path,
+) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — Holiday", "2026-08-11 — Holiday")
+    _now_with(tmp_path, "## Upcoming\n- 2026-08-10 — Holiday")
+
+    report = _check(tmp_path)
+
+    assert "wiki/areas/family.md:5" in report
+    assert "wiki/areas/family.md:4" not in report
+
+
+def test_event_fourteen_days_out_is_still_required(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-17 — Edge of the window")
+
+    assert "Edge of the window" in _check(tmp_path)
+
+
+def test_event_beyond_two_weeks_is_not_required_on_the_dashboard(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-18 — Far event")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_past_dated_bullets_are_history_not_events(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/areas/family.md", "# Family\n\n## History\n- 2026-07-20 — Signed up\n")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_event_dated_today_matches_a_today_line_without_the_date(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-03 18:00 — Dentist")
+    _now_with(tmp_path, "## Today — Monday 2026-08-03\n- 18:00 — Dentist")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_event_range_is_checked_by_its_start_date(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-15 → 2026-08-30 — Camping trip")
+
+    report = _check(tmp_path)
+
+    assert "wiki/areas/family.md:4" in report
+    assert "Camping trip" in report
+
+
+def test_mirrored_range_needs_no_finding(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-15 → 2026-08-30 — Camping trip")
+    _now_with(tmp_path, "## Upcoming\n- 2026-08-15 → 2026-08-30 — Camping trip")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_approximate_event_is_checked(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "~2026-08-10 — Visit from the in-laws")
+
+    assert "Visit from the in-laws" in _check(tmp_path)
+
+
+def test_events_on_archived_pages_are_exempt(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(
+        tmp_path,
+        "wiki/archive/projects/trip.md",
+        "# Trip\n\n**Estado:** cerrado.\n\n## Plan\n- 2026-08-10 — Flight home\n",
+    )
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_events_inside_fenced_code_are_skipped(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(
+        tmp_path,
+        "wiki/areas/family.md",
+        "# Family\n\n## Format\n```\n- 2026-08-10 — Example event\n```\n",
+    )
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_todays_event_is_not_satisfied_by_a_journal_summary_under_another_date(
+    tmp_path: Path,
+) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-03 18:00 — Dentist")
+    _now_with(tmp_path, "## Last 7 days\n- **2026-08-02** — Booked the dentist for tomorrow")
+
+    assert "Dentist" in _check(tmp_path)
+
+
+def test_reminder_marker_on_the_page_event_does_not_break_the_mirror(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — Dentist [reminder:ab12cd34]")
+    _now_with(tmp_path, "## Upcoming\n- Monday — Dentist (2026-08-10)")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_link_in_the_page_event_matches_its_plain_text_on_the_dashboard(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/people/x.md", "# Dr X\n")
+    _family(tmp_path, "2026-08-10 — Dentist with [Dr X](../people/x.md)")
+    _now_with(tmp_path, "## Upcoming\n- 2026-08-10 — Dentist with Dr X")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_event_is_not_satisfied_by_a_journal_summary_naming_its_date(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — Dentist")
+    _now_with(
+        tmp_path,
+        "## Upcoming",
+        "## Last 7 days\n- **2026-08-02** — Booked the dentist for 2026-08-10",
+    )
+
+    assert "Dentist" in _check(tmp_path)
+
+
+def test_event_is_not_satisfied_by_a_task_line_due_that_day(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-10 — Dentist")
+    _write(tmp_path, "wiki/projects/garden.md", "# Garden\n\n## Tasks\n- [ ] Dentist (due 2026-08-10)\n")
+    _write(
+        tmp_path,
+        "wiki/now.md",
+        "# Now — Monday — 2026-08-03\n\n## Upcoming\n\n## Tasks\n[garden](projects/garden.md)\n"
+        "- [ ] Dentist (due 2026-08-10)\n",
+    )
+
+    assert "wiki/areas/family.md:4" in _check(tmp_path)
+
+
+def test_todays_event_must_sit_in_the_section_headed_with_todays_date(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-03 18:00 — Dentist")
+    _now_with(
+        tmp_path,
+        "## Today — Monday 2026-08-03",
+        "## Waiting\n- Dentist invoice (waiting: clinic)",
+    )
+
+    assert "wiki/areas/family.md:4" in _check(tmp_path)
+
+
+def test_todays_event_matches_any_dateless_line_when_no_header_carries_today(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-03 18:00 — Dentist")
+    _now_with(tmp_path, "## Today\n- 18:00 — Dentist")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_wrong_weekday_label_with_trailing_date_on_the_dashboard_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-04 — Concert")
+    _now_with(tmp_path, "## Upcoming\n- Wednesday — Concert (2026-08-04)")
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:4" in report
+    assert "Tuesday" in report
+
+
+def test_leading_weekday_with_trailing_date_is_paired_only_on_the_dashboard(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(
+        tmp_path,
+        "wiki/areas/notes.md",
+        "# Notes\n\n**Estado:** ok.\n\n## Notes\n- Wednesday notes (2026-08-04)\n",
+    )
+
+    assert "Weekday" not in _check(tmp_path)

@@ -56,8 +56,9 @@ vault/
   will not match a search for `2026-08-12`. A weekday label is also a second
   fact that can be wrong on its own. The bot says dates naturally in chat —
   that is where they are meant to read well. `now.md`'s **Upcoming** section is
-  the sole exception: within-7-days items are labelled by weekday alone, since
-  that file is always read whole and rebuilt nightly.
+  the sole exception: within-7-days items are labelled by weekday, with the
+  ISO date kept in parentheses at the end, since that file is always read
+  whole and rebuilt nightly.
 - **Journal entries** are `- HH:MM prose` in local time, under a `# YYYY-MM-DD`
   heading. Prose only — no checkboxes, no `TODO:` markers. The filename carries
   the date, so entries need no date in the text; being append-only, old entries
@@ -68,6 +69,11 @@ vault/
   YYYY-MM-DD)`, `- [x] thing (done YYYY-MM-DD)`, and `(waiting: X)` when blocked
   on someone else. Every open task is also mirrored into `now.md`'s **Tasks**
   section; the page copy is the authority.
+- **Dated events** (an appointment, a trip, a school calendar) live on the
+  owning page as `- YYYY-MM-DD — description` bullets (`YYYY-MM-DD HH:MM`
+  with a time, `YYYY-MM-DD → YYYY-MM-DD` for a range). Every one within the
+  next 14 days is mirrored into `now.md`'s **Upcoming** section, so the
+  dashboard knows about a date the user told the bot weeks ago.
 - **People pages** are created on recurrence, not first mention, and hold stated
   facts only — never invented relationship detail.
 - **`now.md` is a copy**, deliberately. It duplicates state owned by other
@@ -110,7 +116,9 @@ project is the same move in reverse. The weekly lint proposes archiving for
 projects gone quiet, and only the user's yes triggers it.
 
 **Compile** — nightly. Re-reads recent journal entries, applies anything ingest
-missed, recomputes every routine's next-due date, rebuilds `now.md` in full,
+missed, recomputes every routine's next-due date, rebuilds `now.md` in full
+(its **Upcoming** section from every live page's dated events for the next
+two weeks),
 reconciles `index.md` against the pages on disk (archived pages under
 `## Archived`), verifies the result with `check_vault` (see below), logs to
 `log.md`, and flags the tasks the checker's report marks as lapsed since the
@@ -126,7 +134,9 @@ referencing missing files, and the same task tracked on more than one page.
 
 Both jobs lean on **`check_vault`**, a deterministic consistency checker built
 into the bot: pure code, no model involved. It enumerates every open task on
-every live wiki page against the `now.md` mirror (in both directions),
+every live wiki page against the `now.md` mirror (in both directions), pairs
+every dated event within the next two weeks with a dashboard line carrying
+its date and text,
 verifies weekday names written beside ISO dates against the calendar, checks
 each routine's next-due date against last-done + frequency, reconciles every
 page against the index (orphan pages, dead index links), cross-checks reminder
