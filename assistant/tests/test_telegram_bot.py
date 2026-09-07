@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import sys
 from datetime import UTC, datetime
@@ -23,6 +24,12 @@ from assistant.telegram_bot import TelegramBot
 from assistant.transcribe import TranscriptionError
 
 _USER_ID = 42
+_message_ids = itertools.count(1)
+
+
+@pytest.fixture(autouse=True)
+def _short_batch_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(telegram_bot, "_BATCH_WINDOW_SECONDS", 0.01)
 
 
 def _bot(
@@ -78,8 +85,10 @@ def _update(
     video: MagicMock | None = None,
     reply_to: MagicMock | None = None,
     quote: MagicMock | None = None,
+    thread_id: int | None = None,
 ) -> tuple[MagicMock, MagicMock]:
     msg = MagicMock()
+    msg.message_id = next(_message_ids)
     msg.text = text
     msg.voice = voice
     msg.audio = None
@@ -88,7 +97,7 @@ def _update(
     msg.document = document
     msg.video = video
     msg.chat_id = 777
-    msg.message_thread_id = None
+    msg.message_thread_id = thread_id
     msg.migrate_to_chat_id = None
     msg.migrate_from_chat_id = None
     msg.reply_to_message = reply_to
@@ -107,6 +116,12 @@ def _replies(msg: MagicMock) -> list[str]:
     return [c.args[0] for c in msg.reply_text.call_args_list]
 
 
+async def _handle(bot: TelegramBot, ctx: MagicMock, *updates: MagicMock) -> None:
+    """Handle updates the way concurrent PTB does, then wait for their batch to be answered."""
+    await asyncio.gather(*(bot._handle_message(u, ctx) for u in updates))
+    await bot._await_batches()
+
+
 # ------------------------------------------------------------------
 # Text messages (existing behavior)
 # ------------------------------------------------------------------
@@ -115,10 +130,272 @@ async def test_text_message_runs_agent_and_replies() -> None:
     bot, agent = _bot()
     update, ctx = _update(text="remind me tomorrow")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_awaited_once_with(777, "remind me tomorrow", thread_id=None, on_research=ANY)
     assert _replies(update.message) == ["agent reply"]
+
+
+# ------------------------------------------------------------------
+# Bursts: messages that arrive together are one agent run
+# ------------------------------------------------------------------
+
+def test_combine_batch_single_message_is_bare() -> None:
+    assert telegram_bot._combine_batch(["just one"]) == "just one"
+
+
+def test_combine_batch_joins_messages_under_a_count_header() -> None:
+    combined = telegram_bot._combine_batch(["first", "second", "third"])
+
+    assert combined == "[3 messages sent together]\n\nfirst\n\n---\n\nsecond\n\n---\n\nthird"
+
+
+async def test_burst_runs_agent_once_and_replies_to_the_last_message() -> None:
+    """A WhatsApp share of several messages lands as several Telegram
+    updates within a second: the agent must see them as one turn."""
+    bot, agent = _bot()
+    first, ctx = _update(text="first")
+    second, _ = _update(text="second")
+    third, _ = _update(text="third")
+
+    await _handle(bot, ctx, first, second, third)
+
+    agent.run.assert_awaited_once_with(
+        777, telegram_bot._combine_batch(["first", "second", "third"]),
+        thread_id=None, on_research=ANY,
+    )
+    assert _replies(third.message) == ["agent reply"]
+    first.message.reply_text.assert_not_called()
+    second.message.reply_text.assert_not_called()
+    # One typing indicator for the run, not one per message
+    ctx.bot.send_chat_action.assert_awaited_once()
+
+
+async def test_burst_is_ordered_by_message_id_not_by_join_order() -> None:
+    """Handlers join the batch after their own preprocessing (typing action,
+    transcription, download), which completes in any order; the send order
+    Telegram recorded is the one the user meant."""
+    bot, agent = _bot()
+    first, ctx = _update(text="first")
+    second, _ = _update(text="second")
+
+    await _handle(bot, ctx, second, first)
+
+    assert agent.run.call_args.args[1] == telegram_bot._combine_batch(["first", "second"])
+    assert _replies(second.message) == ["agent reply"]
+    first.message.reply_text.assert_not_called()
+
+
+async def test_burst_keeps_reply_context_with_its_own_message() -> None:
+    bot, agent = _bot()
+    quoted = MagicMock()
+    quoted.text = "the plan"
+    quoted.forum_topic_created = None
+    first, ctx = _update(text="first")
+    second, _ = _update(text="second", reply_to=quoted, quote=None)
+
+    await _handle(bot, ctx, first, second)
+
+    user_message = agent.run.call_args.args[1]
+    assert '[replying to: "the plan"]\nsecond' in user_message
+    assert user_message.startswith("[2 messages sent together]\n\nfirst")
+
+
+async def test_messages_in_different_topics_do_not_batch() -> None:
+    bot, agent = _bot()
+    general, ctx = _update(text="general")
+    topic, _ = _update(text="topic", thread_id=5)
+
+    await _handle(bot, ctx, general, topic)
+
+    assert agent.run.await_count == 2
+    texts = sorted(c.args[1] for c in agent.run.await_args_list)
+    assert texts == ["general", "topic"]
+    assert _replies(general.message) == ["agent reply"]
+    assert _replies(topic.message) == ["agent reply"]
+
+
+async def test_messages_after_the_window_start_a_new_batch() -> None:
+    bot, agent = _bot()
+    first, ctx = _update(text="first")
+    second, _ = _update(text="second")
+
+    await _handle(bot, ctx, first)
+    await _handle(bot, ctx, second)
+
+    assert [c.args[1] for c in agent.run.await_args_list] == ["first", "second"]
+
+
+async def test_burst_of_photos_reaches_agent_as_several_images() -> None:
+    import base64
+
+    bot, agent = _bot(save_attachment_fn=_save_fn())
+    first, ctx = _update(photo=_photo_sizes(b"ONE"), caption="one")
+    second, _ = _update(photo=_photo_sizes(b"TWO"), caption="two")
+
+    await _handle(bot, ctx, first, second)
+
+    agent.run.assert_awaited_once()
+    assert agent.run.call_args.kwargs["image_data_urls"] == [
+        "data:image/jpeg;base64," + base64.b64encode(b"ONE").decode(),
+        "data:image/jpeg;base64," + base64.b64encode(b"TWO").decode(),
+    ]
+
+
+async def test_burst_outage_queues_the_combined_message_once() -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    queue_fn = MagicMock()
+    bot, agent = _bot()
+    bot._queue_message_fn = queue_fn
+    agent.run.side_effect = CopilotUnavailableError("down")
+    first, ctx = _update(text="first")
+    second, _ = _update(text="second")
+
+    await _handle(bot, ctx, first, second)
+
+    queue_fn.assert_called_once_with(777, None, telegram_bot._combine_batch(["first", "second"]))
+    assert len(_replies(second.message)) == 1
+    first.message.reply_text.assert_not_called()
+
+
+async def test_handler_returns_once_joined_and_the_batch_counts_as_pending() -> None:
+    """PTB holds a concurrency slot for the whole handler, so a handler that
+    waited for its batch would cap a burst at eight messages and stall every
+    other topic; the pending batch is what the shutdown drain counts instead."""
+    bot, app = _lifecycle_bot()
+    app.update_queue.qsize = MagicMock(return_value=0)
+    update, ctx = _update(text="hello")
+
+    await bot._handle_message(update, ctx)
+
+    agent = bot._agent
+    agent.run.assert_not_awaited()
+    assert bot._inflight_updates == 0
+    assert bot.pending_updates() == 1
+    await bot._await_batches()
+    assert _replies(update.message) == ["agent reply"]
+    assert bot.pending_updates() == 0
+
+
+async def test_drain_waits_for_open_batches() -> None:
+    bot, app = _lifecycle_bot()
+    await bot.start()
+    update, ctx = _update(text="hello")
+    await bot._handle_message(update, ctx)
+
+    await bot.drain()
+
+    app.stop.assert_awaited_once()
+    assert _replies(update.message) == ["agent reply"]
+
+
+async def test_voice_note_still_transcribing_holds_the_batch_for_its_text() -> None:
+    """Arrival is registered before transcription/download, so a text sent
+    right after a voice note waits for the transcript instead of running
+    alone with a dangling reference."""
+
+    async def slow_transcribe(data: bytes) -> str:
+        await asyncio.sleep(0.05)
+        return "voice transcript"
+
+    transcriber = MagicMock()
+    transcriber.transcribe = AsyncMock(side_effect=slow_transcribe)
+    bot, agent = _bot(transcriber=transcriber)
+    voice, ctx = _update(voice=_voice())
+    text, _ = _update(text="that one goes on the list")
+
+    await _handle(bot, ctx, voice, text)
+
+    agent.run.assert_awaited_once()
+    assert agent.run.call_args.args[1] == telegram_bot._combine_batch(
+        ["voice transcript", "that one goes on the list"]
+    )
+
+
+async def test_failed_media_preprocessing_leaves_the_batch() -> None:
+    transcriber = MagicMock()
+    transcriber.transcribe = AsyncMock(side_effect=TranscriptionError("garbled"))
+    bot, agent = _bot(transcriber=transcriber)
+    voice, ctx = _update(voice=_voice())
+    text, _ = _update(text="hello")
+
+    await _handle(bot, ctx, voice, text)
+
+    agent.run.assert_awaited_once_with(777, "hello", thread_id=None, on_research=ANY)
+    assert _replies(voice.message) == ["Couldn't transcribe that: garbled"]
+
+
+async def test_batch_without_any_item_does_not_run_the_agent() -> None:
+    bot, agent = _bot()
+    sticker, ctx = _update(text=None)
+
+    await _handle(bot, ctx, sticker)
+
+    agent.run.assert_not_awaited()
+    ctx.bot.send_chat_action.assert_not_awaited()
+
+
+async def test_typing_action_failure_does_not_lose_the_batch() -> None:
+    bot, agent = _bot()
+    update, ctx = _update(text="hello")
+    ctx.bot.send_chat_action = AsyncMock(side_effect=NetworkError("flood"))
+
+    await _handle(bot, ctx, update)
+
+    agent.run.assert_awaited_once()
+    assert _replies(update.message) == ["agent reply"]
+
+
+async def test_clear_waits_for_the_open_batch_before_forgetting() -> None:
+    """A message and /clear within the window: the message is answered
+    first, then the context goes — never a run on the emptied history."""
+    bot, agent = _bot()
+    order = MagicMock()
+    order.attach_mock(agent.run, "run")
+    order.attach_mock(agent.clear_history, "clear_history")
+    update, ctx = _update(text="pastilla tomada")
+    clear, _ = _update(text="/clear")
+    await bot._handle_message(update, ctx)
+
+    await bot._clear_cmd(clear, ctx)
+
+    assert [c[0] for c in order.mock_calls] == ["run", "clear_history"]
+    assert _replies(update.message) == ["agent reply"]
+
+
+async def test_burst_images_are_numbered_and_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    monkeypatch.setattr(telegram_bot, "_MAX_BATCH_IMAGES", 2)
+    bot, agent = _bot(save_attachment_fn=_save_fn())
+    updates = [_update(photo=_photo_sizes(data), caption=f"photo {i}")
+               for i, data in enumerate((b"ONE", b"TWO", b"THREE"), start=1)]
+    ctx = updates[0][1]
+
+    await _handle(bot, ctx, *(u for u, _ in updates))
+
+    agent.run.assert_awaited_once()
+    assert agent.run.call_args.kwargs["image_data_urls"] == [
+        "data:image/jpeg;base64," + base64.b64encode(b"ONE").decode(),
+        "data:image/jpeg;base64," + base64.b64encode(b"TWO").decode(),
+    ]
+    text = agent.run.call_args.args[1]
+    assert "photo 1\n" in text and "[image 1 of 3 in this burst]" in text
+    assert "[image 2 of 3 in this burst]" in text
+    assert (
+        "[image 3 of 3 in this burst — not shown, more than 2 at once; "
+        "extract_attachment on its stored path shows it]"
+    ) in text
+
+
+async def test_single_photo_text_carries_no_burst_numbering() -> None:
+    bot, agent = _bot(save_attachment_fn=_save_fn())
+    update, ctx = _update(photo=_photo_sizes(), caption="just one")
+
+    await _handle(bot, ctx, update)
+
+    assert "in this burst" not in agent.run.call_args.args[1]
 
 
 # ------------------------------------------------------------------
@@ -139,7 +416,7 @@ async def test_outage_queues_message_and_tells_user() -> None:
     )
     update, ctx = _update(text="pastilla tomada")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     queue_fn.assert_called_once_with(777, None, "pastilla tomada")
     (reply,) = _replies(update.message)
@@ -154,7 +431,7 @@ async def test_outage_without_queue_keeps_generic_error_reply() -> None:
     agent.run = AsyncMock(side_effect=CopilotUnavailableError("HTTP 502"))
     update, ctx = _update(text="hola")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     (reply,) = _replies(update.message)
     assert reply.startswith("Sorry, something went wrong")
@@ -180,7 +457,7 @@ async def test_reply_prepends_quoted_message_to_agent_text() -> None:
     bot, agent = _bot()
     update, ctx = _update(text="yes, do that one", reply_to=_reply_msg(text="buy oat milk"))
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     sent = agent.run.call_args.args[1]
     assert sent == '[replying to: "buy oat milk"]\nyes, do that one'
@@ -196,7 +473,7 @@ async def test_reply_partial_quote_wins_over_full_message() -> None:
     )
     bot, agent = _bot()
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     sent = agent.run.call_args.args[1]
     assert sent == '[replying to: "the second option"]\nthis one'
@@ -206,7 +483,7 @@ async def test_reply_to_media_falls_back_to_caption() -> None:
     bot, agent = _bot()
     update, ctx = _update(text="file it", reply_to=_reply_msg(caption="wine invoice"))
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     sent = agent.run.call_args.args[1]
     assert sent == '[replying to: "wine invoice"]\nfile it'
@@ -216,7 +493,7 @@ async def test_reply_without_any_text_adds_no_context() -> None:
     bot, agent = _bot()
     update, ctx = _update(text="what is this?", reply_to=_reply_msg())
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_awaited_once_with(777, "what is this?", thread_id=None, on_research=ANY)
 
@@ -225,7 +502,7 @@ async def test_reply_quote_is_truncated() -> None:
     bot, agent = _bot()
     update, ctx = _update(text="summarize", reply_to=_reply_msg(text="x" * 500))
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     sent = agent.run.call_args.args[1]
     assert sent == f'[replying to: "{"x" * 300}…"]\nsummarize'
@@ -239,7 +516,7 @@ async def test_forum_topic_service_message_is_not_a_reply() -> None:
     update, ctx = _update(text="plain topic message", reply_to=reply)
     update.message.message_thread_id = 55
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_awaited_once_with(
         777, "plain topic message", thread_id=55, on_research=ANY
@@ -254,7 +531,7 @@ async def test_reply_context_applies_to_photo_captions() -> None:
         reply_to=_reply_msg(text="which wine was it?"),
     )
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     sent = agent.run.call_args.args[1]
     assert sent.startswith('[replying to: "which wine was it?"]\n')
@@ -277,7 +554,7 @@ async def test_research_reacts_to_triggering_message() -> None:
     agent.run = AsyncMock(side_effect=run_with_research)
     update, ctx = _update(text="what's the weather in Girona?")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     update.message.set_reaction.assert_awaited_once_with(ReactionEmoji.EYES)
     assert _replies(update.message) == ["agent reply"]
@@ -287,7 +564,7 @@ async def test_no_reaction_when_agent_does_not_research() -> None:
     bot, agent = _bot()
     update, ctx = _update(text="hello")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     update.message.set_reaction.assert_not_awaited()
 
@@ -301,7 +578,7 @@ async def test_voice_message_is_transcribed_and_fed_to_agent() -> None:
     bot, agent = _bot(transcriber)
     update, ctx = _update(voice=_voice(b"OGGBYTES"))
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     transcriber.transcribe.assert_awaited_once_with(b"OGGBYTES")
     agent.run.assert_awaited_once_with(777, "buy milk tomorrow", thread_id=None, on_research=ANY)
@@ -314,7 +591,7 @@ async def test_voice_in_forum_topic_replies_into_topic() -> None:
     update, ctx = _update(voice=_voice())
     update.message.message_thread_id = 55
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_awaited_once_with(777, "topic note", thread_id=55, on_research=ANY)
     for call in update.message.reply_text.call_args_list:
@@ -325,7 +602,7 @@ async def test_voice_without_transcriber_replies_setup_hint() -> None:
     bot, agent = _bot(transcriber=None)
     update, ctx = _update(voice=_voice())
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_not_awaited()
     assert "ELEVENLABS_API_KEY" in _replies(update.message)[0]
@@ -337,7 +614,7 @@ async def test_voice_transcription_error_replies_and_skips_agent() -> None:
     bot, agent = _bot(transcriber)
     update, ctx = _update(voice=_voice())
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_not_awaited()
     assert "rate limit reached" in _replies(update.message)[0]
@@ -349,7 +626,7 @@ async def test_voice_too_large_is_rejected_before_download() -> None:
     voice = _voice(file_size=25 * 1024 * 1024)
     update, ctx = _update(voice=voice)
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     voice.get_file.assert_not_awaited()
     transcriber.transcribe.assert_not_awaited()
@@ -365,7 +642,7 @@ async def test_sticker_message_gets_fallback_reply() -> None:
     bot, agent = _bot(_transcriber())
     update, ctx = _update(text=None, voice=None)  # e.g. a sticker or video
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_not_awaited()
     assert len(_replies(update.message)) == 1
@@ -376,7 +653,7 @@ async def test_disallowed_user_is_ignored() -> None:
     update, ctx = _update(voice=_voice())
     update.effective_user.id = 999
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_not_awaited()
     update.message.reply_text.assert_not_awaited()
@@ -397,7 +674,7 @@ async def test_photo_is_saved_and_fed_to_agent_with_vision() -> None:
     bot, agent = _bot(save_attachment_fn=save_fn)
     update, ctx = _update(photo=_photo_sizes(b"JPEGBYTES"), caption="save this receipt")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     save_fn.assert_called_once_with(b"JPEGBYTES", "jpg")
     agent.run.assert_awaited_once()
@@ -406,7 +683,7 @@ async def test_photo_is_saved_and_fed_to_agent_with_vision() -> None:
     assert "save this receipt" in call.args[1]
     assert "attachments/2026-07-21-abc123.jpg" in call.args[1]
     expected_url = "data:image/jpeg;base64," + base64.b64encode(b"JPEGBYTES").decode()
-    assert call.kwargs["image_data_url"] == expected_url
+    assert call.kwargs["image_data_urls"] == [expected_url]
     assert call.kwargs["thread_id"] is None
     assert _replies(update.message) == ["agent reply"]
 
@@ -416,7 +693,7 @@ async def test_photo_downloads_largest_size() -> None:
     bot, agent = _bot(save_attachment_fn=_save_fn())
     update, ctx = _update(photo=photo)
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     photo[-1].get_file.assert_awaited_once()
     photo[0].get_file.assert_not_awaited()
@@ -426,7 +703,7 @@ async def test_photo_without_caption_gets_default_message() -> None:
     bot, agent = _bot(save_attachment_fn=_save_fn())
     update, ctx = _update(photo=_photo_sizes(), caption=None)
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_awaited_once()
     user_message = agent.run.call_args.args[1]
@@ -438,7 +715,7 @@ async def test_photo_without_save_fn_gets_fallback_reply() -> None:
     bot, agent = _bot(save_attachment_fn=None)
     update, ctx = _update(photo=_photo_sizes())
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_not_awaited()
     assert len(_replies(update.message)) == 1
@@ -633,7 +910,7 @@ async def test_pdf_document_is_saved_and_fed_to_agent() -> None:
     bot, agent = _bot(save_attachment_fn=save_fn)
     update, ctx = _update(document=_file_attachment(), caption="file this receipt")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     save_fn.assert_called_once_with(b"PDFBYTES", "pdf")
     agent.run.assert_awaited_once()
@@ -650,7 +927,7 @@ async def test_video_extension_falls_back_to_mime_type() -> None:
     video = _file_attachment(file_name=None, mime_type="video/mp4", data=b"MP4BYTES")
     update, ctx = _update(video=video, caption="save this clip")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     save_fn.assert_called_once_with(b"MP4BYTES", "mp4")
     agent.run.assert_awaited_once()
@@ -661,7 +938,7 @@ async def test_document_without_caption_gets_default_message() -> None:
     bot, agent = _bot(save_attachment_fn=save_fn)
     update, ctx = _update(document=_file_attachment(), caption=None)
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     user_message = agent.run.call_args.args[1]
     assert user_message.strip() != ""
@@ -674,7 +951,7 @@ async def test_document_too_large_is_rejected_before_download() -> None:
     doc = _file_attachment(file_size=25 * 1024 * 1024)
     update, ctx = _update(document=doc)
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     doc.get_file.assert_not_awaited()
     save_fn.assert_not_called()
@@ -686,7 +963,7 @@ async def test_document_without_save_fn_gets_fallback_reply() -> None:
     bot, agent = _bot(save_attachment_fn=None)
     update, ctx = _update(document=_file_attachment())
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     agent.run.assert_not_awaited()
     assert len(_replies(update.message)) == 1
@@ -698,7 +975,7 @@ async def test_document_in_forum_topic_threads_replies() -> None:
     update, ctx = _update(document=_file_attachment(), caption="wine invoice")
     update.message.message_thread_id = 55
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     assert agent.run.call_args.kwargs["thread_id"] == 55
     for call in update.message.reply_text.call_args_list:
@@ -710,7 +987,7 @@ async def test_photo_in_forum_topic_threads_replies() -> None:
     update, ctx = _update(photo=_photo_sizes(), caption="wine label")
     update.message.message_thread_id = 55
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     assert agent.run.call_args.kwargs["thread_id"] == 55
     for call in update.message.reply_text.call_args_list:
@@ -953,7 +1230,7 @@ async def test_chat_id_is_persisted_after_message(tmp_path: Path) -> None:
     )
     update, ctx = _update(text="hello")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     assert (tmp_path / "chat_id").read_text() == "777"
 
@@ -970,7 +1247,7 @@ async def test_pinned_chat_id_is_not_retargeted_by_later_messages(tmp_path: Path
     )
     update, ctx = _update(text="hello from another chat")
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     assert bot._chat_id == 555
     assert (tmp_path / "chat_id").read_text() == "555"
@@ -994,7 +1271,7 @@ async def test_pinned_chat_id_follows_telegram_migration(tmp_path: Path) -> None
     update.effective_user = None
     update.message.migrate_to_chat_id = 888
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     assert bot._chat_id == 888
     assert (tmp_path / "chat_id").read_text() == "888"
@@ -1015,7 +1292,7 @@ async def test_unrelated_telegram_migration_cannot_retarget_home_chat(
     update.effective_user = None
     update.message.migrate_to_chat_id = 888
 
-    await bot._handle_message(update, ctx)
+    await _handle(bot, ctx, update)
 
     assert bot._chat_id == 555
     assert (tmp_path / "chat_id").read_text() == "555"
@@ -1366,7 +1643,8 @@ def test_build_enables_concurrent_updates() -> None:
 
 async def test_pending_updates_counts_inflight_handlers() -> None:
     """With concurrent updates the queue drains into tasks immediately, so the
-    shutdown drain report must include handlers still running."""
+    shutdown drain report must include work still running — the batch whose
+    agent run is in progress, after its handler has long returned."""
     bot, agent = _bot()
     app = MagicMock()
     app.update_queue.qsize = MagicMock(return_value=1)
@@ -1388,4 +1666,5 @@ async def test_pending_updates_counts_inflight_handlers() -> None:
 
     release.set()
     await task
+    await bot._await_batches()
     assert bot.pending_updates() == 1  # only the queued one remains

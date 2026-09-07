@@ -703,7 +703,7 @@ class Agent:
         user_message: str,
         thread_id: int | None = None,
         extra_context: str | None = None,
-        image_data_url: str | None = None,
+        image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
@@ -733,7 +733,7 @@ class Agent:
                 user_message,
                 thread_id=thread_id,
                 extra_context=extra_context,
-                image_data_url=image_data_url,
+                image_data_urls=image_data_urls,
                 transient_context=transient_context,
                 on_research=on_research,
                 send_message_fn=send_message_fn,
@@ -752,7 +752,7 @@ class Agent:
         user_message: str,
         thread_id: int | None = None,
         extra_context: str | None = None,
-        image_data_url: str | None = None,
+        image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
@@ -811,12 +811,15 @@ class Agent:
             else f"{stamped_message}\n\n{transient_context}"
         )
         live_entry: dict[str, Any] | None = None
-        if image_data_url:
+        if image_data_urls:
             live_entry = {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": live_text},
-                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                    *(
+                        {"type": "image_url", "image_url": {"url": url}}
+                        for url in image_data_urls
+                    ),
                 ],
             }
         elif transient_context is not None:

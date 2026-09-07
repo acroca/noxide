@@ -1141,7 +1141,7 @@ async def test_image_is_sent_as_multimodal_content(agent: Agent) -> None:
     mock_client.chat = AsyncMock(return_value=_make_text_response("A nice plant."))
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        reply = await agent.run(chat_id=1, user_message="what plant is this?", image_data_url=_DATA_URL)
+        reply = await agent.run(chat_id=1, user_message="what plant is this?", image_data_urls=[_DATA_URL])
 
     assert reply == "A nice plant."
     messages = mock_client.chat.call_args.args[0]
@@ -1157,6 +1157,22 @@ async def test_image_is_sent_as_multimodal_content(agent: Agent) -> None:
 
 
 @pytest.mark.asyncio
+async def test_several_images_ride_the_same_user_message(agent: Agent) -> None:
+    """A burst of photos reaches the model as one turn carrying every image."""
+    second_url = "data:image/jpeg;base64,REVG"
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("two receipts"))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run(chat_id=1, user_message="file these", image_data_urls=[_DATA_URL, second_url])
+
+    messages = mock_client.chat.call_args.args[0]
+    user_msg = [m for m in messages if m["role"] == "user"][-1]
+    images = [p["image_url"]["url"] for p in user_msg["content"] if p["type"] == "image_url"]
+    assert images == [_DATA_URL, second_url]
+
+
+@pytest.mark.asyncio
 async def test_image_is_resent_on_every_iteration_of_the_same_run(agent: Agent) -> None:
     """During tool-call iterations the model must still see the image."""
     mock_client = MagicMock()
@@ -1166,7 +1182,7 @@ async def test_image_is_resent_on_every_iteration_of_the_same_run(agent: Agent) 
     ])
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="file this", image_data_url=_DATA_URL)
+        await agent.run(chat_id=1, user_message="file this", image_data_urls=[_DATA_URL])
 
     for call in mock_client.chat.call_args_list:
         messages = call.args[0]
@@ -1181,7 +1197,7 @@ async def test_image_is_not_stored_in_history_for_later_runs(agent: Agent) -> No
     mock_client.chat = AsyncMock(return_value=_make_text_response("ok"))
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="look at this", image_data_url=_DATA_URL)
+        await agent.run(chat_id=1, user_message="look at this", image_data_urls=[_DATA_URL])
         await agent.run(chat_id=1, user_message="thanks")
 
     # Second request: the earlier user message must be plain text again
