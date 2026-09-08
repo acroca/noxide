@@ -35,14 +35,19 @@ start one.
 | `web.fourget_url` | `FOURGET_URL` | unset | Base URL of a [4get](https://git.lolcat.ca/lolcat/4get) instance. Unset disables the `research` tool entirely |
 | `assistant.timezone` | `TIMEZONE` | `UTC` | IANA name, e.g. `Europe/Madrid`. Drives every local time the bot writes or says, and cron interpretation |
 | `assistant.vault_path` | `VAULT_PATH` | `./vault` | Vault directory. The Docker image sets this to `/data/vault` |
-| `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, usage JSONL. The image sets this to `/data/state` |
-| `assistant.history_size` | `HISTORY_SIZE` | `40` | Messages kept in memory per chat/topic. Bigger means more context and more tokens per turn |
+| `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, usage JSONL, maintenance bookkeeping, durable outage retry queue (`pending_runs.jsonl`), and consumed inbox snapshot (`inbox.processed.md`). The image sets this to `/data/state` |
+| `assistant.history_size` | `HISTORY_SIZE` | `40` | Completed-history message bound per chat/topic, in memory only. Active and outage-pending runs are retained intact and may exceed it; the bound is reapplied when a run completes. Bigger means more context and more tokens per turn |
 | `backup.enabled` | `BACKUP_ENABLED` | `false` | Local-only git history of the vault: one commit per interaction that changed it, plus a periodic sweep for edits arriving from outside the bot. Nothing is ever pushed. See [deployment.md](deployment.md#backups) |
 | `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
 | `maintenance.compile` | `MAINTENANCE_COMPILE` | `0 3 * * *` | Cron for the built-in nightly vault compile, on the local clock, weekdays by name. `""` disables it. See [vault.md](vault.md#operations) |
 | `maintenance.lint` | `MAINTENANCE_LINT` | `0 4 * * SUN` | Cron for the built-in weekly vault lint. `""` disables it |
 
 Paths are expanded and resolved, so `~/vault` and relative paths both work.
+Keep `state_dir` persistent and backed up alongside the vault. Losing it can
+lose queued work and replay already-consumed inbox entries; restoring older
+state can also replay retries that had already completed. It contains private
+message and inbox content as well as credentials, not just disposable caches.
+
 To intentionally move proactive delivery, stop the bot, delete
 `state_dir/chat_id`, update `default_chat_id` if it is set, and restart.
 

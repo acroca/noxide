@@ -8,6 +8,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Leave headroom after lifecycle's 270-second application drain.
+_FINAL_DRAIN_BUDGET = 10.0
+
 
 def _setup_logging() -> None:
     logging.basicConfig(
@@ -122,6 +125,7 @@ async def _run(config_path: Path | None) -> None:
         reply = await agent.retry_message(chat_id, thread_id, text, queued_at, hot=hot)
         if reply is None:
             return  # superseded — correctly silent
+        _require_completed(reply)
         try:
             await bot.send_message(reply or "(no reply)", thread_id, chat_id=chat_id)
         except Exception:
@@ -147,13 +151,13 @@ async def _run(config_path: Path | None) -> None:
                 f"dropped: {item.text[:200]}"
             )
 
-    async def replay_job(prompt: str) -> None:
-        await agent.run_job(prompt)
+    async def run_job(prompt: str) -> None:
+        _require_completed(await agent.run_job(prompt))
 
     retry_queue = RetryQueue(
         cfg.state_dir,
         replay_message_fn=replay_message,
-        replay_job_fn=replay_job,
+        replay_job_fn=run_job,
         notify_drop_fn=notify_drop,
         tz_name=cfg.timezone,
     )
@@ -204,11 +208,6 @@ async def _run(config_path: Path | None) -> None:
         research_fn=researcher.research if researcher else None,
     )
 
-    # Init scheduler (needs agent for job firing; closure resolves the
-    # agent name late — it is constructed below)
-    async def run_job(prompt: str) -> None:
-        await agent.run_job(prompt)
-
     # The built-ins ride the same scheduler as the table's rows; their
     # last-success bookkeeping lives in the state dir.
     scheduler = Scheduler(
@@ -237,65 +236,90 @@ async def _run(config_path: Path | None) -> None:
     )
     bot._agent = agent  # wire back
 
-    # Start scheduler
-    scheduler.start()
-    scheduler.reload()
-
-    # Start watchfiles poll for schedule.md
-    poll_task = asyncio.create_task(_poll_schedule(scheduler))
-
-    # Start usage flush loop
     usage_task = asyncio.create_task(tracker.run())
-
-    # SIGTERM/SIGINT start a drain that lets in-flight work finish; a second
-    # signal abandons it. See lifecycle.py for why the ordering matters.
     lifecycle = Lifecycle()
     lifecycle.install()
-    # The stop event doubles as the abort switch for startup's network
-    # retries, so a SIGTERM during an outage still shuts down promptly.
-    await bot.start(abort=lifecycle.stop)
-
-    # Drain the outage retry queue (items reloaded from a previous run, plus
-    # anything queued live). After bot.start() so replayed replies can deliver.
-    retry_task = asyncio.create_task(retry_queue.run())
-
-    # Fire recurring jobs missed while the service was down. After bot.start()
-    # so the late runs can deliver; reload() above already backfilled `next`
-    # baselines for rows that had none. Skipped when a signal already aborted
-    # startup — the runs would only stall the shutdown drain and, failing,
-    # burn nothing but time; `next` stays past, so the next boot catches up.
-    if not lifecycle.stop.is_set():
-        scheduler.catch_up()
-
-    # Ingest offline captures from inbox.md. Ordering matters: the backup's
-    # startup sweep (init_repo above) has already committed the pre-boot file,
-    # the scheduler is up so entries can create reminders, and the bot is up
-    # so the summary can be delivered. Cancelled mid-run, the file is left
-    # untouched and the next startup retries.
-    from .inbox import ingest as ingest_inbox
-
-    inbox_task = asyncio.create_task(
-        ingest_inbox(cfg.vault_path, agent.run_job, backup=backup)
-    )
-
+    background: list[asyncio.Task] = []
     try:
+        await bot.start(abort=lifecycle.stop)
+        if not lifecycle.stop.is_set():
+            # Even overdue date jobs must wait for Telegram readiness, not
+            # just recurring catch-up: a failed delivery consumes a one-off.
+            scheduler.start()
+            scheduler.reload()
+            scheduler.catch_up()
+            background.append(asyncio.create_task(_poll_schedule(scheduler)))
+            background.append(asyncio.create_task(retry_queue.run()))
+
+            from .inbox import ingest as ingest_inbox
+
+            # The checkpoint records consumed captures without modifying the
+            # externally edited inbox. Cancelled runs leave it unchanged.
+            background.append(asyncio.create_task(ingest_inbox(
+                cfg.vault_path, agent.run_job, backup=backup, state_dir=cfg.state_dir
+            )))
         await lifecycle.wait()
     finally:
-        lifecycle.remove()
-        inbox_task.cancel()
-        # Stop replaying queued work mid-shutdown; unfinished items are on
-        # disk and the next startup reprocesses them.
-        retry_task.cancel()
-        # Stop reloading schedule.md so it cannot register jobs mid-shutdown
-        poll_task.cancel()
-        await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force)
-        usage_task.cancel()
-        await tracker.drain()
-        # After the drain: every finished run has scheduled its commit by now.
-        if backup is not None:
-            if backup_task is not None:
-                backup_task.cancel()
-            await backup.drain()
+        try:
+            for task in background:
+                task.cancel()
+            await asyncio.gather(*background, return_exceptions=True)
+            await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force)
+        finally:
+            try:
+                await _drain_final(
+                    [("usage telemetry", tracker, usage_task)]
+                    + ([("vault backup", backup, backup_task)] if backup is not None else []),
+                    lifecycle.force,
+                )
+            finally:
+                # The second signal must retain its controlled force path
+                # throughout the drain, rather than reverting to SIG_DFL.
+                lifecycle.remove()
+
+
+async def _drain_final(
+    components: list[tuple[str, Any, asyncio.Task | None]], force: asyncio.Event
+) -> None:
+    """Flush independent final state without ignoring a second shutdown signal."""
+    workers = [task for _, _, task in components if task is not None]
+    for task in workers:
+        task.cancel()
+
+    async def finish(component: Any, worker: asyncio.Task | None) -> None:
+        if worker is not None:
+            await asyncio.gather(worker, return_exceptions=True)
+        await component.drain()
+
+    drains = [asyncio.create_task(finish(component, task)) for _, component, task in components]
+    flushed = asyncio.gather(*drains, return_exceptions=True)
+    forced = asyncio.create_task(force.wait())
+    try:
+        await asyncio.wait(
+            {flushed, forced}, timeout=_FINAL_DRAIN_BUDGET,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        logger = logging.getLogger(__name__)
+        for (name, _, _), task in zip(components, drains, strict=True):
+            if not task.done():
+                logger.warning(
+                    "Dropping unfinished final %s flush (%s); pending data may not be persisted",
+                    name, "forced shutdown" if force.is_set() else "deadline or cancellation",
+                )
+                task.cancel()
+        forced.cancel()
+        await asyncio.gather(flushed, forced, *workers, return_exceptions=True)
+        for (name, _, _), task in zip(components, drains, strict=True):
+            if not task.cancelled() and (exc := task.exception()) is not None:
+                logger.error("Final %s flush failed; pending data may not be persisted", name, exc_info=exc)
+
+
+def _require_completed(reply: str) -> None:
+    from .agent import MAX_ITERATIONS_REPLY
+
+    if reply == MAX_ITERATIONS_REPLY:
+        raise RuntimeError("Agent reached its iteration limit before completing the run")
 
 
 async def _poll_schedule(scheduler: Any) -> None:

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from assistant.responses import (
     OUTPUT_KEY,
+    RequestError,
     StreamError,
     build_payload,
     parse_response,
@@ -438,8 +439,32 @@ async def test_read_sse_surfaces_failed_response() -> None:
 async def test_read_sse_surfaces_error_event() -> None:
     lines = _event("error", code="rate_limit", message="slow down")
 
-    with pytest.raises(StreamError, match="slow down"):
+    with pytest.raises(RequestError, match="slow down"):
         await read_sse(_Stream(lines))
+
+
+@pytest.mark.parametrize("kind", ["error", "response.failed"])
+@pytest.mark.parametrize("code", ["invalid_request_error", "rate_limit_exceeded", "unknown"])
+async def test_read_sse_rejections_are_not_transient(kind: str, code: str) -> None:
+    error = {"code": code, "message": "rejected"}
+    fields = error if kind == "error" else {"response": {"error": error}}
+    with pytest.raises(RequestError, match=code):
+        await read_sse(_Stream(_event(kind, **fields)))
+
+
+def test_refusal_text_survives_both_endpoint_round_trips() -> None:
+    from assistant.copilot import _chat_payload
+
+    output = [{
+        "type": "message", "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "I cannot help with that."}],
+    }]
+    message = parse_response(_completed(output))["choices"][0]["message"]
+    assert message["content"] == "I cannot help with that."
+    assert build_payload("m", [message], None, None)["input"] == output
+    assert _chat_payload("m", [message], None, None)["messages"] == [
+        {"role": "assistant", "content": "I cannot help with that."}
+    ]
 
 
 async def test_read_sse_skips_unparseable_lines() -> None:

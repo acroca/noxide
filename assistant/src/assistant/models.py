@@ -160,6 +160,13 @@ def resolve_startup(
     if default_family:
         latest = latest_of_family(fetched, default_family)
         if latest is not None:
-            alias = next(a for a, o in options.items() if o.id == latest.id)
-            return options, alias, latest.id
-    return options, default_alias, None
+            alias = next((a for a, o in options.items() if o.id == latest.id), None)
+            if alias is not None:
+                return options, alias, latest.id
+    default_id = config_models[default_alias]
+    alias = next((a for a, o in options.items() if o.id == default_id), None)
+    if alias is None:
+        # A pinned alias may shadow the fetched slug of the configured default.
+        options[default_alias] = ModelOption(id=default_id, label=default_alias)
+        alias = default_alias
+    return options, alias, None

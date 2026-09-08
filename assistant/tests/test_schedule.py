@@ -430,6 +430,112 @@ async def test_drain_is_safe_before_start(tmp_path: Path) -> None:
     assert await sched.drain(timeout=5) == 0
 
 
+@pytest.mark.parametrize("timeout", [0.01, 1.0])
+async def test_drain_waits_for_real_executor_jobs(tmp_path: Path, timeout: float) -> None:
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def slow_job(prompt: str) -> None:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.set()
+
+    sched = Scheduler(VaultTools(tmp_path), slow_job)
+    sched.start()
+    sched._apscheduler.add_job(
+        sched._fire, "date", run_date=datetime.now(UTC), args=["live", "test", True]
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    unfinished = await sched.drain(timeout)
+    assert unfinished == (1 if timeout < 0.05 else 0)
+    assert finished.is_set() == (timeout > 0.05)
+    assert not sched._apscheduler.running
+
+
+async def test_cancelled_drain_shuts_down_scheduler(tmp_path: Path) -> None:
+    started = asyncio.Event()
+
+    async def hang(prompt: str) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    sched = Scheduler(VaultTools(tmp_path), hang)
+    sched.start()
+    sched._apscheduler.add_job(
+        sched._fire, "date", run_date=datetime.now(UTC), args=["live", "test", True]
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    drain = asyncio.create_task(sched.drain(10))
+    await asyncio.sleep(0)
+    drain.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await drain
+    assert not sched._apscheduler.running
+
+
+async def test_drain_pauses_new_fires_while_waiting_for_existing_run(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    fired: list[str] = []
+
+    async def job(prompt: str) -> None:
+        fired.append(prompt)
+        started.set()
+        await release.wait()
+
+    sched = Scheduler(VaultTools(tmp_path), job)
+    sched.start()
+    sched._apscheduler.add_job(
+        sched._fire, "date", run_date=datetime.now(UTC), args=["live", "live", True]
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    sched._apscheduler.add_job(
+        sched._fire, "date", run_date=datetime.now(UTC) + timedelta(milliseconds=20),
+        args=["later", "later", True],
+    )
+    drain = asyncio.create_task(sched.drain(1))
+    try:
+        await asyncio.sleep(0.05)
+        assert fired == ["live"]
+        assert not drain.done()
+    finally:
+        release.set()
+        assert await drain == 0
+
+
+def test_large_schedule_is_never_truncated_by_a_mutation(scheduler: Scheduler) -> None:
+    entries = [
+        ScheduleEntry(str(i), "0 8 * * *", True, "x" * 1000, "2026-01-01")
+        for i in range(120)
+    ]
+    scheduler._write_entries(entries)
+    assert len(scheduler._vault.read_file_full("system/schedule.md")) > 100_000
+    assert "[truncated" in scheduler._vault.read_file("system/schedule.md")
+    scheduler.cancel_scheduled("0")
+    assert [e.id for e in scheduler._read_entries()] == [str(i) for i in range(1, 120)]
+    scheduler.reload()  # the backfill is another whole-table mutation
+    assert len(scheduler._read_entries()) == 119
+    assert all(e.next for e in scheduler._read_entries())
+
+
+def test_failed_schedule_replace_preserves_existing_jobs(
+    scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from assistant import atomic
+
+    scheduler.schedule("0 8 * * *", "Keep this reminder", True)
+    before = scheduler._vault.read_file_full("system/schedule.md")
+
+    def fail_replace(*args: object) -> None:
+        raise OSError("disk failure")
+
+    monkeypatch.setattr(atomic.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk failure"):
+        scheduler.schedule("0 9 * * *", "New reminder", True)
+    assert scheduler._vault.read_file_full("system/schedule.md") == before
+    assert len(scheduler._read_entries()) == 1
+
+
 # ------------------------------------------------------------------
 # A write must not lose what the read could not parse
 # ------------------------------------------------------------------

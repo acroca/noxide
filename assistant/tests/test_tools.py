@@ -1,13 +1,16 @@
 """Tests for path jail in VaultTools."""
 
+import errno
+import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from assistant.tools import VaultTools, slug_from_name
+from assistant.tools import VaultTools, _version_of, slug_from_name
 
 
 @pytest.fixture
@@ -726,3 +729,104 @@ def test_check_vault_skips_maintenance_jobs_that_are_disabled(tmp_path: Path) ->
 
     assert "lint" not in VaultTools(tmp_path, maintenance=("compile",)).check_vault()
     assert "lint" in VaultTools(tmp_path).check_vault()
+
+
+def test_full_internal_read_is_uncapped_and_not_a_tool(vault: VaultTools) -> None:
+    content = "x" * 150_000 + "\nlast schedule row\n"
+    vault.write_file("system/schedule.md", content)
+
+    assert vault.read_file_full("system/schedule.md") == content
+    assert "truncated" in vault.read_file("system/schedule.md")
+    assert vault.read_file_full("missing.md") == "[file not found: missing.md]"
+    assert "read_file_full" not in {s["function"]["name"] for s in vault.tool_schemas()}
+    assert vault.dispatch("read_file_full", {"path": "system/schedule.md"}).startswith(
+        "[unknown tool:"
+    )
+    with pytest.raises(PermissionError):
+        vault.read_file_full("../outside.md")
+
+
+@pytest.mark.parametrize("content", ["original\n", "x" * 150_000])
+def test_read_token_and_display_share_one_snapshot(vault: VaultTools, content: str) -> None:
+    with patch.object(Path, "read_text", side_effect=[content, "unseen hand edit"]) as read:
+        result = vault.dispatch("read_file", {"path": "note.md"})
+
+    assert read.call_count == 1
+    assert result.startswith(content[:100_000])
+    assert result.endswith(f"[version: {_version_of(content)}]")
+    assert ("truncated" in result) == (len(content) > 100_000)
+
+
+@pytest.mark.parametrize("operation", ["write_file", "rewrite_file", "edit_file", "create_file"])
+@pytest.mark.parametrize("failure", ["fsync", "replace"])
+def test_atomic_write_failures_preserve_destination_and_clean_temp(
+    vault: VaultTools, tmp_path: Path, operation: str, failure: str,
+) -> None:
+    original = "valuable original\n"
+    if operation != "create_file":
+        vault.write_file("note.md", original)
+    # Creation publishes by link rather than replace.
+    target = "link" if operation == "create_file" and failure == "replace" else failure
+    with patch(f"assistant.atomic.os.{target}", side_effect=OSError(errno.ENOSPC, "disk full")):
+        with pytest.raises(OSError, match="disk full"):
+            if operation == "rewrite_file":
+                vault.rewrite_file("note.md", "replacement", _version_of(original))
+            elif operation == "edit_file":
+                vault.edit_file("note.md", "original", "replacement")
+            else:
+                getattr(vault, operation)("note.md", "replacement")
+
+    if operation == "create_file":
+        assert not (tmp_path / "note.md").exists()
+        assert list(tmp_path.iterdir()) == []
+    else:
+        assert vault.read_file_full("note.md") == original
+        assert list(tmp_path.iterdir()) == [tmp_path / "note.md"]
+
+
+def test_atomic_write_preserves_permissions_and_unrelated_temp(vault: VaultTools, tmp_path: Path) -> None:
+    vault.write_file("note.md", "original")
+    (tmp_path / "note.md").chmod(0o640)
+    (tmp_path / "note.md.tmp").write_text("unrelated file")
+
+    vault.write_file("note.md", "replacement")
+
+    assert (tmp_path / "note.md").stat().st_mode & 0o777 == 0o640
+    assert (tmp_path / "note.md.tmp").read_text() == "unrelated file"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["note.md", "note.md.tmp"]
+
+
+def test_encoding_failure_during_write_leaves_original_intact(vault: VaultTools, tmp_path: Path) -> None:
+    vault.write_file("note.md", "original")
+
+    with pytest.raises(UnicodeEncodeError):
+        vault.write_file("note.md", "unencodable surrogate: \ud800")
+
+    assert vault.read_file_full("note.md") == "original"
+    assert list(tmp_path.iterdir()) == [tmp_path / "note.md"]
+
+
+def test_create_file_refuses_a_concurrent_creation(vault: VaultTools, tmp_path: Path) -> None:
+    link = os.link
+
+    def concurrent_create(src, dst):
+        dst.write_text("another writer's content")
+        link(src, dst)
+
+    with patch("assistant.atomic.os.link", side_effect=concurrent_create):
+        result = vault.create_file("note.md", "must not overwrite")
+
+    assert result.startswith("[create error:")
+    assert vault.read_file_full("note.md") == "another writer's content"
+    assert list(tmp_path.iterdir()) == [tmp_path / "note.md"]
+
+
+def test_move_binary_attachment_returns_success(vault: VaultTools, tmp_path: Path) -> None:
+    data = b"\xff\xd8JPEG\x00\xff"
+    source = vault.save_attachment(data)
+
+    result = vault.move_file(source, "attachments/renamed.jpg")
+
+    assert result == f"Moved {source} to attachments/renamed.jpg"
+    assert not (tmp_path / source).exists()
+    assert (tmp_path / "attachments/renamed.jpg").read_bytes() == data

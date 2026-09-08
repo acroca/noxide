@@ -246,10 +246,24 @@ def _read_prompt(name: str) -> str:
 
 
 class ConversationHistory:
-    """Keeps the last N messages per chat."""
+    """Bound completed history, retaining active and outage-pending work intact."""
 
     def __init__(self, max_size: int = 40) -> None:
+        self._max_size = max_size
+        self._unfinished = False
         self._history: deque[dict[str, Any]] = deque(maxlen=max_size)
+
+    def begin_run(self) -> None:
+        # Only completed history is compacted/evictable. Pending work must
+        # survive both long tool loops and any number of outage retries.
+        if not self._unfinished:
+            self.compact_tool_results()
+            self._history = deque(self._history)
+        self._unfinished = True
+
+    def finish_run(self) -> None:
+        self._history = deque(self._history, maxlen=self._max_size)
+        self._unfinished = False
 
     def append(self, msg: dict[str, Any]) -> None:
         self._history.append(msg)
@@ -361,6 +375,7 @@ class Agent:
         # produce tool messages the API rejects. Different conversations
         # (other topics, scheduled jobs on chat 0) run in parallel.
         self._run_locks: dict[tuple[int, int | None], asyncio.Lock] = {}
+        self._topic_lock = asyncio.Lock()
         self._history_size = history_size
         self._tz = ZoneInfo(tz_name)
 
@@ -681,16 +696,26 @@ class Agent:
             topic_name: str = args["name"]
             if "\r" in topic_name or "\n" in topic_name:
                 return "[tool error: topic name must be a single line]"
-            forum_topic = await self._create_forum_topic_fn(topic_name)
-            thread_id = forum_topic["message_thread_id"]
             slug = slug_from_name(topic_name)
-            # Create the topic prompt placeholder
-            self._vault.write_file(
-                f"system/topics/{slug}/AGENTS.md",
-                f"# Topic: {topic_name}\n\n<!-- Add topic-specific instructions here -->\n",
-            )
-            # Register in index
-            self._register_topic(thread_id, slug, topic_name)
+            if not slug.strip("-"):
+                return "[tool error: topic name must contain ASCII letters or digits]"
+            async with self._topic_lock:
+                index = self._vault.read_file(_TOPIC_INDEX_FILE)
+                registered = any(
+                    row and row[1] == slug
+                    for row in (_parse_topic_row(line) for line in index.splitlines())
+                )
+                if registered or self._vault.abs_path(f"system/topics/{slug}").exists():
+                    return f"[tool error: topic slug {slug!r} already exists; choose another name]"
+                forum_topic = await self._create_forum_topic_fn(topic_name)
+                thread_id = forum_topic["message_thread_id"]
+                # A vault edit can land while Telegram is creating the topic.
+                # create_file refuses to overwrite it, unlike internal writes.
+                self._vault.create_file(
+                    f"system/topics/{slug}/AGENTS.md",
+                    f"# Topic: {topic_name}\n\n<!-- Add topic-specific instructions here -->\n",
+                )
+                self._register_topic(thread_id, slug, topic_name)
             return (
                 f"Topic '{topic_name}' created successfully. "
                 f"thread_id={thread_id}, slug='{slug}'."
@@ -772,10 +797,7 @@ class Agent:
         """
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
-        # Everything already in history belongs to finished runs (this run
-        # holds the conversation lock): shed the heavy tool outputs before
-        # they ride every request of this run, cold.
-        history.compact_tool_results()
+        history.begin_run()
         touched: set[str] = set()
 
         # Messages a scheduled run delivered to this conversation since its
@@ -842,6 +864,13 @@ class Agent:
                 if unwind_on_unavailable:
                     history.pop_if_last(user_entry)
                 raise
+            except Exception:
+                # A rejected request is terminal, not outage-pending work.
+                # Bound it so the next run can compact oversized outputs;
+                # retain the real tail (no success reply to supersede retries).
+                # CancelledError is a BaseException and preserves pending work.
+                history.finish_run()
+                raise
 
             choice = response["choices"][0]
             msg = choice["message"]
@@ -881,6 +910,7 @@ class Agent:
                         finish_reason,
                         json.dumps(msg, ensure_ascii=False)[:4000],
                     )
+                history.finish_run()
                 return msg.get("content") or "", touched
 
             # Execute tool calls
@@ -888,7 +918,7 @@ class Agent:
                 fn_name = tc["function"]["name"]
                 try:
                     fn_args = json.loads(tc["function"].get("arguments", "{}"))
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     logger.warning(
                         "tool %s: unparseable arguments, dispatching with {}: %s",
                         fn_name,
@@ -896,7 +926,6 @@ class Agent:
                     )
                     fn_args = {}
                 total_tool_calls += 1
-                touched |= _paths_touched(fn_name, fn_args)
                 if fn_name == "research" and on_research is not None:
                     try:
                         await on_research()
@@ -905,6 +934,9 @@ class Agent:
                     on_research = None  # notify at most once per run
                 failure_tb = ""
                 try:
+                    if not isinstance(fn_args, dict):
+                        raise ValueError("tool arguments must be a JSON object")
+                    touched |= _paths_touched(fn_name, fn_args)
                     timeout = _TOOL_TIMEOUTS.get(fn_name, _TOOL_TIMEOUT)
                     result = await asyncio.wait_for(
                         self._dispatch_tool(fn_name, fn_args, send_message_fn),
@@ -967,39 +999,31 @@ class Agent:
         Raises CopilotUnavailableError while the outage lasts, so the retry
         queue keeps the item.
         """
-        if hot:
-            # Peeked outside the run lock: a concurrent run can only leave a
-            # user/tool/assistant-with-tools tail (no false drop); worst case
-            # is a redundant "everything's handled" reply after racing one.
-            msgs = self._get_history(chat_id, thread_id).messages()
-            if not msgs:
-                logger.info(
-                    "Dropping queued message for chat_id=%d thread_id=%s: history cleared",
-                    chat_id, thread_id,
+        lock = self._run_locks.setdefault((chat_id, thread_id), asyncio.Lock())
+        async with lock:
+            if hot:
+                msgs = self._get_history(chat_id, thread_id).messages()
+                if not msgs:
+                    return None  # /clear deliberately supersedes queued work
+                last = msgs[-1]
+                if last.get("role") == "assistant" and not extract_tool_calls(last):
+                    return None  # a completed run saw all pending work
+                note = (
+                    "[Copilot went down mid-conversation and is back now — review the "
+                    "messages above and finish handling anything still unanswered or "
+                    "incomplete]"
                 )
-                return None
-            last = msgs[-1]
-            if last.get("role") == "assistant" and not extract_tool_calls(last):
-                logger.info(
-                    "Dropping queued message for chat_id=%d thread_id=%s: already covered "
-                    "by a later run", chat_id, thread_id,
+            else:
+                note = (
+                    f"[this message was originally sent {queued_at} and delayed by a Copilot "
+                    f"outage; it may have been partially processed before the failure] {text}"
                 )
-                return None
-            note = (
-                "[Copilot went down mid-conversation and is back now — review the "
-                "messages above and finish handling anything still unanswered or "
-                "incomplete]"
-            )
-            return await self.run(
+            reply, touched = await self._run_locked(
                 chat_id, note, thread_id=thread_id, unwind_on_unavailable=True
             )
-        note = (
-            f"[this message was originally sent {queued_at} and delayed by a Copilot "
-            f"outage; it may have been partially processed before the failure] {text}"
-        )
-        return await self.run(
-            chat_id, note, thread_id=thread_id, unwind_on_unavailable=True
-        )
+        if self._backup is not None and touched:
+            self._backup.schedule_commit(touched, trigger=note, response=reply)
+        return reply
 
     async def run_job(self, prompt: str) -> str:
         """Run a scheduled-job prompt (chat_id 0, no thread).

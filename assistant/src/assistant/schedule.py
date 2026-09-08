@@ -217,17 +217,23 @@ class Scheduler:
         Returns the number of jobs still unfinished when `timeout` expired
         (0 when everything completed, which is the common idle case).
         """
-        # SchedulerNotRunningError when shutdown races a failed startup
+        # Shutting down the asyncio executor cancels its jobs, even with
+        # wait=True. Pause submissions first and shut down only after draining.
         with contextlib.suppress(Exception):
-            self._apscheduler.shutdown(wait=False)
-            # AsyncIOScheduler._shutdown is @run_in_event_loop, so it only takes
-            # effect on the next tick — yield, or jobs can still fire under us.
+            self._apscheduler.pause()
+        try:
+            # Jobs submitted before pause may not have entered _fire yet.
             await asyncio.sleep(0)
-        if not self._inflight:
-            return 0
-        logger.info("Waiting for %d in-flight scheduled job(s)", len(self._inflight))
-        _, pending = await asyncio.wait(set(self._inflight), timeout=timeout)
-        return len(pending)
+            if not self._inflight:
+                return 0
+            logger.info("Waiting for %d in-flight scheduled job(s)", len(self._inflight))
+            _, pending = await asyncio.wait(set(self._inflight), timeout=timeout)
+            return len(pending)
+        finally:
+            # Also stop the executor when the deadline or force signal wins.
+            with contextlib.suppress(Exception):
+                self._apscheduler.shutdown(wait=False)
+                await asyncio.sleep(0)
 
     # ------------------------------------------------------------------
     # schedule.md I/O
@@ -240,7 +246,7 @@ class Scheduler:
         table back in full, so a row the parser skipped is a row the next write
         erases — that is how a single malformed row cost an entire schedule.
         """
-        text = self._vault.read_file(_SCHEDULE_FILE)
+        text = self._vault.read_file_full(_SCHEDULE_FILE)
         if text.startswith("[file not found"):
             return [], []
         entries = []

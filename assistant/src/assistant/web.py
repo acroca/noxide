@@ -96,7 +96,7 @@ def _pin_request(url: str, address: str) -> tuple[str, dict[str, str], dict[str,
     ip_literal = f"[{address}]" if ":" in address else address
     netloc = ip_literal if parsed.port is None else f"{ip_literal}:{parsed.port}"
     host_header = host if parsed.port is None else f"{host}:{parsed.port}"
-    headers = {"User-Agent": _USER_AGENT, "Host": host_header}
+    headers = {"User-Agent": _USER_AGENT, "Host": host_header, "Accept-Encoding": "identity"}
     extensions: dict[str, Any] = {}
     if parsed.scheme == "https":
         extensions["sni_hostname"] = host
@@ -176,15 +176,24 @@ class WebTools:
                             continue
                         if r.status_code >= 400:
                             return f"[tool error: fetch failed: HTTP {r.status_code}]"
+                        # aiter_bytes decompresses before yielding, without an output
+                        # bound. Refuse servers ignoring identity before reading a byte.
+                        content_encoding = r.headers.get("content-encoding", "").strip().lower()
+                        if content_encoding not in ("", "identity"):
+                            return f"[fetch blocked: unsupported content encoding {content_encoding!r}]"
                         body, total = [], 0
                         async for chunk in r.aiter_bytes():
+                            chunk = chunk[:_MAX_RESPONSE_BYTES - total]
                             body.append(chunk)
                             total += len(chunk)
                             if total >= _MAX_RESPONSE_BYTES:
                                 break
                         content_type = r.headers.get("content-type", "")
                         encoding = r.charset_encoding or "utf-8"
-                    return _extract_text(b"".join(body), content_type, encoding)
+                    text = _extract_text(b"".join(body), content_type, encoding)
+                    if total >= _MAX_RESPONSE_BYTES:
+                        text += f"\n[truncated at {_MAX_RESPONSE_BYTES} response bytes]"
+                    return text
                 return "[tool error: too many redirects]"
         except httpx.HTTPError as e:
             return f"[tool error: fetch failed: {e}]"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -294,3 +295,60 @@ async def test_run_survives_flush_exceptions(
     task.cancel()
 
     assert len(calls) >= 2
+
+
+async def test_shutdown_flushes_event_held_during_debounce(
+    tracker: UsageTracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze(tracker, monkeypatch, "2026-07-23T10:00:00")
+    monkeypatch.setattr(usage, "_DEBOUNCE_SECONDS", 60)
+    tracker.record("agent", "m", {"prompt_tokens": 7})
+    task = asyncio.create_task(tracker.run())
+    await asyncio.sleep(0)
+    assert tracker._queue.empty()
+    task.cancel()
+    # Same ordering as production: cancellation need not have been delivered.
+    await tracker.drain()
+    await asyncio.gather(task, return_exceptions=True)
+    events = (tmp_path / "state/usage/usage-2026-07.jsonl").read_text().splitlines()
+    assert len(events) == 1
+    assert json.loads(events[0])["prompt_tokens"] == 7
+
+
+async def test_shutdown_joins_thread_flush_before_starting_another(
+    tracker: UsageTracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze(tracker, monkeypatch, "2026-07-23T10:00:00")
+    monkeypatch.setattr(usage, "_DEBOUNCE_SECONDS", 0)
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_flush = tracker._flush
+    batches: list[int] = []
+
+    def blocked_flush(events: list) -> None:
+        batches.append(len(events))
+        if len(batches) == 1:
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+        real_flush(events)
+
+    monkeypatch.setattr(tracker, "_flush", blocked_flush)
+    tracker.record("agent", "m", {"prompt_tokens": 1})
+    task = asyncio.create_task(tracker.run())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        tracker.record("agent", "m", {"prompt_tokens": 2})
+        drain = asyncio.create_task(tracker.drain())
+        await asyncio.sleep(0.01)
+        assert not drain.done()
+        assert batches == [1]
+        release.set()
+        await asyncio.wait_for(drain, 2)
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    events = (tmp_path / "state/usage/usage-2026-07.jsonl").read_text().splitlines()
+    assert [json.loads(e)["prompt_tokens"] for e in events] == [1, 2]

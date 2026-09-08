@@ -31,6 +31,7 @@ from .vault_check_events import event_findings
 from .vault_check_pages import (
     _LINK_RX,
     _NOW_PATH,
+    _content_lines,
     _iso_date,
     _normalize,
     page_findings,
@@ -168,7 +169,7 @@ def _mirror_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> lis
             continue
         if rel.startswith("wiki/archive/"):
             continue
-        for i, line in enumerate(lines, 1):
+        for i, line in _content_lines(lines):
             if m := _OPEN_TASK.match(line):
                 tasks.append((rel, i, m.group("text")))
 
@@ -188,7 +189,7 @@ def _mirror_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> lis
     findings = []
     mirror_lines = [
         (i, m.group("text"))
-        for i, line in enumerate(now_lines, 1)
+        for i, line in _content_lines(now_lines)
         if (m := _OPEN_TASK.match(line))
     ]
     mirror_texts = [_normalize(text) for _, text in mirror_lines]
@@ -241,7 +242,7 @@ def _log_dates(root: Path) -> dict[str, date] | None:
     except OSError:
         return None
     latest: dict[str, date] = {}
-    for line in lines:
+    for _, line in _content_lines(lines):
         m = _LOG_ENTRY_RX.match(line)
         if m is None:
             continue
@@ -260,7 +261,7 @@ def _overdue_findings(
         # now.md mirrors every task: reporting its copy would double each finding.
         if rel == _NOW_PATH or rel.startswith("wiki/archive/"):
             continue
-        for i, line in enumerate(lines, 1):
+        for i, line in _content_lines(lines):
             m = _OPEN_TASK.match(line)
             if m is None:
                 continue
@@ -344,7 +345,7 @@ def _weekday_pairs(rel: str, line: str) -> list[tuple[str, str]]:
 def _weekday_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
     findings = []
     for rel, lines in wiki_files:
-        for i, line in enumerate(lines, 1):
+        for i, line in _content_lines(lines):
             for weekday, iso in _weekday_pairs(rel, line):
                 if issue := _check_pair(weekday, iso):
                     findings.append((_WEEKDAY_HEADING, f"{rel}:{i}: {issue}"))
@@ -378,7 +379,7 @@ def _schedule_rows(root: Path) -> list[tuple[int, str, str, str, str]] | None:
     except OSError:
         return None
     rows = []
-    for i, line in enumerate(lines, 1):
+    for i, line in _content_lines(lines):
         cells = line.split("|")
         if len(cells) < 4:
             continue
@@ -401,7 +402,7 @@ def _reminder_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> l
     findings = []
     marked: set[str] = set()
     for rel, lines in wiki_files:
-        for i, line in enumerate(lines, 1):
+        for i, line in _content_lines(lines):
             for job_id in _REMINDER_MARKER.findall(line):
                 marked.add(job_id)
                 if job_id not in all_ids:
@@ -527,7 +528,7 @@ def _routine_findings(root: Path) -> list[tuple[str, str]]:
     except OSError:
         return []
     findings = []
-    for i, line in enumerate(lines, 1):
+    for i, line in _content_lines(lines):
         cells = line.split("|")
         if len(cells) < 6:
             continue
@@ -576,7 +577,7 @@ def _index_findings(root: Path) -> list[tuple[str, str]]:
             lines = (root / rel).read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-        for i, line in enumerate(lines, 1):
+        for i, line in _content_lines(lines):
             for target in _LINK_RX.findall(line):
                 resolved = resolve_link(rel, target)
                 if resolved is None or not (
@@ -618,7 +619,7 @@ def _version_token_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tup
             f"{rel}:{i}: leaked read_file version token — delete this line",
         )
         for rel, lines in wiki_files
-        for i, line in enumerate(lines, 1)
+        for i, line in _content_lines(lines)
         if _VERSION_TOKEN_LINE.match(line)
     ]
 

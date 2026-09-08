@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from assistant import vault_check
+from assistant.atomic import atomic_write_text
 
 # Generous enough that no hand-written vault page realistically hits it, low
 # enough that a runaway file cannot displace the conversation.
@@ -31,6 +32,16 @@ def _version_of(text: str) -> str:
     full-rewrite analogue of ``edit_file``'s exact-match requirement.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+
+def _cap_read(text: str) -> str:
+    if len(text) > _MAX_READ_CHARS:
+        return (
+            text[:_MAX_READ_CHARS]
+            + f"\n\n[truncated at {_MAX_READ_CHARS} characters — "
+            f"{len(text)} total; use `search` to find the part you need]"
+        )
+    return text
 
 
 # The read_file *tool* suffixes its output with "\n[version: <hash>]". A model
@@ -117,20 +128,20 @@ class VaultTools:
     # ------------------------------------------------------------------
 
     def read_file(self, path: str) -> str:
-        """Return text content of *path* (relative to vault root)."""
+        """Return capped text content of *path* (relative to vault root)."""
+        return _cap_read(self.read_file_full(path))
+
+    def read_file_full(self, path: str) -> str:
+        """Uncapped internal read, never exposed as a model tool.
+
+        Parsers that rewrite a file (such as the scheduler) must see all of it.
+        Missing files use the same sentinel as read_file; path jailing still applies.
+        """
         p = self._safe_path(path)
-        if not p.exists():
+        try:
+            return p.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return f"[file not found: {path}]"
-        text = p.read_text(encoding="utf-8")
-        # Every other content tool caps its output; without this one, a single
-        # long journal or project page can swallow the whole context window.
-        if len(text) > _MAX_READ_CHARS:
-            return (
-                text[:_MAX_READ_CHARS]
-                + f"\n\n[truncated at {_MAX_READ_CHARS} characters — "
-                f"{len(text)} total; use `search` to find the part you need]"
-            )
-        return text
 
     def write_file(self, path: str, content: str) -> str:
         """Write (create or overwrite) *content* to *path*.
@@ -142,7 +153,7 @@ class VaultTools:
         """
         p = self._safe_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        atomic_write_text(p, content)
         return f"Written {len(content)} bytes to {path}"
 
     def version(self, path: str) -> str:
@@ -153,13 +164,14 @@ class VaultTools:
         """Create *path* with *content*; refuse if it already exists."""
         content = _strip_leaked_version_token(content)
         p = self._safe_path(path)
-        if p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            atomic_write_text(p, content, overwrite=False)
+        except FileExistsError:
             return (
                 f"[create error: {path} already exists — read it, then use "
                 "edit_file or rewrite_file to change it]"
             )
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
         return f"Created {path} ({len(content)} bytes, version {_version_of(content)})"
 
     def rewrite_file(self, path: str, content: str, expected_version: str) -> str:
@@ -191,7 +203,7 @@ class VaultTools:
                 f"(version is now {current}, you passed {expected_version}) — "
                 "read it again and redo your changes on the current content]"
             )
-        p.write_text(content, encoding="utf-8")
+        atomic_write_text(p, content)
         return f"Rewrote {path} ({len(content)} bytes, version {_version_of(content)})"
 
     def edit_file(self, path: str, old_string: str, new_string: str) -> str:
@@ -221,7 +233,7 @@ class VaultTools:
                 "include surrounding lines to identify a single one]"
             )
         new_content = content.replace(old_string, new_string)
-        p.write_text(new_content, encoding="utf-8")
+        atomic_write_text(p, new_content)
         return f"Edited {path} (version {_version_of(new_content)})"
 
     def append_file(self, path: str, content: str) -> str:
@@ -261,11 +273,14 @@ class VaultTools:
                 "pick another path or rewrite that file instead]"
             )
         dst.parent.mkdir(parents=True, exist_ok=True)
+        # Compute any text version before moving: binary attachments have no
+        # rewrite token, and a read failure must not follow a successful rename.
+        try:
+            suffix = f" (version {_version_of(src.read_text(encoding='utf-8'))})"
+        except UnicodeDecodeError:
+            suffix = ""
         src.rename(dst)
-        return (
-            f"Moved {path} to {new_path} "
-            f"(version {_version_of(dst.read_text(encoding='utf-8'))})"
-        )
+        return f"Moved {path} to {new_path}{suffix}"
 
     def list_files(self, glob: str) -> str:
         """Return newline-separated list of vault-relative paths matching *glob*."""
@@ -523,12 +538,11 @@ class VaultTools:
         topic index parsing) keep seeing the file's bare content.
         """
         if name == "read_file":
-            content = self.read_file(args["path"])
+            content = self.read_file_full(args["path"])
             if content.startswith("[file not found"):
                 return content
-            # Hash the file, not the (possibly truncated) returned text: the
-            # token must identify the on-disk state a rewrite would replace.
-            return f"{content}\n[version: {self.version(args['path'])}]"
+            # Both the capped display and token derive from this one snapshot.
+            return f"{_cap_read(content)}\n[version: {_version_of(content)}]"
         elif name == "create_file":
             return self.create_file(args["path"], args["content"])
         elif name == "rewrite_file":

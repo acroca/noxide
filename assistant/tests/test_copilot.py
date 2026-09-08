@@ -1141,3 +1141,24 @@ async def test_chat_round_trips_a_responses_turn_through_history(
         {"type": "function_call_output", "call_id": "call_1", "output": "# A"},
     ]
     assert second["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.parametrize("kind", ["error", "response.failed"])
+@pytest.mark.parametrize("code", ["invalid_request_error", "rate_limit_exceeded", "server_error"])
+async def test_responses_stream_error_classification(auth: CopilotAuth, kind: str, code: str) -> None:
+    from assistant.responses import RequestError
+
+    error = {"code": code, "message": "failure"}
+    event = {"type": kind, **(error if kind == "error" else {"response": {"error": error}})}
+    attempts = 3 if code == "server_error" else 1
+    mock_client = _routing_client(
+        ["/responses"],
+        [_stream_cm(200, [f"data: {json.dumps(event)}"]) for _ in range(attempts)],
+    )
+    with (
+        patch("httpx.AsyncClient", _mock_client_cls(mock_client)),
+        patch("assistant.copilot.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(CopilotUnavailableError if code == "server_error" else RequestError),
+    ):
+        await _chat_client(auth).chat([{"role": "user", "content": "hello"}])
+    assert mock_client.stream.call_count == attempts

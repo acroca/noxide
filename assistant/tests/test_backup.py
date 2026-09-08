@@ -137,9 +137,9 @@ async def test_commit_run_without_changes_creates_no_commit(
     backup: VaultBackup, vault: Path, git_dir: Path
 ) -> None:
     (vault / "note.md").write_text("x\n")
-    await backup.commit_run({"note.md"}, trigger="first", response="ok")
+    assert await backup.commit_run({"note.md"}, trigger="first", response="ok")
 
-    await backup.commit_run({"note.md"}, trigger="second", response="ok")
+    assert await backup.commit_run({"note.md"}, trigger="second", response="ok")
 
     assert len(_log_messages(git_dir, vault)) == 1  # only the first
 
@@ -163,7 +163,7 @@ async def test_commit_run_survives_git_failure(
     # A stale index.lock (e.g. the user mid-command on the Mac) must not raise.
     (git_dir / "index.lock").write_text("")
 
-    await backup.commit_run({"note.md"}, trigger="t", response="r")
+    assert not await backup.commit_run({"note.md"}, trigger="t", response="r")
 
     assert len(_log_messages(git_dir, vault)) == 0
 
@@ -246,6 +246,48 @@ async def test_usage_view_is_excluded_from_backup(
     await backup.sweep()
 
     assert len(_log_messages(git_dir, vault)) == 0
+
+
+@pytest.mark.parametrize("name", [".caf\u00e9.md.icloud", ".line\nbreak.md.icloud"])
+@pytest.mark.parametrize("ignored", [False, True])
+async def test_sweep_detects_literal_placeholders_inside_new_directories(
+    backup: VaultBackup, vault: Path, git_dir: Path, name: str, ignored: bool,
+) -> None:
+    (vault / "real.md").write_text("keep me\n")
+    assert await backup.commit_run({"real.md"}, "baseline", "ok")
+    (vault / "real.md").unlink()
+    nested = vault / "new" / "nested"
+    nested.mkdir(parents=True)
+    (nested / name).write_text("")
+    if ignored:
+        exclude = git_dir / "info" / "exclude"
+        exclude.write_text(exclude.read_text() + "new/\n")
+    await backup.sweep()
+    assert "real.md" in _committed_files(git_dir, vault)
+    assert len(_log_messages(git_dir, vault)) == 1
+
+
+async def test_commit_failure_is_reported(
+    backup: VaultBackup, vault: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (vault / "note.md").write_text("entry\n")
+    real_git = backup._git
+
+    async def fail_commit(*args: str) -> tuple[int, str]:
+        if args[0] == "commit":
+            return 128, "commit failed"
+        return await real_git(*args)
+
+    monkeypatch.setattr(backup, "_git", fail_commit)
+    assert not await backup.commit_run({"note.md"}, "test", "ok")
+
+
+async def test_partial_staging_salvages_valid_paths_but_reports_failure(
+    backup: VaultBackup, vault: Path, git_dir: Path,
+) -> None:
+    (vault / "note.md").write_text("entry\n")
+    assert not await backup.commit_run({"note.md", "missing.md"}, "test", "ok")
+    assert "note.md" in _committed_files(git_dir, vault)
 
 
 async def test_init_repo_supports_persisted_core_worktree_inspection(

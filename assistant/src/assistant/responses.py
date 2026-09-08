@@ -29,6 +29,10 @@ class StreamError(RuntimeError):
     or malformed). The client maps it to its transient error for retry."""
 
 
+class RequestError(RuntimeError):
+    """A stream-level rejection, not an availability failure worth queueing."""
+
+
 def build_payload(
     model: str,
     messages: list[dict[str, Any]],
@@ -141,11 +145,18 @@ async def read_sse(r: Any) -> dict[str, Any]:
         kind = event.get("type")
         if kind in ("response.completed", "response.incomplete"):
             return parse_response(event.get("response") or {})
-        if kind == "error":
-            raise StreamError(f"error event: {event.get('message') or event}")
-        if kind == "response.failed":
-            error = (event.get("response") or {}).get("error") or {}
-            raise StreamError(f"{kind}: {error.get('message') or error}")
+        if kind in ("error", "response.failed"):
+            error = (
+                (event.get("error") or event) if kind == "error"
+                else (event.get("response") or {}).get("error") or {}
+            )
+            code = error.get("code") or error.get("type")
+            # Only explicit server failures are outages. Unknown rejections
+            # must not wedge the durable FIFO behind an unretryable request.
+            error_type = StreamError if code in (
+                "server_error", "internal_server_error", "service_unavailable",
+            ) else RequestError
+            raise error_type(f"{kind} ({code}): {error.get('message') or error}")
     raise StreamError("stream truncated (no response.completed)")
 
 
@@ -162,8 +173,9 @@ def parse_response(response: dict[str, Any]) -> dict[str, Any]:
         kind = item.get("type")
         if kind == "message":
             texts.append("".join(
-                p.get("text") or "" for p in item.get("content") or []
-                if p.get("type") == "output_text"
+                (p.get("refusal") if p.get("type") == "refusal" else p.get("text")) or ""
+                for p in item.get("content") or []
+                if p.get("type") in ("output_text", "refusal")
             ))
         elif kind == "function_call":
             tool_calls.append(_tool_call(item))

@@ -33,6 +33,9 @@ class UsageTracker:
         self._view_path = vault_path / "system" / "usage.md"
         self._tz = ZoneInfo(tz_name)
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._pending: list[dict[str, Any]] = []
+        self._flush_lock = asyncio.Lock()
+        self._flush_task: asyncio.Task[None] | None = None
 
     def _now(self) -> datetime:
         return datetime.now(self._tz)
@@ -62,22 +65,29 @@ class UsageTracker:
     async def run(self) -> None:
         """Background loop: wait for events, debounce, flush to disk."""
         while True:
-            events = [await self._queue.get()]
+            event = await self._queue.get()
+            self._pending.append(event)
             await asyncio.sleep(_DEBOUNCE_SECONDS)
-            while not self._queue.empty():
-                events.append(self._queue.get_nowait())
-            try:
-                await asyncio.to_thread(self._flush, events)
-            except Exception:
-                logger.exception("usage flush failed")
+            await self.drain()
 
     async def drain(self) -> None:
-        """Flush anything still queued (used at shutdown and in tests)."""
-        events: list[dict[str, Any]] = []
-        while not self._queue.empty():
-            events.append(self._queue.get_nowait())
-        if not events:
-            return
+        """Finish an active flush, then flush queued and debouncing events."""
+        async with self._flush_lock:
+            # Cancelling to_thread does not stop the thread. Keep and shield
+            # its task so shutdown joins it instead of racing a second writer.
+            if self._flush_task is not None:
+                await asyncio.shield(self._flush_task)
+                self._flush_task = None
+            events, self._pending = self._pending, []
+            while not self._queue.empty():
+                events.append(self._queue.get_nowait())
+            if not events:
+                return
+            self._flush_task = asyncio.create_task(self._flush_batch(events))
+            await asyncio.shield(self._flush_task)
+            self._flush_task = None
+
+    async def _flush_batch(self, events: list[dict[str, Any]]) -> None:
         try:
             await asyncio.to_thread(self._flush, events)
         except Exception:

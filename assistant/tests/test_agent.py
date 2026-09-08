@@ -2288,3 +2288,282 @@ async def test_retry_message_failed_cold_attempt_leaves_no_trace(agent: Agent) -
             )
 
     assert agent._get_history(1, None).messages() == []
+
+
+@pytest.mark.parametrize("args", [None, [], 3, {"path": ["x.md"]}, {"path": {"bad": True}}])
+async def test_invalid_tool_argument_types_return_results(agent: Agent, args) -> None:
+    from assistant.responses import build_payload, parse_response
+
+    response = parse_response({"status": "completed", "output": [{
+        "type": "function_call", "call_id": "bad", "name": "create_file",
+        "arguments": json.dumps(args),
+    }]})
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=[response, _make_text_response("recovered"),
+                                        _make_text_response("next reply")])
+    with patch("assistant.copilot.get_client", return_value=client):
+        assert await agent.run(1, "write") == "recovered"
+        assert await agent.run(1, "next") == "next reply"
+    messages = client.chat.call_args_list[1].args[0]
+    assert messages[-1]["tool_call_id"] == "bad"
+    assert messages[-1]["content"].startswith("[tool error:")
+    items = build_payload("m", messages, None, None)["input"]
+    assert items[-1]["type"] == "function_call_output"
+    assert items[-1]["call_id"] == "bad"
+
+
+@pytest.mark.parametrize("calls_per_turn,turns", [(2, 16), (40, 1)])
+async def test_active_run_keeps_task_images_and_tool_results(
+    vault: VaultTools, calls_per_turn: int, turns: int,
+) -> None:
+    agent = Agent(vault)
+    client = MagicMock()
+    replies = []
+    for turn in range(turns):
+        response = _make_tool_call_response("list_files", {})
+        response["choices"][0]["message"]["tool_calls"] = [
+            {"id": f"c{turn}-{n}", "type": "function",
+             "function": {"name": "list_files", "arguments": "{}"}}
+            for n in range(calls_per_turn)
+        ]
+        replies.append(response)
+    client.chat = AsyncMock(side_effect=[*replies, _make_text_response("done")])
+    with patch("assistant.copilot.get_client", return_value=client):
+        await agent.run(1, "original task", image_data_urls=[_DATA_URL], transient_context="snapshot")
+    messages = client.chat.call_args.args[0]
+    user = next(m for m in messages if m["role"] == "user")
+    assert "original task" in user["content"][0]["text"]
+    assert "snapshot" in user["content"][0]["text"]
+    assert user["content"][1]["image_url"]["url"] == _DATA_URL
+    assert sum(m["role"] == "tool" for m in messages) == calls_per_turn * turns
+    assert len(agent._get_history(1).messages()) <= 40
+
+
+async def test_hot_retries_keep_all_unanswered_messages_beyond_history_limit(vault: VaultTools) -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    agent = Agent(vault, history_size=3)
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=CopilotUnavailableError("502"))
+    with patch("assistant.copilot.get_client", return_value=client):
+        for n in range(6):
+            with pytest.raises(CopilotUnavailableError):
+                await agent.run(1, f"pending-{n}")
+        before = agent._get_history(1).messages()
+        for _ in range(3):
+            with pytest.raises(CopilotUnavailableError):
+                await agent.retry_message(1, None, "pending-0", "earlier", hot=True)
+            assert agent._get_history(1).messages() == before
+        client.chat = AsyncMock(return_value=_make_text_response("handled all"))
+        assert await agent.retry_message(1, None, "pending-0", "earlier", hot=True) == "handled all"
+        sent = client.chat.call_args.args[0]
+        for n in range(6):
+            assert any(f"pending-{n}" in str(m.get("content")) for m in sent)
+        assert await agent.retry_message(1, None, "pending-1", "earlier", hot=True) is None
+
+
+async def test_failed_retry_preserves_full_deque_and_partial_tool_output(vault: VaultTools) -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    agent = Agent(vault, history_size=3)
+    history = agent._get_history(1)
+    for n in range(3):
+        history.append({"role": "user", "content": f"old-{n}"})
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=CopilotUnavailableError("502"))
+    before = history.messages()
+    with patch("assistant.copilot.get_client", return_value=client):
+        with pytest.raises(CopilotUnavailableError):
+            await agent.retry_message(1, None, "old-0", "earlier", hot=True)
+        assert history.messages() == before
+        history.append({"role": "assistant", "content": None, "tool_calls": [{"id": "c"}]})
+        history.append({"role": "tool", "tool_call_id": "c", "content": "x" * 6000})
+        with pytest.raises(CopilotUnavailableError):
+            await agent.retry_message(1, None, "old-0", "earlier", hot=True)
+        assert history.messages()[-1]["content"] == "x" * 6000
+        agent.clear_history(1)
+        assert await agent.retry_message(1, None, "old-0", "earlier", hot=True) is None
+
+
+@pytest.mark.parametrize("existing", ["prompt", "index"])
+async def test_topic_slug_collision_refused_before_telegram(vault: VaultTools, existing: str) -> None:
+    create = AsyncMock()
+    agent = Agent(vault, create_forum_topic_fn=create)
+    if existing == "prompt":
+        vault.write_file("system/topics/health/AGENTS.md", "custom instructions")
+    else:
+        agent._register_topic(1, "health", "Health!")
+    result = await agent._dispatch_tool("create_forum_topic", {"name": "Health?"})
+    assert "already exists" in result
+    create.assert_not_awaited()
+    if existing == "prompt":
+        assert vault.read_file("system/topics/health/AGENTS.md") == "custom instructions"
+
+
+async def test_concurrent_topic_creation_cannot_share_slug(vault: VaultTools) -> None:
+    async def create(name):
+        await asyncio.sleep(0)
+        return {"message_thread_id": 1}
+
+    callback = AsyncMock(side_effect=create)
+    agent = Agent(vault, create_forum_topic_fn=callback)
+    results = await asyncio.gather(
+        agent._dispatch_tool("create_forum_topic", {"name": "Health!"}),
+        agent._dispatch_tool("create_forum_topic", {"name": "Health?"}),
+    )
+    callback.assert_awaited_once()
+    assert sum("already exists" in result for result in results) == 1
+
+
+async def test_hot_retry_rechecks_superseding_after_waiting_for_run_lock(agent: Agent) -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def reply(messages, tools, **kwargs):
+        started.set()
+        await finish.wait()
+        return _make_text_response("handled pending work")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=CopilotUnavailableError("502"))
+    with patch("assistant.copilot.get_client", return_value=client):
+        with pytest.raises(CopilotUnavailableError):
+            await agent.run(1, "pending")
+        client.chat = AsyncMock(side_effect=reply)
+        run = asyncio.create_task(agent.run(1, "followup"))
+        await started.wait()
+        retry = asyncio.create_task(agent.retry_message(1, None, "pending", "earlier", hot=True))
+        await asyncio.sleep(0)
+        finish.set()
+        await run
+        assert await retry is None
+    client.chat.assert_awaited_once()
+
+
+async def test_partial_work_is_retained_across_outage_without_reexecution(vault: VaultTools) -> None:
+    from assistant.copilot import CopilotUnavailableError
+
+    vault.write_file("large.md", "x" * 6000)
+    backup = _StubBackup()
+    agent = Agent(vault, history_size=2, backup=backup)
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("read_file", {"path": "large.md"}, call_id="read"),
+        _make_tool_call_response("append_file", {"path": "note.md", "content": "once"}, call_id="write"),
+        CopilotUnavailableError("502"),
+        _make_tool_call_response("append_file", {"path": "note.md", "content": " twice"}, call_id="resume"),
+        _make_text_response("done"),
+    ])
+    with patch("assistant.copilot.get_client", return_value=client):
+        with pytest.raises(CopilotUnavailableError):
+            await agent.run(1, "original task")
+        assert await agent.retry_message(1, None, "original task", "earlier", hot=True) == "done"
+    recovery_messages = client.chat.call_args_list[3].args[0]
+    assert any("original task" in str(m.get("content")) for m in recovery_messages)
+    assert any("x" * 6000 in str(m.get("content")) for m in recovery_messages)
+    assert vault.read_file("note.md") == "once twice"
+    assert backup.commits[0][0] == {"note.md"}
+
+
+@pytest.mark.parametrize("name", ["???", "---"])
+async def test_topic_name_without_slug_is_rejected(vault: VaultTools, name: str) -> None:
+    create = AsyncMock()
+    agent = Agent(vault, create_forum_topic_fn=create)
+    assert "tool error" in await agent._dispatch_tool("create_forum_topic", {"name": name})
+    create.assert_not_awaited()
+
+
+async def test_topic_prompt_appearing_during_creation_is_not_overwritten(vault: VaultTools) -> None:
+    async def create(name):
+        vault.write_file("system/topics/health/AGENTS.md", "concurrent custom instructions")
+        return {"message_thread_id": 1}
+
+    agent = Agent(vault, create_forum_topic_fn=create)
+    await agent._dispatch_tool("create_forum_topic", {"name": "Health"})
+    assert vault.read_file("system/topics/health/AGENTS.md") == "concurrent custom instructions"
+    assert agent._resolve_topic_slug(1) == ("health", "Health")
+
+
+@pytest.mark.parametrize("error_kind", ["request", "http400"])
+@pytest.mark.parametrize("hot_retry", [False, True])
+async def test_terminal_chat_error_bounds_history_and_allows_next_run_compaction(
+    vault: VaultTools, error_kind: str, hot_retry: bool,
+) -> None:
+    import httpx
+
+    from assistant.responses import RequestError
+
+    error = RequestError("context length exceeded") if error_kind == "request" else (
+        httpx.HTTPStatusError(
+            "context length exceeded", request=httpx.Request("POST", "https://example.com"),
+            response=httpx.Response(400),
+        )
+    )
+    vault.write_file("large.md", "x" * 6000)
+    agent = Agent(vault, history_size=4)
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("read_file", {"path": "large.md"}, call_id="first"),
+        _make_tool_call_response("read_file", {"path": "large.md"}, call_id="second"),
+        error,
+        _make_text_response("recovered"),
+    ])
+    with patch("assistant.copilot.get_client", return_value=client):
+        with pytest.raises(type(error)):
+            await agent.run(1, "read both")
+        history = agent._get_history(1)
+        assert len(history.messages()) == 4
+        assert not history._unfinished
+        assert history.messages()[-1]["role"] == "tool"
+        assert "x" * 6000 in history.messages()[-1]["content"]
+        if hot_retry:
+            reply = await agent.retry_message(1, None, "read both", "earlier", hot=True)
+        else:
+            reply = await agent.run(1, "try again")
+        assert reply == "recovered"  # not falsely superseded by the rejection
+    sent = client.chat.call_args.args[0]
+    outputs = [m["content"] for m in sent if m["role"] == "tool"]
+    assert len(outputs) == 2
+    assert all(output == "x" * _HISTORY_TOOL_RESULT_CAP + _HISTORY_TRIM_MARKER for output in outputs)
+    assert len(history.messages()) <= 4
+
+
+@pytest.mark.parametrize("ending", ["outage", "cancel", "cap"])
+async def test_nonterminal_chat_end_preserves_unbounded_uncompacted_work(
+    vault: VaultTools, ending: str,
+) -> None:
+    from assistant.agent import MAX_ITERATIONS_REPLY
+    from assistant.copilot import CopilotUnavailableError
+
+    vault.write_file("large.md", "x" * 6000)
+    agent = Agent(vault, history_size=4)
+    replies = [
+        _make_tool_call_response("read_file", {"path": "large.md"}, call_id="first"),
+        _make_tool_call_response("read_file", {"path": "large.md"}, call_id="second"),
+    ]
+    error = CopilotUnavailableError("502") if ending == "outage" else asyncio.CancelledError()
+    if ending != "cap":
+        replies.append(error)
+    replies.append(_make_text_response("resumed"))
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=replies)
+    with (
+        patch("assistant.copilot.get_client", return_value=client),
+        patch("assistant.agent._MAX_ITERATIONS", 2 if ending == "cap" else 20),
+    ):
+        if ending == "cap":
+            assert await agent.run(1, "original task") == MAX_ITERATIONS_REPLY
+        else:
+            with pytest.raises(type(error)):
+                await agent.run(1, "original task")
+        history = agent._get_history(1)
+        assert len(history.messages()) == 5
+        assert history._unfinished
+        assert await agent.retry_message(1, None, "original task", "earlier", hot=True) == "resumed"
+    sent = client.chat.call_args.args[0]
+    assert any("original task" in str(m.get("content")) for m in sent)
+    outputs = [m["content"] for m in sent if m["role"] == "tool"]
+    assert len(outputs) == 2
+    assert all("x" * 6000 in output for output in outputs)

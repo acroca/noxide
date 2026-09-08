@@ -41,6 +41,7 @@ services:
       DEFAULT_MODEL: ${DEFAULT_MODEL:-sonnet}
       TIMEZONE: ${TIMEZONE:-UTC}
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      FOURGET_URL: ${FOURGET_URL:-}
     volumes:
       - ./vault:/data/vault
       - ./state:/data/state
@@ -62,6 +63,8 @@ TIMEZONE=Europe/Madrid
 # DEFAULT_MODEL=sonnet
 # Optional — enables voice messages, see below
 # ELEVENLABS_API_KEY=...
+# Optional — enables web research with the service below
+# FOURGET_URL=http://fourget
 ```
 
 Multiple users go in `ALLOWED_USER_IDS` separated by commas. Then:
@@ -193,8 +196,11 @@ Everything that matters is in two directories:
 
 - `vault/` — your notes. Plain markdown. The built-in backup below gives it a
   full git history — and an undo for anything the model gets wrong.
-- `state/` — the OAuth token, the remembered chat id, and usage JSONL. Losing
-  it costs you a re-auth, not data.
+- `state/` — the OAuth token, remembered chat id, usage JSONL, pending outage
+  retries, maintenance bookkeeping, and the consumed inbox snapshot. With
+  backup enabled, it also holds `vault.git` by default. Losing it can lose
+  queued work and backup history or replay already-processed captures, not
+  just require re-authentication.
 
 Conversation history is deliberately **not** persisted; it lives in memory and
 is gone on restart. That is by design — see the README.
@@ -274,8 +280,9 @@ For a full restore into a fresh or emptied vault directory:
 git --git-dir=/path/to/state/vault.git --work-tree=/path/to/vault checkout -f main
 ```
 
-Then restart the bot. `state/` needs no restore ceremony — losing it only
-costs a re-auth.
+Then restart the bot. Restore `state/` deliberately: an older retry queue or
+inbox checkpoint can replay work already processed, while omitting the state
+can lose queued work. Protect both directories in your backups.
 
 ### Graceful restarts
 

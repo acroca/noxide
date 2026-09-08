@@ -62,7 +62,7 @@ class VaultBackup:
         self._vault = vault_path
         self._git_dir = git_dir
         self._lock = asyncio.Lock()
-        self._pending: set[asyncio.Task[None]] = set()
+        self._pending: set[asyncio.Task[bool]] = set()
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -118,22 +118,31 @@ class VaultBackup:
             exclude.write_text(existing + "".join(f"{m}\n" for m in missing), encoding="utf-8")
         await self.sweep(reason="startup")
 
-    async def commit_run(self, paths: Iterable[str], trigger: str, response: str) -> None:
-        """Commit exactly *paths* with the interaction that produced them."""
+    async def commit_run(self, paths: Iterable[str], trigger: str, response: str) -> bool:
+        """Commit *paths*; return whether staging and committing succeeded.
+
+        An unchanged index counts as success. This confirms git operations,
+        not a snapshot of external files, which can change while git runs.
+        """
         pathspecs = sorted(p for p in paths if p)
         if not pathspecs:
-            return
+            return True
         try:
             async with self._lock:
                 code, out = await self._git("add", "-A", "--", *pathspecs)
+                staged = code == 0
                 if code != 0:
                     # One bad pathspec fails the whole call; salvage the rest.
                     logger.warning("vault backup: git add failed: %s", out.strip()[:_GIT_OUTPUT_MAX])
+                    staged = True
                     for path in pathspecs:
-                        await self._git("add", "-A", "--", path)
-                await self._commit(_build_message(trigger, response))
+                        code, _ = await self._git("add", "-A", "--", path)
+                        staged = staged and code == 0
+                committed = await self._commit(_build_message(trigger, response))
+                return staged and committed
         except Exception:
             logger.exception("vault backup: commit failed")
+            return False
 
     def schedule_commit(self, paths: Iterable[str], trigger: str, response: str) -> None:
         """Fire-and-forget ``commit_run`` so replies are never delayed by git."""
@@ -144,17 +153,33 @@ class VaultBackup:
     async def sweep(self, reason: str = "unattributed changes") -> None:
         """Commit everything dirty that no run claimed (external edits, crash leftovers)."""
         async with self._lock:
-            code, out = await self._git("status", "--porcelain")
+            code, out = await self._git(
+                "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=traditional"
+            )
             if code != 0:
                 logger.warning("vault backup: git status failed: %s", out.strip()[:_GIT_OUTPUT_MAX])
                 return
-            if not out.strip():
-                return
-            if any(line.rstrip().endswith(_ICLOUD_SUFFIX) for line in out.splitlines()):
+            # -z gives literal paths (including non-ASCII and newlines), and
+            # -uall exposes placeholders inside otherwise untracked directories.
+            records = iter(out.split("\0"))
+            dirty = False
+            placeholder = False
+            for record in records:
+                if not record:
+                    continue
+                status, path = record[:2], record[3:]
+                placeholder |= path.endswith(_ICLOUD_SUFFIX)
+                dirty |= status != "!!"
+                if "R" in status or "C" in status:
+                    # Porcelain -z renames have a second, source path field.
+                    placeholder |= next(records, "").endswith(_ICLOUD_SUFFIX)
+            if placeholder:
                 logger.warning(
                     "vault backup: iCloud eviction placeholders in the vault; "
                     "skipping sweep so evicted files are not committed as deletions"
                 )
+                return
+            if not dirty:
                 return
             code, out = await self._git("add", "-A")
             if code != 0:
@@ -162,10 +187,18 @@ class VaultBackup:
                 return
             await self._commit(f"vault sweep: {reason}")
 
-    async def _commit(self, message: str) -> None:
+    async def _commit(self, message: str) -> bool:
+        # Detect a clean index without interpreting localized commit output.
+        code, out = await self._git("diff", "--cached", "--quiet", "--exit-code")
+        if code == 0:
+            return True
+        if code != 1:
+            logger.warning("vault backup: git diff failed: %s", out.strip()[:_GIT_OUTPUT_MAX])
+            return False
         code, out = await self._git("commit", "--no-verify", "-m", message)
-        if code != 0 and "nothing to commit" not in out and "nothing added to commit" not in out:
+        if code != 0:
             logger.warning("vault backup: git commit failed: %s", out.strip()[:_GIT_OUTPUT_MAX])
+        return code == 0
 
     async def run(self) -> None:
         """Periodic sweep loop; cancelled at shutdown."""

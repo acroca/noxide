@@ -12,6 +12,7 @@ import asyncio
 import base64
 import io
 import logging
+import threading
 from typing import TYPE_CHECKING, Any
 
 from . import copilot, usage
@@ -27,9 +28,10 @@ _MAX_TEXT_PAGES = 20
 _MAX_VISION_PAGES = 8
 _RENDER_SCALE = 2.0  # 72 dpi * 2 ≈ 144 dpi, plenty for text
 _JPEG_QUALITY = 80
-# Below this average per examined page, the text layer is considered absent
+# Below this count on an individual page, the text layer is considered absent
 # (scanned PDFs yield ~nothing; even sparse digital ones clear this easily)
 _MIN_TEXT_CHARS_PER_PAGE = 5
+_PDFIUM_LOCK = threading.Lock()
 
 _TEXT_EXTS = {"txt", "md", "csv", "json", "yaml", "yml", "toml", "log"}
 _IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif"}
@@ -83,16 +85,26 @@ class AttachmentExtractor:
 
     async def _extract_pdf(self, data: bytes) -> str:
         try:
-            n_pages, text = await asyncio.to_thread(_pdf_text_layer, data)
+            n_pages, pages = await asyncio.to_thread(_pdf_text_layer, data)
         except Exception as e:
             return f"[could not parse PDF: {e}]"
 
-        pages_examined = max(1, min(n_pages, _MAX_TEXT_PAGES))
-        if len(text) >= _MIN_TEXT_CHARS_PER_PAGE * pages_examined:
+        sparse_pages = [
+            i for i, text in enumerate(pages, 1) if len(text.strip()) < _MIN_TEXT_CHARS_PER_PAGE
+        ]
+        if len(sparse_pages) < len(pages):
             header = f"[PDF, {n_pages} page(s), text layer"
             if n_pages > _MAX_TEXT_PAGES:
                 header += f", first {_MAX_TEXT_PAGES} pages only"
-            return f"{header}]\n\n{_truncate(text)}"
+            warning = ""
+            if sparse_pages:
+                warning = (
+                    "\n[partial extraction: pages " + ", ".join(map(str, sparse_pages))
+                    + " have little or no text layer; scanned content on these pages "
+                    "has not been transcribed]"
+                )
+            text = "\n\n".join(pages)
+            return f"{header}]{warning}\n\n{_truncate(text)}"
 
         # No usable text layer: scanned document — render pages and use vision
         try:
@@ -144,29 +156,39 @@ class AttachmentExtractor:
 # ----------------------------------------------------------------------
 
 
-def _pdf_text_layer(data: bytes) -> tuple[int, str]:
-    """Return (page count, text-layer content of the first _MAX_TEXT_PAGES pages)."""
+def _pdf_text_layer(data: bytes) -> tuple[int, list[str]]:
+    """Return (page count, per-page text of the first _MAX_TEXT_PAGES pages)."""
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(data))
     pages = reader.pages
     chunks = [page.extract_text() or "" for page in pages[:_MAX_TEXT_PAGES]]
-    return len(pages), "\n\n".join(chunks).strip()
+    return len(pages), chunks
 
 
 def _render_pdf_pages(data: bytes) -> list[bytes]:
     """Render the first _MAX_VISION_PAGES pages to JPEG bytes."""
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(data)
-    try:
-        images: list[bytes] = []
-        for i in range(min(len(pdf), _MAX_VISION_PAGES)):
-            bitmap = pdf[i].render(scale=_RENDER_SCALE)
-            pil_image = bitmap.to_pil().convert("RGB")
-            buf = io.BytesIO()
-            pil_image.save(buf, format="JPEG", quality=_JPEG_QUALITY)
-            images.append(buf.getvalue())
-        return images
-    finally:
-        pdf.close()
+    # PDFium is not thread-safe, even across documents. Hold the lock inside
+    # the worker: cancelling to_thread's await does not stop its native work.
+    with _PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(data)
+        try:
+            images: list[bytes] = []
+            for i in range(min(len(pdf), _MAX_VISION_PAGES)):
+                page = pdf[i]
+                try:
+                    bitmap = page.render(scale=_RENDER_SCALE)
+                    try:
+                        pil_image = bitmap.to_pil().convert("RGB")
+                        buf = io.BytesIO()
+                        pil_image.save(buf, format="JPEG", quality=_JPEG_QUALITY)
+                        images.append(buf.getvalue())
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+            return images
+        finally:
+            pdf.close()

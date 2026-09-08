@@ -478,6 +478,9 @@ class CopilotClient:
                 if url == _RESPONSES_URL:
                     try:
                         return await responses.read_sse(r)
+                    except responses.RequestError:
+                        logger.error("Copilot rejected Responses stream (model=%s)", payload["model"])
+                        raise
                     except responses.StreamError as exc:
                         raise _TransientServerError(str(exc)) from exc
                 return await _read_sse_message(r)

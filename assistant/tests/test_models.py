@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from assistant.models import (
@@ -329,3 +331,29 @@ def test_capabilities_use_responses_only_without_chat_completions() -> None:
     assert ModelCapabilities(False, ("/responses",)).uses_responses is True
     assert ModelCapabilities(False, ("/responses", "/chat/completions")).uses_responses is False
     assert ModelCapabilities(False, ()).uses_responses is False
+
+
+@pytest.mark.parametrize("family", ["", "claude-haiku"])
+def test_resolve_startup_remaps_default_to_catalog_alias(family: str) -> None:
+    fetched = [FetchedModel("claude-sonnet-5", "Sonnet", "Anthropic")]
+    options, alias, model_id = resolve_startup(_CONFIG_MODELS, "sonnet", fetched, family)
+    assert alias == "sonnet-5"
+    assert options[alias].id == "claude-sonnet-5"
+    assert model_id is None
+
+
+def test_resolve_startup_handles_shadowed_family_slug() -> None:
+    options, alias, model_id = resolve_startup(
+        {"opus-5": "pinned", "sonnet": "claude-sonnet-5"}, "sonnet", _opus("5"), "claude-opus"
+    )
+    assert options[alias].id == "claude-sonnet-5"
+    assert model_id is None
+
+
+def test_resolve_startup_retains_default_when_its_catalog_slug_is_shadowed() -> None:
+    options, alias, model_id = resolve_startup(
+        {"opus-5": "pinned", "opus": "claude-opus-5"}, "opus", _opus("5"), ""
+    )
+    assert options["opus-5"].id == "pinned"
+    assert options[alias].id == "claude-opus-5"
+    assert model_id is None

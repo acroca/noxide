@@ -6,6 +6,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from assistant.vault_check import run_checks
@@ -1215,3 +1217,78 @@ def test_leading_weekday_with_trailing_date_is_paired_only_on_the_dashboard(tmp_
     )
 
     assert "Weekday" not in _check(tmp_path)
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+def test_all_checks_ignore_fenced_examples(tmp_path: Path, fence: str) -> None:
+    _clean_vault(tmp_path)
+    example = (
+        "**Status:** TBD\n## Empty\n## Tasks\n"
+        "- [ ] Example task (due 2026-01-01)\n"
+        "- 2026-08-10 — Example event\n"
+        "Monday 2026-08-04\n[version: deadbeef]\n"
+        "- Example reminder [reminder:deadbeef]\n"
+        "[missing](missing.md)\n"
+        + "- Identical example bullet with enough text\n" * 2
+        + _done_tasks(16)
+    )
+    _write(tmp_path, "wiki/projects/template.md", f"# Template\n{fence}markdown\n{example}{fence}\n")
+    _write(tmp_path, "wiki/routines.md", f"# Routines\n{fence}\n| Pill | Daily | 2026-08-01 | 2026-08-10 | |\n{fence}\n")
+    _write(tmp_path, "wiki/log.md", f"# Log\n{fence}\n## [2026-01-01] compile | example\n{fence}\n")
+    _write(tmp_path, "system/schedule.md", _SCHEDULE_HEADER + f"{fence}\n"
+           + _one_off_row("deadbeef", "[scheduled run] [silent]") + "\n"
+           + "| ab12cd34 | 0 8 * * 0 | true | example | | |\n" + f"{fence}\n")
+    _index(tmp_path, "- [now](now.md)", "- [garden](projects/garden.md)",
+           "- [template](projects/template.md)", "- [routines](routines.md)", "- [log](log.md)",
+           f"{fence}\n- [missing](missing.md)\n{fence}")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_fenced_dashboard_tasks_do_not_satisfy_the_mirror(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/now.md", "# Now\n```\n- [ ] buy compost (due 2026-08-05)\n- [ ] example only\n```\n")
+
+    report = _check(tmp_path)
+
+    assert "wiki/projects/garden.md:4: open task not mirrored" in report
+    assert "example only" not in report
+
+
+def test_fenced_marker_and_index_link_do_not_cover_live_items(tmp_path: Path) -> None:
+    _write(tmp_path, "wiki/a.md", "# A\n```\n[reminder:ab12cd34]\n```\n")
+    _index(tmp_path, "```\n- [A](a.md)\n```")
+    _schedule(tmp_path, _one_off_row("ab12cd34"))
+
+    report = _check(tmp_path)
+
+    assert "one-off job ab12cd34 has no" in report
+    assert "wiki/a.md: page has no line in any index" in report
+
+
+def test_fenced_schedule_and_log_entries_are_not_live_evidence(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/a.md", "# A\n[reminder:ab12cd34]\n")
+    _write(tmp_path, "system/schedule.md", _SCHEDULE_HEADER + "```\n" + _one_off_row("ab12cd34") + "\n```\n")
+    _log(tmp_path, "## [2026-07-01] compile | real", "```", "## [2026-08-02] compile | example", "```")
+
+    report = _check(tmp_path)
+
+    assert "wiki/a.md:2: marker [reminder:ab12cd34] references no pending job" in report
+    assert "last compile entry is from 2026-07-01" in report
+
+
+@pytest.mark.parametrize("opening, inner, closing", [
+    ("````markdown", "```", "````"),
+    ("~~~markdown", "```", "~~~~"),
+    ("```markdown", "```not a closing fence", "```"),
+])
+def test_fences_require_matching_character_length_and_empty_closer(
+    tmp_path: Path, opening: str, inner: str, closing: str,
+) -> None:
+    _write(tmp_path, "wiki/a.md", f"# Example\n{opening}\n{inner}\n[version: deadbeef]\n{closing}\n[version: ab12cd34]\n")
+
+    report = _check(tmp_path)
+
+    assert report.startswith("1 finding.")
+    assert "wiki/a.md:6: leaked" in report

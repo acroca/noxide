@@ -1,8 +1,9 @@
 # The vault
 
-The vault is the whole point: a directory of plain markdown files that is the
-bot's only durable memory. It is readable and useful without the bot — open it
-in Obsidian, grep it, keep it in git.
+The vault is the whole point: a directory of plain markdown files that holds
+the bot's durable knowledge. It is readable and useful without the bot — open
+it in Obsidian, grep it, keep it in git. Operational state, including pending
+outage retries and the consumed inbox snapshot, lives separately in `state_dir`.
 
 > The bot's operating rules for the vault live in
 > [`assistant/src/assistant/prompts/wiki.md`](../assistant/src/assistant/prompts/wiki.md),
@@ -169,13 +170,22 @@ in one mechanism — see [deployment.md](deployment.md#backups).
 **Offline capture** — when the bot is down but the vault is reachable (on the
 host, or through your sync), write into `inbox.md` at the vault root:
 free-form entries, one per paragraph or bullet, an ISO date/time up front when
-the timing matters. At the next startup the bot processes every entry as if
+the timing matters. At the next startup the bot processes new entries as if
 you had texted it — notes journaled and filed, reminders scheduled, questions
-answered — then clears the processed content and messages you what it did.
-Entries added while it was ingesting are kept for the next round, a failed run
-leaves the file untouched so nothing is lost, and with backup enabled the raw
-file is committed to history before anything clears it. While the bot is
-running, "process the inbox" in chat does the same on demand.
+answered — and messages you what it did. Startup ingestion never clears or
+rewrites `inbox.md`: it atomically records the exact consumed snapshot in
+`state_dir/inbox.processed.md`. An unchanged inbox is skipped; if you append
+to it, only the new suffix is processed. If you edit earlier content so the
+file no longer starts with the consumed snapshot, the whole file is reprocessed,
+preferring possible duplicates to lost captures.
+
+Entries added or changed during ingestion remain for the next startup. Failed,
+cancelled, or iteration-capped runs leave the checkpoint unchanged; with backup
+enabled, a failed backup also withholds it. The checkpoint preserves the input
+snapshot even if external edits mean git sees different content. Keep `state_dir`
+with your backups: losing or restoring an older checkpoint can replay entries
+already processed. Asking to process the inbox in chat is a separate model-driven
+operation, not this automatic checkpointed startup path.
 
 ## Starting a vault
 

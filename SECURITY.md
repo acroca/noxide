@@ -36,6 +36,9 @@ and cloud metadata endpoints). Redirects are followed manually so every hop is
 re-checked, and the vetted IP is pinned for the connection — with the hostname
 carried in the `Host` header and SNI — so DNS cannot be rebound between the
 check and the request. Responses are capped in bytes and characters.
+Page fetches request `Accept-Encoding: identity` and reject compressed responses
+before reading or decoding the body, preventing decompression from bypassing
+the byte limit.
 
 **Path traversal.** Every vault file operation resolves through `_safe_path`,
 which rejects anything landing outside the vault root, whether via `..` or an
@@ -73,14 +76,18 @@ fine, occasionally not. The exfiltration channel this could reach is the
 token can spend your Copilot quota; whoever controls an allowlisted Telegram
 account is, as far as the bot is concerned, you.
 
-**The model's judgment.** The agent can write, overwrite and delete files
-anywhere inside the vault. It is instructed never to edit past journal entries,
-but nothing enforces that. Keep the vault in git if you want an undo — it's
-plain markdown, so this works well.
+**The model's judgment.** The agent can create, rewrite, edit, append and move
+files inside the vault; there is no delete tool. The file tools enforce
+append-only history for `raw/journal/` and `wiki/log.md`: edits, rewrites and
+moves are refused on resolved paths, while reads, appends and exclusive creates
+remain allowed. This protects existing history, not the accuracy of new entries
+or edits elsewhere. Keep the vault in git if you want an undo — it's plain
+markdown, so this works well.
 
 **Anyone with filesystem access to the host.** The vault is unencrypted
-markdown and `state/oauth_token` is a plaintext credential at `0600`. Both are
-as safe as the machine they sit on.
+markdown and `state/oauth_token` is a plaintext credential at `0600`. The state
+directory also holds private queued messages and the exact consumed inbox
+snapshot. These are as safe as the machine they sit on.
 
 **Denial of service and quota exhaustion.** There is no rate limiting; the
 allowlist is the only gate. An allowlisted user can burn your Copilot quota.

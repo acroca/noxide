@@ -33,20 +33,28 @@ def _iso_date(text: str) -> date | None:
     except ValueError:
         return None
 
-_FENCE_RX = re.compile(r"^\s*(```|~~~)")
+_FENCE_RX = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 _HEADING_RX = re.compile(r"^(?P<hashes>#{1,6})\s+\S")
 
 
 def _scan(lines: list[str]) -> list[tuple[int, str, bool]]:
     """(line no, line, fenced) for every line; fence markers count as fenced."""
     out = []
-    in_fence = False
+    fence = ""
     for i, line in enumerate(lines, 1):
-        if _FENCE_RX.match(line):
-            in_fence = not in_fence
+        match = _FENCE_RX.match(line)
+        if fence:
             out.append((i, line, True))
-            continue
-        out.append((i, line, in_fence))
+            if (
+                match and match[1][0] == fence[0] and len(match[1]) >= len(fence)
+                and not match[2].strip()
+            ):
+                fence = ""
+        elif match and not (match[1][0] == "`" and "`" in match[2]):
+            fence = match[1]
+            out.append((i, line, True))
+        else:
+            out.append((i, line, False))
     return out
 
 

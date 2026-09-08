@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -344,6 +345,80 @@ async def test_fetch_page_http_error_returns_error_string(web: WebTools, public_
     out = await web.fetch_page("https://example.com/gone")
 
     assert out.startswith("[tool error:")
+
+
+@respx.mock
+@pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "GZip", "gzip, identity"])
+async def test_fetch_page_rejects_compression_before_reading(
+    web: WebTools, public_dns: None, encoding: str
+) -> None:
+    class CompressedStream(httpx.AsyncByteStream):
+        read = False
+        closed = False
+
+        async def __aiter__(self):
+            self.read = True
+            yield gzip.compress(b"x" * 4_000_000)
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = CompressedStream()
+    route = respx.get("https://93.184.216.34/compressed").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "content-encoding": encoding},
+            stream=stream,
+        )
+    )
+
+    out = await web.fetch_page("https://example.com/compressed")
+
+    assert "fetch blocked: unsupported content encoding" in out
+    assert route.calls[0].request.headers["accept-encoding"] == "identity"
+    assert not stream.read
+    assert stream.closed
+
+
+@respx.mock
+@pytest.mark.parametrize("encoding", [None, "identity", " Identity "])
+async def test_fetch_page_caps_stream_before_extraction(
+    web: WebTools, public_dns: None, monkeypatch: pytest.MonkeyPatch, encoding: str | None
+) -> None:
+    monkeypatch.setattr("assistant.web._MAX_RESPONSE_BYTES", 100)
+
+    class LargeStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b"a" * 70
+            yield b"b" * 200
+            pytest.fail("fetch consumed the stream beyond the cap")
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = LargeStream()
+    headers = {"content-type": "text/plain"}
+    if encoding is not None:
+        headers["content-encoding"] = encoding
+    respx.get("https://93.184.216.34/large").mock(
+        return_value=httpx.Response(200, headers=headers, stream=stream)
+    )
+
+    with patch("assistant.web._extract_text", return_value="extracted") as extract:
+        out = await web.fetch_page("https://example.com/large")
+
+    extract.assert_called_once_with(b"a" * 70 + b"b" * 30, "text/plain", "utf-8")
+    assert out == "extracted\n[truncated at 100 response bytes]"
+    assert stream.closed
+
+
+def test_deployment_compose_forwards_fourget_url() -> None:
+    deployment = (Path(__file__).parents[2] / "docs/deployment.md").read_text()
+    compose = deployment.split("```yaml\n", 1)[1].split("```", 1)[0]
+    assert "      FOURGET_URL: ${FOURGET_URL:-}\n" in compose
+    assert "# FOURGET_URL=http://fourget" in deployment
 
 
 # ------------------------------------------------------------------
