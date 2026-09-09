@@ -231,7 +231,7 @@ async def _run(config_path: Path | None) -> None:
         fan_out_fn=fan_out.run,
         skills=skills,
         backup=backup,
-        history_size=cfg.history_size,
+        history_exchanges=cfg.history_exchanges,
         tz_name=cfg.timezone,
     )
     bot._agent = agent  # wire back

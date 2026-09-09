@@ -52,7 +52,8 @@ sonnet = "claude-sonnet-5"
 
 [assistant]
 timezone = "Europe/Madrid"
-history_size = 40
+# Complete exchanges sent automatically; older text is retrievable until restart or /clear.
+history_exchanges = 5
 # Where the vault and state directories live. Defaults are relative to the
 # working directory; the Docker image already points these at its own mounts,
 # so only set them for a non-container run or an unusual layout.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tomllib
@@ -51,7 +52,7 @@ class Config(BaseSettings):
     timezone: str = "UTC"
     vault_path: Path = Path("vault")
     state_dir: Path = Path("state")
-    history_size: int = 40
+    history_exchanges: int = Field(default=5, ge=1)
 
     # Vault backup (optional) — local-only git history of the vault, kept in a
     # git dir outside it. None means <state_dir>/vault.git.
@@ -162,7 +163,7 @@ _TOML_FIELDS = (
     ("assistant", "timezone", "timezone"),
     ("assistant", "vault_path", "vault_path"),
     ("assistant", "state_dir", "state_dir"),
-    ("assistant", "history_size", "history_size"),
+    ("assistant", "history_exchanges", "history_exchanges"),
     ("backup", "enabled", "backup_enabled"),
     ("backup", "git_dir", "backup_git_dir"),
     ("maintenance", "compile", "maintenance_compile"),
@@ -179,7 +180,7 @@ _ENV_FIELDS = {
     "TIMEZONE": "timezone",
     "VAULT_PATH": "vault_path",
     "STATE_DIR": "state_dir",
-    "HISTORY_SIZE": "history_size",
+    "HISTORY_EXCHANGES": "history_exchanges",
     "BACKUP_ENABLED": "backup_enabled",
     "BACKUP_GIT_DIR": "backup_git_dir",
     "MAINTENANCE_COMPILE": "maintenance_compile",
@@ -190,6 +191,7 @@ _ENV_FIELDS = {
 def load_config(config_path: Path | None = None) -> Config:
     """Load config from TOML file, with env-var overrides."""
     data: dict = {}
+    legacy_history = "HISTORY_SIZE" in os.environ
 
     # Find config file
     if config_path is None:
@@ -205,6 +207,7 @@ def load_config(config_path: Path | None = None) -> Config:
     if config_path and config_path.exists():
         with open(config_path, "rb") as f:
             raw = tomllib.load(f)
+        legacy_history |= "history_size" in raw.get("assistant", {})
         # Flatten nested TOML sections into the flat keys Config expects. Only
         # keys actually present are copied, so every default lives exactly once
         # — on the model above — instead of being restated here.
@@ -231,4 +234,9 @@ def load_config(config_path: Path | None = None) -> Config:
                 f"user ids, got {allowed_ids_env!r}"
             ) from None
 
+    if legacy_history:
+        logging.getLogger(__name__).warning(
+            "history_size/HISTORY_SIZE is retired and ignored; use "
+            "assistant.history_exchanges/HISTORY_EXCHANGES (default 5 complete exchanges)"
+        )
     return Config(**data)

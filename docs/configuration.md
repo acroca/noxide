@@ -36,13 +36,21 @@ start one.
 | `assistant.timezone` | `TIMEZONE` | `UTC` | IANA name, e.g. `Europe/Madrid`. Drives every local time the bot writes or says, and cron interpretation |
 | `assistant.vault_path` | `VAULT_PATH` | `./vault` | Vault directory. The Docker image sets this to `/data/vault` |
 | `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, usage JSONL, maintenance bookkeeping, durable outage retry queue (`pending_runs.jsonl`), and consumed inbox snapshot (`inbox.processed.md`). The image sets this to `/data/state` |
-| `assistant.history_size` | `HISTORY_SIZE` | `40` | Completed-history message bound per chat/topic, in memory only. Active and outage-pending runs are retained intact and may exceed it; the bound is reapplied when a run completes. Bigger means more context and more tokens per turn |
+| `assistant.history_exchanges` | `HISTORY_EXCHANGES` | `5` | Complete exchanges sent automatically per chat/topic (positive integer), with up to 6k text characters per exchange plus truncation markers. Only user text, final replies, and delivered reminder notes are included; completed tool traces are discarded. Older full text is available through `get_history`/`search_history` until restart or `/clear`. Active and outage-pending work stays intact outside this window |
 | `backup.enabled` | `BACKUP_ENABLED` | `false` | Local-only git history of the vault: one commit per interaction that changed it, plus a periodic sweep for edits arriving from outside the bot. Nothing is ever pushed. See [deployment.md](deployment.md#backups) |
 | `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
 | `maintenance.compile` | `MAINTENANCE_COMPILE` | `0 3 * * *` | Cron for the built-in nightly vault compile, on the local clock, weekdays by name. `""` disables it. See [vault.md](vault.md#operations) |
 | `maintenance.lint` | `MAINTENANCE_LINT` | `0 4 * * SUN` | Cron for the built-in weekly vault lint. `""` disables it |
 
 Paths are expanded and resolved, so `~/vault` and relative paths both work.
+
+`assistant.history_size` / `HISTORY_SIZE` is retired: its raw-message count is
+not interchangeable with complete exchanges. Existing values are ignored with
+a startup warning; remove them or replace them with `history_exchanges = 5`.
+The automatic window is not a retention limit: completed conversation text
+remains in RAM until restart or `/clear`, so memory use grows with conversation
+length. No Telegram backlog is downloaded and no transcript is written to disk.
+
 Keep `state_dir` persistent and backed up alongside the vault. Losing it can
 lose queued work and replay already-consumed inbox entries; restoring older
 state can also replay retries that had already completed. It contains private
@@ -89,7 +97,7 @@ opus = "claude-opus-4.8"
 
 [assistant]
 timezone = "Europe/Madrid"
-history_size = 40
+history_exchanges = 5
 
 [maintenance]
 compile = "30 2 * * *"

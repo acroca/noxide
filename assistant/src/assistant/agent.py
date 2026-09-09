@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from . import copilot, usage
 from .backup import VaultBackup
+from .history import ConversationHistory, history_tool_schemas
 from .skills import SkillLibrary
 from .tools import VaultTools, slug_from_name
 
@@ -50,19 +51,6 @@ _ERROR_RESULT_RX = re.compile(
 # A scheduled run replies with this sentinel (prompts/schedule.md) when it
 # finds its purpose already met; run_job then delivers nothing.
 _SILENT_SENTINEL = "[silent]"
-
-# Tool results from *finished* runs are trimmed to this many characters at the
-# start of the next run: heavy outputs (check_vault reports, full-page reads)
-# otherwise sit in the deque for up to history_size messages and get re-paid,
-# cold, on every later request. The marker carries no lengths so re-trimming
-# is byte-identical — a shifting history would defeat the provider's prompt
-# cache. Trimming drops read_file's trailing version token, which is a
-# feature: a rewrite in a later run must re-read anyway.
-_HISTORY_TOOL_RESULT_CAP = 2000
-_HISTORY_TRIM_MARKER = (
-    "\n[older tool output trimmed from history — call the tool again "
-    "if you need the full content]"
-)
 
 # A proactive sender: delivers text (optionally into a forum topic) and
 # returns the chat id it delivered to, or None when the message was dropped.
@@ -245,76 +233,6 @@ def _read_prompt(name: str) -> str:
     return (files("assistant") / "prompts" / name).read_text(encoding="utf-8").strip()
 
 
-class ConversationHistory:
-    """Bound completed history, retaining active and outage-pending work intact."""
-
-    def __init__(self, max_size: int = 40) -> None:
-        self._max_size = max_size
-        self._unfinished = False
-        self._history: deque[dict[str, Any]] = deque(maxlen=max_size)
-
-    def begin_run(self) -> None:
-        # Only completed history is compacted/evictable. Pending work must
-        # survive both long tool loops and any number of outage retries.
-        if not self._unfinished:
-            self.compact_tool_results()
-            self._history = deque(self._history)
-        self._unfinished = True
-
-    def finish_run(self) -> None:
-        self._history = deque(self._history, maxlen=self._max_size)
-        self._unfinished = False
-
-    def append(self, msg: dict[str, Any]) -> None:
-        self._history.append(msg)
-
-    def messages(self) -> list[dict[str, Any]]:
-        msgs = list(self._history)
-        # Eviction can cut between an assistant tool_calls message and its
-        # tool results; leading orphaned tool messages are rejected by the API.
-        while msgs and msgs[0].get("role") == "tool":
-            msgs.pop(0)
-        return msgs
-
-    def compact_tool_results(self) -> None:
-        """Trim stored tool results beyond ``_HISTORY_TOOL_RESULT_CAP`` chars.
-
-        Called at run start, under the conversation's run lock, so every
-        message in the deque belongs to a finished run — the live run keeps
-        its own tool outputs intact. Trimming is idempotent (the marker holds
-        no lengths), keeping compacted history byte-stable across runs for
-        the provider's prompt cache. Entries are replaced, not mutated: the
-        original dicts may still be referenced by an in-flight backup commit
-        or a retry-queue peek.
-        """
-        for i, msg in enumerate(self._history):
-            content = msg.get("content")
-            if (
-                msg.get("role") == "tool"
-                and isinstance(content, str)
-                and len(content) > _HISTORY_TOOL_RESULT_CAP
-            ):
-                self._history[i] = {
-                    **msg,
-                    "content": content[:_HISTORY_TOOL_RESULT_CAP] + _HISTORY_TRIM_MARKER,
-                }
-
-    def pop_if_last(self, msg: dict[str, Any]) -> bool:
-        """Remove ``msg`` if it is (by identity) the newest entry.
-
-        Lets a failed outage-replay attempt unwind the note it just appended:
-        anything newer than the note means the run made progress, which must
-        be kept.
-        """
-        if self._history and self._history[-1] is msg:
-            self._history.pop()
-            return True
-        return False
-
-    def clear(self) -> None:
-        self._history.clear()
-
-
 def extract_tool_calls(msg: dict[str, Any]) -> list[dict[str, Any]]:
     """Return tool calls from an assistant message, tolerating legacy shapes."""
     tool_calls = msg.get("tool_calls")
@@ -349,7 +267,7 @@ class Agent:
         fan_out_fn: Callable[[str, list[str]], Coroutine[Any, Any, str]] | None = None,
         skills: SkillLibrary | None = None,
         backup: VaultBackup | None = None,
-        history_size: int = 40,
+        history_exchanges: int = 5,
         tz_name: str = "UTC",
     ) -> None:
         self._vault = vault_tools
@@ -376,13 +294,13 @@ class Agent:
         # (other topics, scheduled jobs on chat 0) run in parallel.
         self._run_locks: dict[tuple[int, int | None], asyncio.Lock] = {}
         self._topic_lock = asyncio.Lock()
-        self._history_size = history_size
+        self._history_exchanges = history_exchanges
         self._tz = ZoneInfo(tz_name)
 
     def _get_history(self, chat_id: int, thread_id: int | None = None) -> ConversationHistory:
         key = (chat_id, thread_id)
         if key not in self._histories:
-            self._histories[key] = ConversationHistory(self._history_size)
+            self._histories[key] = ConversationHistory(self._history_exchanges)
         return self._histories[key]
 
     def _local_stamp(self) -> str:
@@ -396,7 +314,7 @@ class Agent:
         send again.
         """
         notes = self._pending_notes.setdefault(
-            (chat_id, thread_id), deque(maxlen=self._history_size)
+            (chat_id, thread_id), deque()
         )
         notes.append(f"[{self._local_stamp()}, sent from a scheduled run] {text}")
 
@@ -525,6 +443,7 @@ class Agent:
 
     def _all_tools(self) -> list[dict[str, Any]]:
         tools = list(self._vault.tool_schemas())
+        tools.extend(history_tool_schemas())
         tools.extend(self._schedule_schemas)
         if self._skills:
             tools.extend(self._skills.tool_schemas())
@@ -643,7 +562,12 @@ class Agent:
         name: str,
         args: dict[str, Any],
         send_message_fn: SendMessageFn | None = None,
+        history: ConversationHistory | None = None,
     ) -> str:
+        if name in ("get_history", "search_history"):
+            if history is None:
+                return "[tool error: no conversation history in this context]"
+            return history.retrieve(name, args)
         # Vault mutations wait for any in-flight backup commit, so a commit
         # never snapshots a file mid-write.
         if self._backup is not None and name in _VAULT_MUTATING_TOOLS:
@@ -790,10 +714,11 @@ class Agent:
         CopilotUnavailableError removes the just-appended user message from
         history before propagating — the drain loop re-invokes the replay on
         every backoff cycle, and without the unwind each failed attempt would
-        leave its note behind, eventually evicting the original failed turn
-        from the deque. Only the newest entry is ever removed: anything newer
+        grow the pending request with a redundant note. Only the newest entry
+        is ever removed: anything newer
         means the run made progress (completed tool calls) that the next
-        resume must see.
+        resume must see. Completed exchanges are projected separately; this
+        unwind touches only the unfinished work block.
         """
         t_start = time.monotonic()
         history = self._get_history(chat_id, thread_id)
@@ -832,6 +757,8 @@ class Agent:
             if transient_context is None
             else f"{stamped_message}\n\n{transient_context}"
         )
+        if coverage := history.coverage():
+            live_text = f"{live_text}\n\n{coverage}"
         live_entry: dict[str, Any] | None = None
         if image_data_urls:
             live_entry = {
@@ -844,7 +771,7 @@ class Agent:
                     ),
                 ],
             }
-        elif transient_context is not None:
+        elif transient_context is not None or coverage:
             live_entry = {"role": "user", "content": live_text}
 
         tools = self._all_tools()
@@ -866,10 +793,10 @@ class Agent:
                 raise
             except Exception:
                 # A rejected request is terminal, not outage-pending work.
-                # Bound it so the next run can compact oversized outputs;
+                # Keep it so the next run can compact oversized outputs;
                 # retain the real tail (no success reply to supersede retries).
                 # CancelledError is a BaseException and preserves pending work.
-                history.finish_run()
+                history.finish_run(success=False)
                 raise
 
             choice = response["choices"][0]
@@ -910,7 +837,7 @@ class Agent:
                         finish_reason,
                         json.dumps(msg, ensure_ascii=False)[:4000],
                     )
-                history.finish_run()
+                history.finish_run(timestamp=self._local_stamp())
                 return msg.get("content") or "", touched
 
             # Execute tool calls
@@ -939,7 +866,7 @@ class Agent:
                     touched |= _paths_touched(fn_name, fn_args)
                     timeout = _TOOL_TIMEOUTS.get(fn_name, _TOOL_TIMEOUT)
                     result = await asyncio.wait_for(
-                        self._dispatch_tool(fn_name, fn_args, send_message_fn),
+                        self._dispatch_tool(fn_name, fn_args, send_message_fn, history),
                         timeout=timeout,
                     )
                 except TimeoutError:

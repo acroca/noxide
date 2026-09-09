@@ -354,7 +354,7 @@ async def test_agent_dispatches_fan_out_tool(vault: VaultTools) -> None:
         calls.append((instruction, items))
         return "### Item 1: a\nfine"
 
-    agent = Agent(vault_tools=vault, fan_out_fn=fake_fan_out, history_size=10)
+    agent = Agent(vault_tools=vault, fan_out_fn=fake_fan_out)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=[
         _make_tool_call_response("fan_out", {"instruction": "grade", "items": ["a"]}),

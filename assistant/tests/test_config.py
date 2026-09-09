@@ -266,14 +266,32 @@ def test_vault_path_and_state_dir_env_override(
     assert cfg.state_dir == tmp_path / "mounted-state"
 
 
-def test_history_size_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HISTORY_SIZE", "12")
+def test_history_exchanges_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HISTORY_EXCHANGES", "7")
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text("[assistant]\nhistory_size = 40\n")
+    cfg_file.write_text("[assistant]\nhistory_exchanges = 5\n")
 
     cfg = load_config(cfg_file)
 
-    assert cfg.history_size == 12
+    assert cfg.history_exchanges == 7
+
+
+def test_legacy_history_size_warns_without_changing_exchange_default(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HISTORY_SIZE", "40")
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text("[assistant]\nhistory_size = 40\n")
+    assert load_config(cfg_file).history_exchanges == 5
+    assert "retired and ignored" in caplog.text
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_history_exchanges_must_be_positive(tmp_path, value):
+    from pydantic import ValidationError
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(f"[assistant]\nhistory_exchanges = {value}\n")
+    with pytest.raises(ValidationError):
+        load_config(cfg_file)
 
 
 def test_keys_absent_from_a_present_section_keep_their_defaults(tmp_path: Path) -> None:
@@ -284,7 +302,7 @@ def test_keys_absent_from_a_present_section_keep_their_defaults(tmp_path: Path) 
     cfg = load_config(cfg_file)
 
     assert cfg.timezone == "Europe/Madrid"
-    assert cfg.history_size == 40
+    assert cfg.history_exchanges == 5
 
 
 def test_allowed_user_ids_env_rejects_non_numeric_entries(

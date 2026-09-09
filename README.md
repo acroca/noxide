@@ -159,7 +159,7 @@ lines of plain Python.
 
 ## Design decisions & notes
 
-- **No persistent chat history.** Restarting loses conversation context. The vault is the only memory. This is intentional — what matters got written down, and what didn't wasn't worth keeping.
+- **Small context, retrievable history.** The last five complete exchanges are supplied automatically, without old tool traces. Earlier conversation text is searchable on demand within the same chat/topic. History stays in memory until restart or `/clear`; durable knowledge belongs in the vault. See [configuration](docs/configuration.md).
 - **Allowlisted users.** `allowed_user_ids` lists the Telegram user ids that may talk to the bot; everyone else is silently ignored. Multiple ids are supported (a household sharing one assistant), but they all share one vault and one conversation per chat — this is not multi-tenancy.
 - **Graceful restarts.** SIGTERM starts a drain: the bot stops fetching, finishes the in-flight run plus everything already queued, waits for any mid-run scheduled job, and only then exits. This is not politeness — stopping the updater acks every fetched update to Telegram, so a container killed mid-drain loses those messages for good. A second signal abandons the drain. The budget is 270s, which is why the Compose service must set `stop_grace_period: 5m`.
 - **schedule.md as source of truth.** APScheduler uses an in-memory job store only. The markdown file is re-parsed on startup and every 60 seconds, so hand edits take effect within a minute. Rows that don't parse are logged, not silently dropped. On restart, one-off jobs overdue by less than 12 hours fire once; older ones are dropped.

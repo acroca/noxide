@@ -572,7 +572,7 @@ async def test_agent_dispatches_research_tool(vault: VaultTools) -> None:
         questions.append(question)
         return "The answer is 42. Source: https://example.com"
 
-    agent = Agent(vault_tools=vault, research_fn=fake_research, history_size=10)
+    agent = Agent(vault_tools=vault, research_fn=fake_research)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=[
         _make_tool_call_response("research", {"question": "answer to everything?"}),
