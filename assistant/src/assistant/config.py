@@ -7,6 +7,7 @@ import os
 import shutil
 import tomllib
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
@@ -50,9 +51,17 @@ class Config(BaseSettings):
     # suits a local checkout; a packaged deployment points them at its own
     # mounts via VAULT_PATH / STATE_DIR rather than having them baked in here.
     timezone: str = "UTC"
+    agent_name: str = Field(default="Noxide", min_length=1, max_length=64)
     vault_path: Path = Path("vault")
     state_dir: Path = Path("state")
     history_exchanges: int = Field(default=5, ge=1)
+
+    # Optional same-process web companion. Public access requires HTTPS.
+    pwa_enabled: bool = False
+    pwa_host: str = "127.0.0.1"
+    pwa_port: int = Field(default=8080, ge=1, le=65535)
+    pwa_origin: str = "http://localhost:8080"
+    pwa_push_contact: str = ""
 
     # Vault backup (optional) — local-only git history of the vault, kept in a
     # git dir outside it. None means <state_dir>/vault.git.
@@ -72,6 +81,13 @@ class Config(BaseSettings):
         if v is None:
             return None
         return Path(v).expanduser().resolve()
+
+    @field_validator("agent_name", mode="before")
+    @classmethod
+    def validate_agent_name(cls, value: str) -> str:
+        if not isinstance(value, str) or any(not c.isprintable() for c in value):
+            raise ValueError("assistant.name must be a printable single-line name")
+        return value.strip()
 
     @field_validator("maintenance_compile", "maintenance_lint")
     @classmethod
@@ -143,6 +159,15 @@ class Config(BaseSettings):
                 )
 
         problems.extend(self._maintenance_problems())
+        if self.pwa_enabled:
+            origin = urlsplit(self.pwa_origin)
+            if (origin.scheme not in ("http", "https") or not origin.hostname
+                    or origin.path or origin.query or origin.fragment or origin.username
+                    or origin.password or (origin.scheme == "http"
+                    and origin.hostname not in ("localhost", "127.0.0.1", "::1"))):
+                problems.append("pwa.origin must be an HTTPS origin without a path (HTTP only on localhost)")
+            if self.pwa_push_contact and not self.pwa_push_contact.startswith("mailto:"):
+                problems.append("pwa.push_contact must be a mailto: address, or empty to disable push")
 
         if problems:
             raise ConfigError(
@@ -161,9 +186,15 @@ _TOML_FIELDS = (
     ("copilot", "vendors", "model_vendors"),
     ("web", "fourget_url", "fourget_url"),
     ("assistant", "timezone", "timezone"),
+    ("assistant", "name", "agent_name"),
     ("assistant", "vault_path", "vault_path"),
     ("assistant", "state_dir", "state_dir"),
     ("assistant", "history_exchanges", "history_exchanges"),
+    ("pwa", "enabled", "pwa_enabled"),
+    ("pwa", "host", "pwa_host"),
+    ("pwa", "port", "pwa_port"),
+    ("pwa", "origin", "pwa_origin"),
+    ("pwa", "push_contact", "pwa_push_contact"),
     ("backup", "enabled", "backup_enabled"),
     ("backup", "git_dir", "backup_git_dir"),
     ("maintenance", "compile", "maintenance_compile"),
@@ -178,9 +209,15 @@ _ENV_FIELDS = {
     "DEFAULT_FAMILY": "default_family",
     "FOURGET_URL": "fourget_url",
     "TIMEZONE": "timezone",
+    "AGENT_NAME": "agent_name",
     "VAULT_PATH": "vault_path",
     "STATE_DIR": "state_dir",
     "HISTORY_EXCHANGES": "history_exchanges",
+    "PWA_ENABLED": "pwa_enabled",
+    "PWA_HOST": "pwa_host",
+    "PWA_PORT": "pwa_port",
+    "PWA_ORIGIN": "pwa_origin",
+    "PWA_PUSH_CONTACT": "pwa_push_contact",
     "BACKUP_ENABLED": "backup_enabled",
     "BACKUP_GIT_DIR": "backup_git_dir",
     "MAINTENANCE_COMPILE": "maintenance_compile",

@@ -7,11 +7,13 @@ that doesn't.
 
 ## What this project is
 
-- **Single user, self-hosted.** No multi-tenancy, no accounts, no web UI.
+- **Single user, self-hosted.** No multi-tenancy or application accounts. An
+  optional private-network PWA runs alongside Telegram.
 - **The vault is the memory.** Plain markdown on disk, readable and useful
-  without this bot. Conversation history is deliberately ephemeral.
-- **No LLM frameworks.** The agent loop is ~100 lines of plain Python and stays
-  that way. New capabilities are tools, not abstractions.
+  without this bot. Conversation text is archived separately in private SQLite;
+  it is evidence, not a replacement for the vault's current knowledge.
+- **No LLM frameworks.** A plain Python agent loop. New capabilities are tools,
+  not abstractions.
 - **Quarantine over trust.** Untrusted content gets an isolated sub-agent or an
   explicit label; capabilities stay jailed.
 
@@ -23,14 +25,15 @@ proposing a feature.
 
 ```bash
 cd assistant
-uv sync --dev
-uv run pytest
-uv run ruff check src/ tests/
+mise exec uv -- uv sync --dev
+mise exec uv -- uv run pytest
+mise exec uv -- uv run ruff check src/ tests/
 ```
 
-`uv run pytest tests/test_agent.py -k test_name` runs a single test. Tests use
+`mise exec uv -- uv run pytest tests/test_agent.py -k test_name` runs a single test. Tests use
 `asyncio_mode = "auto"`, so async tests need no decorator, and HTTP is mocked
-with `respx` — no test should ever make a real network call.
+with `respx`; companion/browser tests use disposable local servers. Tests must
+not contact real Telegram, Copilot, push providers, or other external services.
 
 Running the bot for real needs a Telegram bot token, a Copilot licence and a
 one-time `assistant auth` — see [docs/development.md](docs/development.md).
@@ -39,8 +42,8 @@ one-time `assistant auth` — see [docs/development.md](docs/development.md).
 
 1. **Open an issue first** for anything beyond a bug fix or a docs correction.
    A feature that doesn't fit the constraints above is a wasted afternoon.
-2. **Write the test first.** The suite covers ~87% of the source and is the
-   reason this thing can be refactored at all. A change without a test that
+2. **Write the test first.** Regression tests are what make refactoring safe.
+   A change without a test that
    would have failed before it is unlikely to be merged.
 3. **Run `pytest` and `ruff check` before pushing.** CI runs both on every PR.
 4. **Keep commits conventional**: `feat:`, `fix:`, `refactor:`, `docs:`,

@@ -85,6 +85,7 @@ async def graceful_shutdown(
     scheduler: Scheduler | Any,
     force: asyncio.Event,
     budget: float = DRAIN_BUDGET,
+    companion: Any = None,
 ) -> None:
     """Stop accepting work, let what is in flight finish, then tear down.
 
@@ -102,7 +103,7 @@ async def graceful_shutdown(
     with contextlib.suppress(Exception):
         await bot.stop_polling()
 
-    drain = asyncio.create_task(_drain_all(bot, scheduler, budget))
+    drain = asyncio.create_task(_drain_all(bot, scheduler, budget, companion))
     abandoned = asyncio.create_task(force.wait())
     try:
         done, _ = await asyncio.wait(
@@ -134,10 +135,12 @@ async def graceful_shutdown(
         await bot.close()
 
 
-async def _drain_all(bot: TelegramBot | Any, scheduler: Scheduler | Any, budget: float) -> None:
+async def _drain_all(bot: TelegramBot | Any, scheduler: Scheduler | Any, budget: float,
+                     companion: Any = None) -> None:
     """Await the Telegram queue and any in-flight scheduled jobs."""
     results = await asyncio.gather(
-        bot.drain(), scheduler.drain(timeout=budget), return_exceptions=True
+        bot.drain(), scheduler.drain(timeout=budget),
+        *([companion.drain()] if companion is not None else []), return_exceptions=True
     )
     for result in results:
         if isinstance(result, BaseException):

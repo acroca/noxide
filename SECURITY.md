@@ -12,10 +12,42 @@ rather not be.
 
 ## Threat model
 
-Noxide is a single-user, self-hosted bot holding a private journal. It makes
-outbound connections only and publishes no ports.
+Noxide is a single-user, self-hosted assistant holding a private journal. By
+default it makes outbound connections only. The optional PWA companion opens
+a network-protected HTTP listener with **no application authentication**; see
+[deployment](docs/deployment.md#web-companion-pwa) before enabling it. Anyone who
+can reach the listener can read conversations and use the assistant. Restrict
+access through Tailscale Serve and tailnet rules (never Funnel), or equivalent
+private-network controls. Keep the backend port bound to localhost. This is not
+multi-tenant access control and is not suitable for public exposure.
 
 ### What it defends against
+
+**Web browser protections.** The service validates Host and same-origin mutation
+headers and does not enable CORS. These checks are not authentication: a direct
+client can supply the expected headers. HTML content is escaped before the limited
+Markdown renderer handles it; no raw HTML or arbitrary vault file server is
+exposed. CSP blocks inline script, framing, and external dependencies. The
+service worker caches only public shell assets, never API/vault responses.
+Push endpoints are restricted to known browser push providers, with redirects
+disabled; expired subscriptions are removed. Notifications display reply or
+reminder previews (up to 500 characters), which can expose private content on
+the lock screen. Control preview visibility in device notification settings.
+
+Web drafts and uncertain-submission records are stored unencrypted in browser
+local storage. Uncertain-submission records contain both a client ID and full
+message text and can remain after Clear local drafts to deduplicate uncertain
+sends. Clear the site's browser data to remove all local records. Telegram and web messages, completed model
+context, replies and push subscriptions persist in private SQLite,
+even with the PWA disabled. Protect the
+device, state directory and backups accordingly. Clearing local drafts is not a
+remote device wipe. Reset context retains the archive and starts a new automatic window;
+Delete chat removes saved conversation text, not vault facts, Telegram-side
+messages, pending queue payloads, logs or backups. Non-content tombstones retain
+IDs, conversation keys, timestamps, source, role, reply linkage, generation and
+delivery state to prevent old retries resurrecting deleted messages. SQLite secure_delete is
+enabled, but this is not a guarantee of forensic erasure on the host or backups.
+Push delivery is best effort, not an acknowledgment.
 
 **Untrusted web content.** Web research runs in a `Researcher` sub-agent with a
 fresh context per call and exactly two tools (search, fetch). It has no vault,
@@ -89,8 +121,12 @@ markdown and `state/oauth_token` is a plaintext credential at `0600`. The state
 directory also holds private queued messages and the exact consumed inbox
 snapshot. These are as safe as the machine they sit on.
 
-**Denial of service and quota exhaustion.** There is no rate limiting; the
-allowlist is the only gate. An allowlisted user can burn your Copilot quota.
+**Denial of service and quota exhaustion.** Telegram's allowlist and private
+network controls are trust gates, not quotas. At most four web runs are admitted
+at once, one unfinished web message per space. Anyone who can reach the web
+service can still consume Copilot quota or fill storage. Use a
+private network and reverse-proxy limits rather than treating this personal
+service as hardened public multi-user hosting.
 
 ## Deployment notes
 

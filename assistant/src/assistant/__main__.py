@@ -88,6 +88,9 @@ async def _run(config_path: Path | None) -> None:
         tz_name=cfg.timezone,
         maintenance=tuple(job.id for job in maintenance_jobs),
     )
+    from .conversations import ConversationArchive
+
+    archive = ConversationArchive(cfg.state_dir)
 
     # Vault backup (optional) — local-only git history of the vault, in a git
     # dir outside it. The startup sweep commits anything from before this boot.
@@ -120,15 +123,27 @@ async def _run(config_path: Path | None) -> None:
     from .retry_queue import PendingItem, RetryQueue
 
     async def replay_message(
-        chat_id: int, thread_id: int | None, text: str, queued_at: str, hot: bool
+        chat_id: int, thread_id: int | None, text: str, queued_at: str, hot: bool,
+        message_id: str | None = None,
     ) -> None:
-        reply = await agent.retry_message(chat_id, thread_id, text, queued_at, hot=hot)
+        context_chat = chat_id
+        if message_id and (record := archive.get(message_id)) is not None:
+            from .conversations import WEB_CHAT_ID
+
+            if record["space"] == "general" or record["space"].startswith("topic:"):
+                context_chat = WEB_CHAT_ID
+        reply = await agent.retry_message(context_chat, thread_id, text, queued_at, hot=hot,
+                                          **({"message_id": message_id} if message_id else {}))
         if reply is None:
             return  # superseded — correctly silent
         _require_completed(reply)
         try:
-            await bot.send_message(reply or "(no reply)", thread_id, chat_id=chat_id)
+            target = await bot.send_message(reply or "(no reply)", thread_id, chat_id=chat_id)
+            if message_id:
+                archive.delivery(message_id, "delivered" if target is not None else "failed")
         except Exception:
+            if message_id:
+                archive.delivery(message_id, "failed")
             # The run itself succeeded (vault writes happened); a Telegram
             # delivery hiccup — likely when several items drain back-to-back —
             # must not classify the item as poison and tell the user their
@@ -176,6 +191,7 @@ async def _run(config_path: Path | None) -> None:
         state_dir=cfg.state_dir,
         default_chat_id=cfg.default_chat_id,
         queue_message_fn=retry_queue.enqueue_message,
+        archive=archive,
     )
 
     # Web research is optional — enabled when a 4get URL is configured
@@ -219,12 +235,27 @@ async def _run(config_path: Path | None) -> None:
         maintenance_state=MaintenanceState(cfg.state_dir / STATE_FILENAME),
     )
 
+    companion = None
+
+    async def send_message(text: str, thread_id: int | None = None) -> int | None:
+        target = await bot.send_message(text, thread_id)
+        if target is not None:
+            archive.insert(agent.conversation_space(target, thread_id), "assistant", text, "done",
+                           source="telegram", delivery="delivered")
+            agent._queue_sent_note(target, thread_id, text)
+        if companion is not None and target is not None:
+            try:
+                await companion.observe_delivery(text, thread_id)
+            except Exception:
+                logging.getLogger(__name__).exception("Could not mirror delivery into web companion")
+        return target
+
     # Init agent
     agent = Agent(
         vault_tools=vault,
         schedule_dispatcher=scheduler.dispatch,
         schedule_schemas=scheduler.tool_schemas(),
-        send_message_fn=bot.send_message,
+        send_message_fn=send_message,
         create_forum_topic_fn=bot.create_forum_topic,
         research_fn=researcher.research if researcher else None,
         extract_fn=extractor.extract,
@@ -233,8 +264,16 @@ async def _run(config_path: Path | None) -> None:
         backup=backup,
         history_exchanges=cfg.history_exchanges,
         tz_name=cfg.timezone,
+        archive=archive,
+        home_chat_fn=lambda: bot.home_chat_id,
+        agent_name=cfg.agent_name,
     )
     bot._agent = agent  # wire back
+    retry_queue.attach_archive(archive, agent.conversation_space)
+    if cfg.pwa_enabled:
+        from .companion import Companion
+
+        companion = Companion(cfg, agent, vault, scheduler, archive=archive)
 
     usage_task = asyncio.create_task(tracker.run())
     lifecycle = Lifecycle()
@@ -243,6 +282,8 @@ async def _run(config_path: Path | None) -> None:
     try:
         await bot.start(abort=lifecycle.stop)
         if not lifecycle.stop.is_set():
+            if companion is not None:
+                await companion.start()
             # Even overdue date jobs must wait for Telegram readiness, not
             # just recurring catch-up: a failed delivery consumes a one-off.
             scheduler.start()
@@ -264,9 +305,14 @@ async def _run(config_path: Path | None) -> None:
             for task in background:
                 task.cancel()
             await asyncio.gather(*background, return_exceptions=True)
-            await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force)
+            if companion is not None:
+                companion.accepting = False
+            await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force,
+                                    companion=companion)
         finally:
             try:
+                if companion is not None:
+                    await companion.close()
                 await _drain_final(
                     [("usage telemetry", tracker, usage_task)]
                     + ([("vault backup", backup, backup_task)] if backup is not None else []),
@@ -276,6 +322,7 @@ async def _run(config_path: Path | None) -> None:
                 # The second signal must retain its controlled force path
                 # throughout the drain, rather than reverting to SIG_DFL.
                 lifecycle.remove()
+                archive.close()
 
 
 async def _drain_final(

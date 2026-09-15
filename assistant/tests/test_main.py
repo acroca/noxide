@@ -220,6 +220,29 @@ async def test_run_waits_for_telegram_readiness_before_starting_jobs(runtime) ->
     runtime.backup.drain.assert_awaited_once()
 
 
+async def test_web_companion_starts_drains_and_mirrors_successful_sends(runtime, monkeypatch):
+    from assistant import companion
+
+    runtime.cfg.pwa_enabled = True
+    service = MagicMock(start=AsyncMock(), drain=AsyncMock(), close=AsyncMock(),
+                        observe_delivery=AsyncMock())
+    factory = MagicMock(return_value=service)
+    monkeypatch.setattr(companion, "Companion", factory)
+    await main._run(None)
+    service.start.assert_awaited_once()
+    service.drain.assert_awaited_once()
+    service.close.assert_awaited_once()
+    assert not service.accepting
+    sender = agent.Agent.call_args.kwargs["send_message_fn"]
+    monkeypatch.setattr(agent.Agent.call_args.kwargs["archive"], "insert", MagicMock())
+    runtime.bot.send_message.return_value = 123
+    assert await sender("A reminder", 10) == 123
+    service.observe_delivery.assert_awaited_once_with("A reminder", 10)
+    runtime.bot.send_message.return_value = None
+    assert await sender("Dropped", None) is None
+    service.observe_delivery.assert_awaited_once()
+
+
 async def test_second_signal_can_force_the_actual_graceful_drain(runtime) -> None:
     final_tasks = []
 

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#eeeee7">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="description" content="Chat with your personal assistant and read your Now page.">
+  <title>__AGENT_NAME__ · Chat</title>
+  <meta name="agent-name" content="__AGENT_NAME__">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <div id="update-banner" class="update-banner" role="status" hidden><span id="update-label">Update available. Reload when you’re ready.</span><button id="reload-update" type="button" class="secondary">Reload</button></div>
+  <section id="unavailable" class="unavailable-view" hidden>
+    <span class="wordmark"><span data-agent-name>__AGENT_NAME__</span><span class="brand-dot"></span></span>
+    <h1 id="unavailable-title">__AGENT_NAME__ is unavailable</h1>
+    <p id="unavailable-detail">Couldn’t reach your server. Check that the assistant and Tailscale are running, then try again.</p>
+    <p>Your saved drafts stay on this device. Conversations and Now need a connection to your server.</p>
+    <button id="retry-connection" class="primary" type="button">Try again</button>
+  </section>
+  <div id="shell" class="shell" hidden>
+    <aside class="sidebar">
+       <a class="wordmark" href="#chat" aria-label="Chat home"><span data-agent-name>__AGENT_NAME__</span><span class="brand-dot"></span></a>
+      <span class="sidebar-label">YOUR EVERYDAY</span>
+      <nav aria-label="Main navigation">
+        <a href="#chat" data-nav="chat"><span data-icon="chat"></span>Chat</a>
+        <a href="#now" data-nav="now"><span data-icon="page"></span>Now</a>
+      </nav>
+      <div class="sidebar-rule"></div>
+      <span class="sidebar-label">TOPICS</span>
+      <div id="topic-links" class="topic-links" aria-label="Chat topics"></div>
+      <div class="sidebar-bottom"><div class="local-label"><span class="status-dot"></span><span id="connection">Connected to your vault</span></div><button id="settings-button" class="quiet"><span data-icon="settings"></span>Preferences</button></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar"><a class="mobile-brand" href="#chat"><span data-agent-name>__AGENT_NAME__</span><span class="brand-dot"></span></a><span id="breadcrumb">Chat / General</span><div class="topbar-actions"><button id="refresh" class="icon-button" aria-label="Refresh" title="Refresh"><span data-icon="refresh"></span></button><button id="mobile-settings" class="icon-button" aria-label="Preferences"><span data-icon="settings"></span></button></div></header>
+      <div id="offline-banner" class="offline-banner" role="status" hidden>__AGENT_NAME__ is unreachable. Your draft stays here; nothing is sent automatically.</div>
+      <main id="main" tabindex="-1"><div class="loading">Opening chat…</div></main>
+    </div>
+    <nav class="mobile-nav" aria-label="Mobile navigation"><a href="#chat" data-nav="chat"><span data-icon="chat"></span>Chat</a><a href="#now" data-nav="now"><span data-icon="page"></span>Now</a></nav>
+  </div>
+  <dialog id="settings"><form method="dialog"><button class="dialog-close icon-button" aria-label="Close preferences">×</button></form><span class="eyebrow">MAKE YOURSELF AT HOME</span><h2>A few preferences.</h2><section><h3>Notifications</h3><p>Notifications include reply and reminder previews. Message content may appear on your lock screen; control previews in your device notification settings.</p><button id="push-toggle" class="secondary">Enable notifications</button><button id="push-test" class="quiet" hidden>Send a test</button><p id="push-status" class="small"></p></section><section><h3>Install <span data-agent-name>__AGENT_NAME__</span></h3><p id="install-help">Use your browser’s install menu. On iPhone: Share → Add to Home Screen. Install before enabling notifications.</p><button id="install" class="secondary" hidden>Install app</button></section><section><h3>Your conversations</h3><p>Telegram and web messages share a private archive on your server. The latest five complete exchanges are restored after restart; older messages can be retrieved when needed. Reset context starts fresh without deleting the archive. Delete chat removes the saved conversation, not vault knowledge or messages in the Telegram app.</p><p>There is no app password. Access is controlled by your private network. Anyone who can reach this service can use the assistant and read its conversations.</p><button id="clear-local-drafts" class="quiet danger">Clear local drafts</button></section></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="topic-picker" aria-labelledby="topic-picker-title">
+    <button id="close-topics" class="dialog-close icon-button" type="button" aria-label="Close topics">×</button>
+    <h2 id="topic-picker-title">Choose a topic</h2>
+    <nav id="topic-options" aria-label="Available topics"></nav>
+  </dialog>
+  <noscript>This companion needs JavaScript. Telegram remains available.</noscript>
+</body>
+</html>

@@ -244,6 +244,7 @@ class TelegramBot:
         state_dir: Path | None = None,
         default_chat_id: int | None = None,
         queue_message_fn: Callable[[int, int | None, str], None] | None = None,
+        archive=None,
     ) -> None:
         self._token = token
         self._allowed_user_ids = allowed_user_ids
@@ -255,6 +256,7 @@ class TelegramBot:
         self._set_model_fn = set_model_fn
         self._refresh_models_fn = refresh_models_fn
         self._queue_message_fn = queue_message_fn
+        self.archive = archive
         # Open batches per (chat_id, thread_id); a batch leaves the dict the
         # moment its run starts, so later arrivals open the next one. The task
         # set is the strong reference asyncio requires and what the shutdown
@@ -307,6 +309,10 @@ class TelegramBot:
         for chunk in _split_message(text):
             await self._app.bot.send_message(**{**kwargs, "text": chunk})
         return target_chat_id
+
+    @property
+    def home_chat_id(self) -> int | None:
+        return self._chat_id
 
     async def create_forum_topic(self, name: str) -> dict[str, Any]:
         """Create a new forum topic in the group and return its data dict.
@@ -474,9 +480,12 @@ class TelegramBot:
         pending = self._batches.get((msg.chat_id, thread_id))
         if pending is not None and pending.task is not None:
             await asyncio.shield(pending.task)
-        self._agent.clear_history(msg.chat_id, thread_id=thread_id)
+        if self.archive:
+            await self._agent.reset_conversation(msg.chat_id, thread_id)
+        else:
+            self._agent.clear_history(msg.chat_id, thread_id=thread_id)
         await msg.reply_text(
-            "Context cleared — I've forgotten this conversation. Vault notes are untouched.",
+            "Context cleared. The conversation archive and vault notes are untouched.",
             message_thread_id=thread_id,
         )
 
@@ -777,11 +786,35 @@ class TelegramBot:
         # which finishes in any order; Telegram's message ids record the order
         # the user actually sent.
         items = _cap_images(sorted(batch.items, key=lambda item: item.msg.message_id))
+        if self.archive:
+            # Telegram can regroup redelivered updates after a restart. Dedup
+            # individual update identities, not the quiet-window batch shape.
+            items = [item for item in items if not self.archive.db.execute(
+                "SELECT 1 FROM telegram_inputs WHERE chat_id=? AND message_id=?",
+                (chat_id, item.msg.message_id),
+            ).fetchone()]
+            if not items:
+                return
         text = _combine_batch([item.text for item in items])
         image_data_urls = [item.image_data_url for item in items if item.image_data_url]
         # The reply and the research reaction go to the newest message: that
         # is where the user is looking, and a burst reads as one send.
         msg = items[-1].msg
+        message_id = None
+        if self.archive:
+            message_id = f"telegram:{chat_id}:" + ",".join(str(item.msg.message_id) for item in items)
+            space = self._agent.conversation_space(chat_id, thread_id)
+            self.archive.insert(space, "user", text, "queued", message_id=message_id, source="telegram",
+                                metadata={"chat_id": chat_id, "thread_id": thread_id,
+                                          "message_ids": [item.msg.message_id for item in items],
+                                          "items": [{"id": item.msg.message_id, "text": item.text,
+                                                     "date": str(item.msg.date)} for item in items]})
+            self.archive.db.executemany("INSERT OR IGNORE INTO telegram_inputs VALUES (?,?,?)",
+                                        [(chat_id, item.msg.message_id, message_id) for item in items])
+            self.archive.db.commit()
+            existing = self.archive.get(message_id)
+            if existing["status"] in ("done", "dismissed", "deleted"):
+                return
 
         try:
             await batch.bot.send_chat_action(
@@ -799,6 +832,8 @@ class TelegramBot:
         }
         if image_data_urls:
             agent_kwargs["image_data_urls"] = image_data_urls
+        if message_id:
+            agent_kwargs["message_id"] = message_id
 
         try:
             reply = await self._agent.run(chat_id, text, **agent_kwargs)
@@ -814,7 +849,10 @@ class TelegramBot:
                     "(chat_id=%d thread_id=%s)",
                     e, chat_id, thread_id,
                 )
-                self._queue_message_fn(chat_id, thread_id, text)
+                if message_id:
+                    self._queue_message_fn(chat_id, thread_id, text, message_id=message_id)
+                else:
+                    self._queue_message_fn(chat_id, thread_id, text)
                 reply = (
                     "GitHub Copilot looks down right now — I've queued your "
                     "message and will answer as soon as it's back."
@@ -823,8 +861,18 @@ class TelegramBot:
             logger.exception("Agent error for chat_id=%d thread_id=%s", chat_id, thread_id)
             reply = f"Sorry, something went wrong: {e}"
 
-        for chunk in _split_message(reply or "(no reply)"):
-            await msg.reply_text(chunk, message_thread_id=thread_id)
+        receipts = []
+        try:
+            for chunk in _split_message(reply or "(no reply)"):
+                sent = await msg.reply_text(chunk, message_thread_id=thread_id)
+                if sent is not None:
+                    receipts.append(sent.message_id)
+        except Exception:
+            if self.archive and message_id:
+                self.archive.delivery(message_id, "partial" if receipts else "failed", receipts)
+            raise
+        if self.archive and message_id:
+            self.archive.delivery(message_id, "delivered", receipts)
 
     def _is_allowed(self, update: Update) -> bool:
         uid = update.effective_user.id if update.effective_user else None

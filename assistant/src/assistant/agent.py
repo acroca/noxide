@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from . import copilot, usage
 from .backup import VaultBackup
+from .conversations import WEB_CHAT_ID, ConversationArchive, conversation_space
 from .history import ConversationHistory, history_tool_schemas
 from .skills import SkillLibrary
 from .tools import VaultTools, slug_from_name
@@ -269,8 +270,12 @@ class Agent:
         backup: VaultBackup | None = None,
         history_exchanges: int = 5,
         tz_name: str = "UTC",
+        archive: ConversationArchive | None = None,
+        home_chat_fn: Callable[[], int | None] | None = None,
+        agent_name: str = "Noxide",
     ) -> None:
         self._vault = vault_tools
+        self._agent_name = agent_name
         self._schedule_dispatcher = schedule_dispatcher
         self._schedule_schemas = schedule_schemas or []
         self._send_message_fn = send_message_fn
@@ -295,13 +300,42 @@ class Agent:
         self._run_locks: dict[tuple[int, int | None], asyncio.Lock] = {}
         self._topic_lock = asyncio.Lock()
         self._history_exchanges = history_exchanges
+        self.archive = archive
+        self._home_chat_fn = home_chat_fn
+        self._space_aliases: dict[tuple[int, int | None], str] = {}
+        self._home_chat_aliases: set[int] = set()
         self._tz = ZoneInfo(tz_name)
 
     def _get_history(self, chat_id: int, thread_id: int | None = None) -> ConversationHistory:
-        key = (chat_id, thread_id)
+        key = self.conversation_key(chat_id, thread_id)
         if key not in self._histories:
-            self._histories[key] = ConversationHistory(self._history_exchanges)
+            self._histories[key] = ConversationHistory(
+                self._history_exchanges, archive=self.archive if chat_id != 0 else None,
+                space=self.conversation_space(*key),
+            )
         return self._histories[key]
+
+    def conversation_key(self, chat_id: int, thread_id: int | None = None) -> tuple[int, int | None]:
+        if self._home_chat_fn and (home := self._home_chat_fn()) is not None:
+            self._home_chat_aliases.add(home)
+        if chat_id != 0 and chat_id in self._home_chat_aliases:
+            chat_id = WEB_CHAT_ID
+        return chat_id, thread_id
+
+    def conversation_space(self, chat_id: int, thread_id: int | None = None) -> str:
+        key = self.conversation_key(chat_id, thread_id)
+        return self._space_aliases.get(key, conversation_space(*key))
+
+    def register_legacy_space(self, thread_id: int, space: str) -> None:
+        self._space_aliases[(WEB_CHAT_ID, thread_id)] = space
+
+    async def reset_conversation(self, chat_id: int, thread_id: int | None = None, *, delete=False):
+        key = self.conversation_key(chat_id, thread_id)
+        async with self._run_locks.setdefault(key, asyncio.Lock()):
+            self._histories.pop(key, None)
+            self._pending_notes.pop(key, None)
+            if self.archive:
+                self.archive.reset(self.conversation_space(*key), delete=delete)
 
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
@@ -313,10 +347,12 @@ class Agent:
         prefix tells the model this is a message it already sent, not one to
         send again.
         """
-        notes = self._pending_notes.setdefault(
-            (chat_id, thread_id), deque()
-        )
-        notes.append(f"[{self._local_stamp()}, sent from a scheduled run] {text}")
+        key = self.conversation_key(chat_id, thread_id)
+        note = f"[{self._local_stamp()}, sent from a scheduled run] {text}"
+        if self.archive:
+            self.archive.queue_note(self.conversation_space(*key), note)
+        else:
+            self._pending_notes.setdefault(key, deque()).append(note)
 
     def _job_state_snapshot(self, prompt: str) -> str | None:
         """Current content of the vault pages a job prompt names.
@@ -342,8 +378,11 @@ class Agent:
 
     def clear_history(self, chat_id: int, thread_id: int | None = None) -> None:
         """Forget one chat/topic's conversation; the next run starts fresh."""
-        self._histories.pop((chat_id, thread_id), None)
-        self._pending_notes.pop((chat_id, thread_id), None)
+        key = self.conversation_key(chat_id, thread_id)
+        self._histories.pop(key, None)
+        self._pending_notes.pop(key, None)
+        if self.archive:
+            self.archive.reset(self.conversation_space(*key))
 
     def _base_prompt(self) -> str:
         """Embedded capability prompt: ships with the code, sections gated by enabled features."""
@@ -373,7 +412,9 @@ class Agent:
         newest user message instead, so the provider's prompt cache keeps
         covering the system prompt and older history.
         """
-        parts = [self._base_prompt()]
+        parts = [self._base_prompt(),
+                 f"Your assistant instance name is {json.dumps(self._agent_name, ensure_ascii=False)}. "
+                 "Noxide is the software project, not necessarily your name."]
         vault_prompt = self._vault.read_file("AGENTS.md")
         if not vault_prompt.startswith("[file not found"):
             parts.append(vault_prompt)
@@ -658,6 +699,8 @@ class Agent:
         send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
         unwind_on_unavailable: bool = False,
+        message_id: str | None = None,
+        source: str = "telegram",
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
 
@@ -675,20 +718,45 @@ class Agent:
         ``send_message_fn`` overrides the constructor-injected sender for this
         run only (used by ``run_job`` to observe deliveries).
         """
-        lock = self._run_locks.setdefault((chat_id, thread_id), asyncio.Lock())
+        key = self.conversation_key(chat_id, thread_id)
+        chat_id, thread_id = key  # Freeze identity before lock waits or network calls.
+        if self.archive and chat_id != 0:
+            message_id = self.archive.insert(self.conversation_space(*key), "user", user_message, "queued",
+                                             message_id=message_id, source=source) if message_id is None else message_id
+        lock = self._run_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            reply, touched = await self._run_locked(
-                chat_id,
-                user_message,
-                thread_id=thread_id,
-                extra_context=extra_context,
-                image_data_urls=image_data_urls,
-                transient_context=transient_context,
-                on_research=on_research,
-                send_message_fn=send_message_fn,
-                response_format=response_format,
-                unwind_on_unavailable=unwind_on_unavailable,
-            )
+            if self.archive and message_id:
+                row = self.archive.get(message_id)
+                if row is None or row["status"] in ("dismissed", "deleted"):
+                    return ""
+                if row["space"] != self.conversation_space(*key):
+                    raise ValueError("Message belongs to a different conversation")
+                if row["status"] == "done":
+                    return self.archive.reply(message_id) or ""
+                self.archive.status(message_id, "running")
+                self._get_history(chat_id, thread_id).request_ids.add(message_id)
+                self._get_history(chat_id, thread_id).active_request_id = message_id
+            try:
+                reply, touched = await self._run_locked(
+                    chat_id,
+                    user_message,
+                    thread_id=thread_id,
+                    extra_context=extra_context,
+                    image_data_urls=image_data_urls,
+                    transient_context=transient_context,
+                    on_research=on_research,
+                    send_message_fn=send_message_fn,
+                    response_format=response_format,
+                    unwind_on_unavailable=unwind_on_unavailable,
+                )
+            except BaseException as exc:
+                if self.archive and message_id:
+                    status = "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    self.archive.status(message_id, status, "Run did not finish; some work may have completed.")
+                raise
+            if self.archive and message_id:
+                if reply == MAX_ITERATIONS_REPLY:
+                    self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
         # One commit per interaction, in the background: the reply is not
         # delayed by git, and the commit message carries the full exchange.
         if self._backup is not None and touched:
@@ -728,8 +796,13 @@ class Agent:
         # Messages a scheduled run delivered to this conversation since its
         # last run enter history here, under its run lock, so the incoming
         # user message lands with the reminder it is replying to in context.
-        for note in self._pending_notes.pop((chat_id, thread_id), ()):
+        for note in self._pending_notes.pop(self.conversation_key(chat_id, thread_id), ()):
             history.append({"role": "assistant", "content": note})
+        if history.archive:
+            for note in history.archive.notes(history.space):
+                if note["id"] not in history.note_ids:
+                    history.append({"role": "assistant", "content": note["content"]})
+                    history.note_ids.add(note["id"])
 
         # Resolve topic slug for thread-specific prompt (if in a forum topic)
         topic_slug: str | None = None
@@ -903,6 +976,9 @@ class Agent:
         text: str,
         queued_at: str,
         hot: bool,
+        send_message_fn: SendMessageFn | None = None,
+        extra_context: str | None = None,
+        message_id: str | None = None,
     ) -> str | None:
         """Replay a user message that failed during a Copilot outage.
 
@@ -926,8 +1002,17 @@ class Agent:
         Raises CopilotUnavailableError while the outage lasts, so the retry
         queue keeps the item.
         """
+        chat_id, thread_id = self.conversation_key(chat_id, thread_id)
         lock = self._run_locks.setdefault((chat_id, thread_id), asyncio.Lock())
         async with lock:
+            if self.archive and message_id:
+                row = self.archive.get(message_id)
+                if row is None or row["status"] in ("dismissed", "deleted", "done"):
+                    return None
+                if row["space"] != self.conversation_space(chat_id, thread_id):
+                    raise ValueError("Retry belongs to a different conversation")
+                self._get_history(chat_id, thread_id).request_ids.add(message_id)
+                self._get_history(chat_id, thread_id).active_request_id = message_id
             if hot:
                 msgs = self._get_history(chat_id, thread_id).messages()
                 if not msgs:
@@ -945,9 +1030,19 @@ class Agent:
                     f"[this message was originally sent {queued_at} and delayed by a Copilot "
                     f"outage; it may have been partially processed before the failure] {text}"
                 )
-            reply, touched = await self._run_locked(
-                chat_id, note, thread_id=thread_id, unwind_on_unavailable=True
-            )
+            try:
+                reply, touched = await self._run_locked(
+                    chat_id, note, thread_id=thread_id, unwind_on_unavailable=True,
+                    send_message_fn=send_message_fn, extra_context=extra_context,
+                )
+            except BaseException as exc:
+                if self.archive and message_id:
+                    self.archive.status(message_id,
+                                        "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed",
+                                        "Retry did not finish; some work may have completed.")
+                raise
+            if self.archive and message_id and reply == MAX_ITERATIONS_REPLY:
+                self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
         if self._backup is not None and touched:
             self._backup.schedule_commit(touched, trigger=note, response=reply)
         return reply
@@ -981,7 +1076,7 @@ class Agent:
             # user reply to it there arrives with context — this run is the
             # chat-0 job conversation, invisible to the one the message
             # landed in. A None chat id means the delivery was dropped.
-            if target_chat is not None:
+            if target_chat is not None and self.archive is None:
                 self._queue_sent_note(target_chat, thread_id, text)
             return target_chat
 

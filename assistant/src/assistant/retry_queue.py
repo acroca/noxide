@@ -25,7 +25,7 @@ import json
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -62,12 +62,15 @@ class PendingItem:
     thread_id: int | None = None
     # In-memory only, never serialized: items reloaded from disk are cold.
     hot: bool = False
+    message_id: str | None = None
 
     def to_json(self) -> str:
         record = {"kind": self.kind, "text": self.text, "queued_at": self.queued_at}
         if self.kind == "message":
             record["chat_id"] = self.chat_id
             record["thread_id"] = self.thread_id
+            if self.message_id is not None:
+                record["message_id"] = self.message_id
         return json.dumps(record, ensure_ascii=False)
 
 
@@ -92,6 +95,7 @@ def _parse_item(line: str) -> PendingItem | None:
                 queued_at=queued_at,
                 chat_id=record["chat_id"],
                 thread_id=thread_id,
+                message_id=record.get("message_id") if isinstance(record.get("message_id"), str) else None,
             )
     return None
 
@@ -119,10 +123,23 @@ class RetryQueue:
     def pending(self) -> int:
         return len(self._items)
 
+    def attach_archive(self, archive, space_fn) -> None:
+        """Give pre-upgrade queue entries durable identities before accepting resets."""
+        migrated = deque()
+        for item in self._items:
+            if item.kind == "message" and item.message_id is None:
+                message_id = archive.insert(space_fn(item.chat_id, item.thread_id), "user", item.text,
+                                            "unavailable", source="telegram")
+                item = replace(item, message_id=message_id)
+            migrated.append(item)
+        self._items = migrated
+        self._persist()
+
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def enqueue_message(self, chat_id: int, thread_id: int | None, text: str) -> None:
+    def enqueue_message(self, chat_id: int, thread_id: int | None, text: str,
+                        message_id: str | None = None) -> None:
         item = PendingItem(
             kind="message",
             text=text,
@@ -130,6 +147,7 @@ class RetryQueue:
             chat_id=chat_id,
             thread_id=thread_id,
             hot=True,
+            message_id=message_id,
         )
         self._append(item)
         logger.info(
@@ -185,6 +203,7 @@ class RetryQueue:
                 text=item.text,
                 queued_at=item.queued_at,
                 hot=item.hot,
+                **({"message_id": item.message_id} if item.message_id is not None else {}),
             )
         else:
             # queued_at is when the run failed, not the row's due time — the

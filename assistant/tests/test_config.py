@@ -266,6 +266,22 @@ def test_vault_path_and_state_dir_env_override(
     assert cfg.state_dir == tmp_path / "mounted-state"
 
 
+def test_agent_name_configuration(tmp_path, monkeypatch):
+    config = tmp_path / 'config.toml'
+    config.write_text('[assistant]\nname = "Juniper"\n')
+    assert load_config(config).agent_name == 'Juniper'
+    monkeypatch.setenv('AGENT_NAME', ' Cedar ')
+    assert load_config(config).agent_name == 'Cedar'
+
+
+@pytest.mark.parametrize('name', ['', '   ', 'line\nbreak', 'tab\tname', 'x' * 65])
+def test_agent_name_validation(name):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Config(agent_name=name)
+
+
 def test_history_exchanges_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HISTORY_EXCHANGES", "7")
     cfg_file = tmp_path / "config.toml"

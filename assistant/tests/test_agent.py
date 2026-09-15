@@ -89,6 +89,14 @@ def agent(vault: VaultTools) -> Agent:
     return Agent(vault_tools=vault)
 
 
+def test_agent_instance_name_is_in_stable_identity_prompt(vault):
+    agent = Agent(vault, agent_name='Juniper')
+    prompt = agent._load_system_prompt()
+    assert 'Your assistant instance name is "Juniper"' in prompt
+    assert 'Noxide is the software project' in prompt
+    assert agent._load_system_prompt() == prompt
+
+
 # ------------------------------------------------------------------
 # Basic text reply
 # ------------------------------------------------------------------

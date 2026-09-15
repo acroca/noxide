@@ -1,6 +1,7 @@
 # Configuration
 
-Every setting can come from a TOML file or an environment variable. A basic
+Settings come from TOML or environment variables; the reference marks env-only
+credentials and TOML-only model aliases. A basic
 deployment needs no file at all — the env vars in
 [deployment.md](deployment.md) are enough.
 
@@ -34,9 +35,15 @@ start one.
 | — | `ELEVENLABS_API_KEY` | unset | [ElevenLabs](https://elevenlabs.io) API key, enabling voice transcription. Env-only, deliberately: it is a credential, not configuration |
 | `web.fourget_url` | `FOURGET_URL` | unset | Base URL of a [4get](https://git.lolcat.ca/lolcat/4get) instance. Unset disables the `research` tool entirely |
 | `assistant.timezone` | `TIMEZONE` | `UTC` | IANA name, e.g. `Europe/Madrid`. Drives every local time the bot writes or says, and cron interpretation |
+| `assistant.name` | `AGENT_NAME` | `Noxide` | Instance name for assistant identity, app labels, page titles and installation manifest. Notification titles use the channel name; the installed app identifies the instance. Trimmed, printable single-line text, 1–64 characters |
 | `assistant.vault_path` | `VAULT_PATH` | `./vault` | Vault directory. The Docker image sets this to `/data/vault` |
-| `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, usage JSONL, maintenance bookkeeping, durable outage retry queue (`pending_runs.jsonl`), and consumed inbox snapshot (`inbox.processed.md`). The image sets this to `/data/state` |
-| `assistant.history_exchanges` | `HISTORY_EXCHANGES` | `5` | Complete exchanges sent automatically per chat/topic (positive integer), with up to 6k text characters per exchange plus truncation markers. Only user text, final replies, and delivered reminder notes are included; completed tool traces are discarded. Older full text is available through `get_history`/`search_history` until restart or `/clear`. Active and outage-pending work stays intact outside this window |
+| `assistant.state_dir` | `STATE_DIR` | `./state` | OAuth token, chat id, shared conversation archive (`companion.sqlite3`), optional push key (`webpush.pem`), usage JSONL, maintenance bookkeeping, durable outage retry queue (`pending_runs.jsonl`), and consumed inbox snapshot (`inbox.processed.md`). The image sets this to `/data/state` |
+| `assistant.history_exchanges` | `HISTORY_EXCHANGES` | `5` | Complete exchanges sent automatically per topic (positive integer), with up to 6k text characters per exchange plus truncation markers. Text context is restored from SQLite after restart; completed tool traces are discarded. Older completed text is available through `get_history`/`search_history`, including before a context reset. Active and outage-pending work stays intact outside this window |
+| `pwa.enabled` | `PWA_ENABLED` | `false` | Enable the web companion in the same process; Telegram remains required |
+| `pwa.host` | `PWA_HOST` | `127.0.0.1` | Web listener address. Use `0.0.0.0` inside a container, with a restricted published port or proxy |
+| `pwa.port` | `PWA_PORT` | `8080` | Web listener port |
+| `pwa.origin` | `PWA_ORIGIN` | `http://localhost:8080` | Exact browser origin, without a trailing slash or path. HTTPS required except on localhost; proxy must preserve Host |
+| `pwa.push_contact` | `PWA_PUSH_CONTACT` | unset | `mailto:you@example.com`; enables optional web push. VAPID keys are generated in `state_dir/webpush.pem` |
 | `backup.enabled` | `BACKUP_ENABLED` | `false` | Local-only git history of the vault: one commit per interaction that changed it, plus a periodic sweep for edits arriving from outside the bot. Nothing is ever pushed. See [deployment.md](deployment.md#backups) |
 | `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
 | `maintenance.compile` | `MAINTENANCE_COMPILE` | `0 3 * * *` | Cron for the built-in nightly vault compile, on the local clock, weekdays by name. `""` disables it. See [vault.md](vault.md#operations) |
@@ -44,12 +51,33 @@ start one.
 
 Paths are expanded and resolved, so `~/vault` and relative paths both work.
 
+Noxide is the project name; each deployment can choose its own assistant name.
+Set `[assistant] name = "Juniper"` or `AGENT_NAME=Juniper` and restart. The
+environment variable takes precedence. Renaming preserves conversations, drafts,
+subscriptions and app identity. The shell offers an update after a rename;
+installed Home Screen labels may need to be renamed or re-added on iOS.
+Telegram's bot profile name remains managed separately through BotFather.
+
+The PWA has no application password or login. Remove `PWA_PASSWORD` from older
+deployments; it is no longer used. Restrict the listener using private networking
+such as Tailscale Serve and tailnet access rules. Anyone who can reach the
+service can read conversations and use the assistant. Host/Origin checks are
+browser protections, not authentication. HTTPS remains required outside localhost.
+
 `assistant.history_size` / `HISTORY_SIZE` is retired: its raw-message count is
 not interchangeable with complete exchanges. Existing values are ignored with
 a startup warning; remove them or replace them with `history_exchanges = 5`.
-The automatic window is not a retention limit: completed conversation text
-remains in RAM until restart or `/clear`, so memory use grows with conversation
-length. No Telegram backlog is downloaded and no transcript is written to disk.
+The automatic window is not a retention limit: `state_dir/companion.sqlite3`
+archives Telegram and web conversations even with the PWA disabled. No old
+Telegram backlog is downloaded. Completed text is restored after restart and
+older history is retrievable. Reset context (`/clear` in Telegram) keeps the
+archive, but dismisses pending conversation work and queued notes; independent
+scheduled jobs are not cancelled. Delete chat also removes the selected
+conversation's text, retaining non-content tombstone fields (IDs, conversation,
+timestamps, source, role, reply linkage, generation and delivery state) to suppress
+replay. The database also holds push subscriptions.
+There is no automatic expiry; archive size and loaded
+conversation text can grow over time. Back it up as private operational state.
 
 Keep `state_dir` persistent and backed up alongside the vault. Losing it can
 lose queued work and replay already-consumed inbox entries; restoring older
@@ -73,6 +101,11 @@ at once rather than failing on the first:
   not inside the vault
 - `maintenance.compile` and `maintenance.lint` are valid cron expressions with
   named weekdays, or empty
+- with `pwa.enabled`: `pwa.origin` is an HTTPS origin without a path (HTTP is
+  accepted only on localhost), and `pwa.push_contact` is empty or starts with `mailto:`
+
+Configuration parsing also validates a printable, nonempty instance name of at
+most 64 characters, a positive history exchange count, and a valid listener port.
 
 A malformed `ALLOWED_USER_IDS` (non-numeric entry) fails the same way rather
 than raising a traceback.
@@ -96,6 +129,7 @@ opus = "claude-opus-4.8"
 # fourget_url = "http://fourget"
 
 [assistant]
+name = "Juniper"
 timezone = "Europe/Madrid"
 history_exchanges = 5
 
@@ -106,12 +140,14 @@ lint = "0 4 * * SUN"
 
 ## Model selection
 
-`/model` opens an inline picker of the aliases above. While a non-default model
+`/model` opens the live Copilot catalog, refreshed when opened, with configured
+aliases as fallback/custom entries. While a non-default model
 is active the bot appends ` (alias)` to the **group title** — never to its own
 name, because Telegram locks `setMyName` for roughly 18 hours after a few
 changes. It reconciles that title at startup, so a run that died while switched
 does not leave a stale suffix.
 
-The selection is per-runtime and resets to `default_model` on restart. If a
+The selection is per-runtime and resets to the resolved startup default on
+restart (`default_family` when available, otherwise `default_model`). If a
 model id returns a 4xx, the response body is logged verbatim — that is almost
 always the fastest way to find the correct id for your plan.

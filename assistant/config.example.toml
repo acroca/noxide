@@ -34,6 +34,15 @@ sonnet = "claude-sonnet-5"
 # web searches in an isolated sub-agent. Leave unset to disable.
 # fourget_url = "http://fourget"
 
+[pwa]
+# Optional web companion, served by the same process. Telegram stays enabled.
+# No app authentication: restrict access with Tailscale Serve/private networking.
+# enabled = true
+# host = "127.0.0.1"
+# port = 8080
+# origin = "http://localhost:8080"  # exact browser origin; HTTPS outside localhost
+# push_contact = "mailto:you@example.com"  # enables optional web push
+
 [backup]
 # Optional: local-only git history of the vault. Every interaction that
 # changes the vault becomes one commit whose message carries the exchange;
@@ -51,8 +60,10 @@ sonnet = "claude-sonnet-5"
 # lint = "0 4 * * SUN"
 
 [assistant]
+# Instance display name and assistant identity; AGENT_NAME overrides this.
+# name = "Noxide"
 timezone = "Europe/Madrid"
-# Complete exchanges sent automatically; older text is retrievable until restart or /clear.
+# Complete exchanges sent automatically; older archived text is retrievable on demand.
 history_exchanges = 5
 # Where the vault and state directories live. Defaults are relative to the
 # working directory; the Docker image already points these at its own mounts,

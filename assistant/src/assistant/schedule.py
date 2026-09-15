@@ -629,6 +629,16 @@ class Scheduler:
             return "[no scheduled jobs]"
         return "\n".join(lines)
 
+    def entries_view(self) -> list[dict[str, Any]]:
+        """Read-only web view; table mutations still go through schedule tools."""
+        entries = [{"id": e.id, "when": e.when, "recurring": e.recurring,
+                    "prompt": e.prompt, "next": e.next, "builtin": False}
+                   for e in self._read_entries()]
+        entries.extend({"id": job.id, "when": job.cron, "recurring": True,
+                        "prompt": job.prompt, "next": "", "builtin": True}
+                       for job in self._builtins.values())
+        return entries
+
     def cancel_scheduled(self, job_id: str) -> str:
         if job_id in self._builtins:
             return (

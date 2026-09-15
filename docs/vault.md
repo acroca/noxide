@@ -200,8 +200,9 @@ cp -r vault.template/. ./vault
 Then just talk to the bot — ask it to **"set up my vault"**. Its built-in
 `vault-setup` skill interviews you for the few things the code cannot know
 (your name, timezone, and reply language), writes `AGENTS.md` itself, lays
-down the skeleton pages, and offers to schedule the housekeeping jobs. You
-never have to hand-edit commented-out placeholders.
+down the skeleton pages, and explains the built-in compile/lint housekeeping
+jobs. These are enabled by default and configured under `[maintenance]`, not
+created as schedule-table rows. You never have to hand-edit commented-out placeholders.
 
 Starting from a completely empty directory works too; the template just saves
 the bot a few guesses.
