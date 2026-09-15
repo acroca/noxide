@@ -108,7 +108,6 @@ class Companion:
         self.app.router.add_get("/api/messages", self.messages)
         self.app.router.add_post("/api/messages", self.submit)
         self.app.router.add_post("/api/retry", self.retry)
-        self.app.router.add_post("/api/clear", self.clear)
         self.app.router.add_post("/api/reset", self.reset)
         self.app.router.add_post("/api/seen", self.mark_seen)
         self.app.router.add_post("/api/push", self.subscribe)
@@ -276,8 +275,11 @@ class Companion:
         before = float(request.query.get("before", "inf"))
         rows = self.db.execute("SELECT * FROM messages WHERE space=? AND status!='deleted' AND created<? ORDER BY created DESC LIMIT 101",
                                (space, before)).fetchall()
+        # The current generation lets the timeline draw a divider after a
+        # reset that no message has followed yet.
         return web.json_response({"messages": [dict(r) for r in reversed(rows[:100])],
-                                  "before": rows[99]["created"] if len(rows) > 100 else None})
+                                  "before": rows[99]["created"] if len(rows) > 100 else None,
+                                  "generation": self.archive.generation(space)})
 
     def _insert(self, space, role, text, status, *, message_id=None, reply_to=None):
         return self.archive.insert(space, role, text, status, message_id=message_id, reply_to=reply_to)
@@ -377,21 +379,6 @@ class Companion:
         self.db.execute("UPDATE messages SET status='queued' WHERE id=?", (message_id,))
         self.db.commit()
         self._launch(message_id)
-        return web.json_response({"ok": True})
-
-    async def clear(self, request):
-        space = (await request.json()).get("space")
-        thread = self._space(space)
-        if self.db.execute("SELECT 1 FROM messages WHERE space=? AND status IN ('running','queued')", (space,)).fetchone():
-            raise web.HTTPConflict(text="Wait for this space's current run to finish")
-        if getattr(self.agent, "archive", None) is self.archive:
-            await self.agent.reset_conversation(WEB_CHAT_ID, thread, delete=True)
-        else:
-            self.agent.clear_history(WEB_CHAT_ID, thread)
-            self.archive.reset(space, delete=True)
-        for row in self.db.execute("SELECT id FROM messages WHERE space=?", (space,)):
-            self.hot.discard(row["id"])
-        self.db.commit()
         return web.json_response({"ok": True})
 
     async def reset(self, request):

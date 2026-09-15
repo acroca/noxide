@@ -78,22 +78,18 @@ async def test_shared_lock_serializes_web_and_telegram_and_reset(setup):
     assert archive.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 4
 
 
-async def test_delete_erases_archive_but_preserves_retry_tombstone(setup):
+async def test_reset_dismisses_pending_work_but_keeps_archived_text(setup):
     archive, vault, agent = setup
     mid = archive.insert("general", "user", "secret-pending", "queued", source="telegram")
     client = MagicMock(chat=AsyncMock(side_effect=CopilotUnavailableError("offline")))
     with patch("assistant.copilot.get_client", return_value=client):
         with pytest.raises(CopilotUnavailableError):
             await agent.run(123, "secret-pending", message_id=mid)
-        await agent.reset_conversation(WEB_CHAT_ID, delete=True)
+        await agent.reset_conversation(WEB_CHAT_ID)
         restored = Agent(vault, archive=archive, home_chat_fn=lambda: 123)
         assert await restored.retry_message(123, None, "secret-pending", "earlier", hot=False, message_id=mid) is None
     row = archive.get(mid)
-    assert row["status"] == "deleted" and row["text"] == "" and row["metadata"] == "{}"
-    assert restored._get_history(123).retrieve("get_history", {}) == json.dumps({
-        "messages": [], "next_before_id": None, "scope": "this conversation's retained archive"})
-    await restored.reset_conversation(123)
-    assert archive.get(mid)["status"] == "deleted"
+    assert row["status"] == "dismissed" and row["text"] == "secret-pending"
 
 
 async def test_outage_retry_commits_one_reply_and_completed_context(setup):

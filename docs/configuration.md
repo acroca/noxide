@@ -72,10 +72,9 @@ archives Telegram and web conversations even with the PWA disabled. No old
 Telegram backlog is downloaded. Completed text is restored after restart and
 older history is retrievable. Reset context (`/clear` in Telegram) keeps the
 archive, but dismisses pending conversation work and queued notes; independent
-scheduled jobs are not cancelled. Delete chat also removes the selected
-conversation's text, retaining non-content tombstone fields (IDs, conversation,
-timestamps, source, role, reply linkage, generation and delivery state) to suppress
-replay. The database also holds push subscriptions.
+scheduled jobs are not cancelled. Nothing in the app deletes archived text;
+remove `companion.sqlite3` while the service is stopped if you need to. The
+database also holds push subscriptions.
 There is no automatic expiry; archive size and loaded
 conversation text can grow over time. Back it up as private operational state.
 

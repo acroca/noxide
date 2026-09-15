@@ -47,13 +47,16 @@ async def test_no_password_required_but_csrf_and_host_checks_remain(companion):
         response = await client.get(path)
         assert response.status == 200
         assert "Set-Cookie" not in response.headers
-    assert (await client.post("/api/clear", json={"space": "general"}, headers={"Origin": "https://evil.test"})).status == 403
-    assert (await client.post("/api/clear", json={"space": "general"}, headers={"X-Noxide": ""})).status == 403
+    assert (await client.post("/api/reset", json={"space": "general"}, headers={"Origin": "https://evil.test"})).status == 403
+    assert (await client.post("/api/reset", json={"space": "general"}, headers={"X-Noxide": ""})).status == 403
     assert (await client.get("/api/overview", headers={"Host": "evil.test"})).status == 403
     response = await client.get("/api/overview")
     assert response.headers["Cache-Control"] == "no-store"
     assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
-    assert (await client.post("/api/clear", json={"space": "general"})).status == 200
+    service.agent.reset_conversation = AsyncMock()
+    assert (await client.post("/api/reset", json={"space": "general"})).status == 200
+    # Deleting a chat was removed with its endpoint; reset is the only way to start over.
+    assert (await client.post("/api/clear", json={"space": "general"})).status == 404
 
 
 async def test_auth_routes_and_stored_sessions_removed(companion):
@@ -115,7 +118,7 @@ async def test_submit_idempotency_pending_guard_and_project_context(companion):
         assert (await client.post("/api/messages", json=data)).status == 202
         assert (await client.post("/api/messages", json={**data, "text": "different"})).status == 409
         assert (await client.post("/api/messages", json={**data, "id": "b" * 32})).status == 409
-        assert (await client.post("/api/clear", json={"space": data["space"]})).status == 409
+        assert (await client.post("/api/reset", json={"space": data["space"]})).status == 409
     finally:
         release.set()
     await settle(service)
@@ -162,15 +165,19 @@ async def test_restart_marks_interrupted_work_without_replaying(companion):
     assert "Explicit retry after interruption" in service.agent.run.call_args.args[1]
 
 
-async def test_clear_only_one_web_space_and_mirrored_delivery(companion):
+async def test_reset_marks_a_new_generation_the_timeline_can_draw(companion):
     service, client = companion
-    service.vault.write_file("wiki/projects/one.md", "# One")
-    service._insert("wiki/projects/one.md", "user", "private thread", "done")
+    service._insert("general", "user", "before", "done")
     await service.observe_delivery("A scheduled reminder")
     service.agent._queue_sent_note.assert_called_once_with(WEB_CHAT_ID, None, "A scheduled reminder")
-    await client.post("/api/clear", json={"space": "general"})
-    assert service.db.execute("SELECT count(*) FROM messages WHERE status!='deleted'").fetchone()[0] == 1
-    service.agent.clear_history.assert_called_once_with(WEB_CHAT_ID, None)
+    data = await (await client.get("/api/messages")).json()
+    assert data["generation"] == 0 and [m["generation"] for m in data["messages"]] == [0, 0]
+    service.agent.reset_conversation = AsyncMock(side_effect=lambda *a, **k: service.archive.reset("general"))
+    assert (await client.post("/api/reset", json={"space": "general"})).status == 200
+    service._insert("general", "user", "after", "done")
+    data = await (await client.get("/api/messages")).json()
+    assert data["generation"] == 1
+    assert [(m["text"], m["generation"]) for m in data["messages"]] == [("before", 0), ("A scheduled reminder", 0), ("after", 1)]
 
 
 async def test_push_keys_persist_and_endpoints_are_restricted(companion):
@@ -437,9 +444,6 @@ async def test_shared_timeline_reset_delete_and_restart_context(companion):
         service.agent = Agent(service.vault, archive=service.archive, home_chat_fn=lambda: 123)
         assert service.agent._get_history(123).messages() == []
         assert "Telegram input" in service.agent._get_history(123).retrieve("get_history", {})
-        assert (await client.post("/api/clear", json={"space": "general"})).status == 200
-        assert (await (await client.get("/api/messages")).json())["messages"] == []
-        assert "Telegram input" not in service.agent._get_history(123).retrieve("get_history", {})
 
 
 @pytest.mark.parametrize("origin", ["http://example.com", "https://example.com/path", "https://user@example.com", "https://example.com?x=1"])

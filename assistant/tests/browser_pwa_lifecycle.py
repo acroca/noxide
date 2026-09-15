@@ -17,7 +17,7 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True, "replies": {}}
+    state = {"revision": 1, "available": True, "authorized": True, "replies": {}, "generation": 0}
     seen = []
     release = asyncio.Event()
     release.set()
@@ -41,7 +41,8 @@ async def main():
                 seen.append(await request.json())
                 return web.json_response({"ok": True})
             space = request.query.get("space", "general")
-            return web.json_response({"messages": state["replies"].get(space, []), "before": None})
+            return web.json_response({"messages": state["replies"].get(space, []), "before": None,
+                                      "generation": state["generation"]})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
             name = "icon.svg"
@@ -53,7 +54,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v12", f"noxide-shell-v12-test{state['revision']}")
+            text = text.replace("noxide-shell-v13", f"noxide-shell-v13-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -167,7 +168,7 @@ async def main():
             assert seen == [], seen
             await other.close()
             reply = {"id": "r1", "space": "general", "role": "assistant", "text": "Done.", "status": "done",
-                     "created": 1700000000.5, "source": "web", "delivery": "available"}
+                     "created": 1700000000.5, "source": "web", "delivery": "available", "generation": 0}
             state["replies"]["general"] = [reply]
             await page.bring_to_front()
             await expect(page.locator(".message-assistant")).to_be_visible()
@@ -188,9 +189,24 @@ async def main():
             await page.evaluate("() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); }")
             await asyncio.sleep(1)
             assert seen == [{"space": "general", "through": 1700000000.5}, {"space": "general", "through": 1700000001.5}], seen
+
+            # Reset context draws a divider: after the last message when
+            # nothing has followed yet, then between generations.
+            assert await page.locator(".context-divider").count() == 0
+            assert await page.get_by_role("button", name="Delete chat").count() == 0
+            state["generation"] = 1
+            await expect(page.locator(".context-divider")).to_have_count(1)
+            assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "context-divider"
+            state["replies"]["general"].append({**reply, "id": "r3", "created": 1700000002.5, "generation": 1})
+            await expect(page.locator(".message-assistant")).to_have_count(3)
+            await expect(page.locator(".context-divider")).to_have_count(1)
+            assert await page.evaluate("() => document.querySelector('.context-divider').nextElementSibling.textContent.includes('Done.')")
+            assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "message message-assistant"
+            keys = await page.evaluate("() => caches.keys()")
+            assert keys == [f"noxide-shell-v13-test2-{instance_version}"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements.")
+            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers.")
     finally:
         release.set()
         await runner.cleanup()

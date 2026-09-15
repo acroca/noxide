@@ -329,13 +329,13 @@ class Agent:
     def register_legacy_space(self, thread_id: int, space: str) -> None:
         self._space_aliases[(WEB_CHAT_ID, thread_id)] = space
 
-    async def reset_conversation(self, chat_id: int, thread_id: int | None = None, *, delete=False):
+    async def reset_conversation(self, chat_id: int, thread_id: int | None = None):
         key = self.conversation_key(chat_id, thread_id)
         async with self._run_locks.setdefault(key, asyncio.Lock()):
             self._histories.pop(key, None)
             self._pending_notes.pop(key, None)
             if self.archive:
-                self.archive.reset(self.conversation_space(*key), delete=delete)
+                self.archive.reset(self.conversation_space(*key))
 
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")

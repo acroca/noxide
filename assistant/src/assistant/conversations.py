@@ -155,16 +155,13 @@ class ConversationArchive:
     def notes(self, space):
         return self.db.execute("SELECT * FROM pending_notes WHERE space=? ORDER BY id", (space,)).fetchall()
 
-    def reset(self, space, *, delete=False):
+    def reset(self, space):
         generation = self.generation(space) + 1
         self.db.execute("INSERT OR REPLACE INTO context_generations VALUES (?,?)", (space, generation))
         self.db.execute("DELETE FROM pending_notes WHERE space=?", (space,))
         # Durable queue references become tombstones, so a cold retry cannot
-        # bring back work deliberately reset or deleted by the user.
+        # bring back work deliberately reset by the user.
         self.db.execute("UPDATE messages SET status='dismissed',error='' WHERE space=? AND status NOT IN ('done','deleted')", (space,))
-        if delete:
-            self.db.execute("DELETE FROM context_records WHERE space=?", (space,))
-            self.db.execute("UPDATE messages SET text='',metadata='{}',status='deleted',error='' WHERE space=?", (space,))
         self.db.commit()
 
     def close(self):

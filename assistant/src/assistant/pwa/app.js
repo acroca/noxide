@@ -112,7 +112,7 @@ function renderChat(topic, pageVersion) {
         <div class="channel-picker"><span class="topic-label">Topic</span>
           <button id="chat-topic" type="button" aria-label="Change topic: ${escape(name)}" aria-haspopup="dialog" aria-controls="topic-picker">${escape(name)} <span aria-hidden="true">▾</span></button>
         </div>
-        <div><button id="reset-chat" class="quiet" type="button">Reset context</button><button id="clear-chat" class="quiet danger" type="button">Delete chat</button></div>
+        <div><button id="reset-chat" class="quiet" type="button">Reset context</button></div>
       </header>
       <button id="older-messages" class="quiet older" hidden>Load earlier messages</button>
       <div id="chat-thread" class="chat-thread" role="log" aria-label="${escape(name)} messages"><div class="loading">Loading messages…</div></div>
@@ -160,7 +160,7 @@ function renderChat(topic, pageVersion) {
     if (loadOlder) { older = [...data.messages, ...older]; cursor = data.before; await loadMessages(); return; }
     if (!older.length) cursor = data.before;
     $('#older-messages').hidden = cursor === null;
-    const nextSignature = JSON.stringify([data.messages, older]);
+    const nextSignature = JSON.stringify([data.messages, older, data.generation]);
     loaded = true;
     busy = data.messages.some(m => m.role === 'user' && m.source !== 'telegram' && !['done', 'dismissed'].includes(m.status));
     latest = data.messages;
@@ -171,12 +171,17 @@ function renderChat(topic, pageVersion) {
     const thread = $('#chat-thread'), nearBottom = atEnd(thread);
     const ids = new Set();
     const messages = [...older, ...data.messages].filter(m => { if (ids.has(m.id)) return false; ids.add(m.id); return true; });
-    thread.innerHTML = messages.length ? messages.map(m => `
+    // A context reset starts a new generation: mark where the model stopped
+    // seeing earlier messages, including a reset nothing has followed yet.
+    const divider = '<div class="context-divider" role="separator">Context reset</div>';
+    const trailing = messages.length && messages[messages.length - 1].generation < data.generation ? divider : '';
+    thread.innerHTML = messages.length ? messages.map((m, i) => `
+      ${i && m.generation !== messages[i - 1].generation ? divider : ''}
       <article class="message message-${escape(m.role)}">
         <div class="message-meta"><strong>${m.role === 'user' ? 'You' : escape(agentName)}</strong><time>${escape(dateLabel(m.created))}</time><span>${m.source === 'telegram' ? 'Telegram' : 'Web'}</span>${m.role === 'assistant' && ['failed','partial','pending'].includes(m.delivery) ? `<span>Telegram delivery: ${escape(m.delivery)}</span>` : ''}</div>
         <div class="message-body">${m.role === 'user' ? escape(m.text) : markdown(m.text)}</div>
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${m.source !== 'telegram' && ['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
-      </article>`).join('') : `<div class="chat-empty"><h1>${escape(name)}</h1><p>No messages yet. Send a message to start.</p></div>`;
+      </article>`).join('') + trailing : `<div class="chat-empty"><h1>${escape(name)}</h1><p>No messages yet. Send a message to start.</p></div>`;
     $$('[data-retry]').forEach(b => b.addEventListener('click', async () => {
       b.disabled = true;
       try { await api('retry', { id: b.dataset.retry }); await loadMessages(); }
@@ -186,14 +191,6 @@ function renderChat(topic, pageVersion) {
     markSeen();
   }
   $('#older-messages').addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
-  $('#clear-chat').addEventListener('click', async () => {
-    if (!confirm(`Delete the saved conversation for ${name}, including its Telegram and web archive and model context? This cannot be undone. Messages in the Telegram app, vault notes, and backups are not deleted.`)) return;
-    try {
-      await api('clear', { space: topic });
-      localStorage.removeItem(draftKey(topic)); localStorage.removeItem(submissionKey(topic));
-      if (active()) await route();
-    } catch (e) { toast(e.message); }
-  });
   $('#reset-chat').addEventListener('click', async () => {
     if (!confirm(`Start fresh in ${name}? The shared Telegram/web context will reset. Saved messages remain visible and can still be retrieved through history tools.`)) return;
     try { await api('reset', {space: topic}); if (active()) await route(); toast('Context reset. Saved conversation kept.'); }

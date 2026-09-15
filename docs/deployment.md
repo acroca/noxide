@@ -256,15 +256,14 @@ current knowledge, not the chat archive.
 **Reset context** (also Telegram `/clear`) starts a new automatic-context window
 without deleting saved messages. Older text is still retrievable explicitly.
 It dismisses pending conversation work and queued notes, but does not cancel
-independent scheduled jobs.
+independent scheduled jobs. The web chat draws a "Context reset" divider at
+the cut, so you can see which messages the model no longer has in front of it.
+It does not change messages in Telegram itself, vault files, or backups.
 
-**Delete chat** removes the selected conversation's saved text and model context;
-non-content tombstone fields remain (IDs, conversation keys, timestamps, source,
-role, reply linkage, generation and delivery state) to prevent old retries from
-resurrecting deleted work. Neither action changes messages in Telegram itself, vault files,
-or backups. Pending queue files can retain an old payload until the retry worker
-discards its tombstoned item. Treat deletion as logical removal, not secure
-erasure from all disks or backups. There is no automatic retention cutoff.
+There is no way to delete archived text from the app. If you need a
+conversation gone from disk, stop the service and remove or edit
+`state_dir/companion.sqlite3`; backups and pending queue files can still hold
+copies. There is no automatic retention cutoff.
 Stop the service before copying its SQLite database for a consistent backup.
 Generated replies remain readable in the web timeline if Telegram delivery fails;
 the delivery status is recorded separately, without rerunning completed writes.
