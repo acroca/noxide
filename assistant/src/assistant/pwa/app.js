@@ -148,6 +148,13 @@ function renderChat(topic, pageVersion) {
     api('seen', { space: topic, through: newest }, undefined, true).catch(() => { if (acked === newest) acked = previous; });
   }
   ackVisible = markSeen;
+  // Closing the keyboard restores the bottom nav's home-indicator inset, which
+  // shrinks the thread; a shrinking scroller keeps its offset and hides the
+  // end. Stay anchored to the end across resizes unless the reader scrolled up.
+  const thread = $('#chat-thread');
+  let stickToEnd = true;
+  thread.addEventListener('scroll', () => { stickToEnd = atEnd(thread); });
+  new ResizeObserver(() => { if (stickToEnd) thread.scrollTop = thread.scrollHeight; }).observe(thread);
   function updateComposer() {
     if (!active()) return;
     button.disabled = !loaded || busy || sending || !navigator.onLine;

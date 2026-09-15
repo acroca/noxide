@@ -54,7 +54,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v14", f"noxide-shell-v14-test{state['revision']}")
+            text = text.replace("noxide-shell-v15", f"noxide-shell-v15-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -208,8 +208,29 @@ async def main():
             state["replies"]["general"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
             await expect(page.locator(".message-meta span")).to_have_count(1)
             await expect(page.locator(".message-meta span")).to_have_text("Web")
+            # Blurring the composer restores the nav inset and shrinks the thread;
+            # the thread stays anchored to its end, unless the reader scrolled up.
+            # Chromium re-anchors a shrinking scroller by itself, so this cannot
+            # fail here without the fix; WebKit (iOS) leaves the offset and ends
+            # up an inset above the end, which is what the ResizeObserver fixes.
+            await page.add_style_tag(content=":root{--navigation-safe-area:34px}")  # lost on the reloads above
+            await page.evaluate("() => document.querySelector('#settings').close()")  # modal would trap focus
+            state["replies"]["general"].extend({**reply, "id": f"r{i}", "created": 1700000010 + i, "generation": 1, "text": "Filler line " * 12} for i in range(10, 40))
+            await expect(page.locator(".message-assistant")).to_have_count(34)
+            gap = "() => { const t = document.querySelector('#chat-thread'); return t.scrollHeight - t.scrollTop - t.clientHeight; }"
+            assert await page.evaluate("() => document.querySelector('#chat-thread').scrollHeight > document.querySelector('#chat-thread').clientHeight * 2")
+            await page.evaluate("() => { const t = document.querySelector('#chat-thread'); t.scrollTop = t.scrollHeight; }")
+            await page.get_by_label("Message to General").focus()
+            await page.wait_for_function("() => document.querySelector('#chat-thread').scrollHeight - document.querySelector('#chat-thread').scrollTop - document.querySelector('#chat-thread').clientHeight < 1")
+            await page.get_by_label("Message to General").blur()
+            await page.wait_for_function(f"() => ({gap})() < 1")
+            await page.evaluate("() => { document.querySelector('#chat-thread').scrollTop = 0; }")
+            await page.get_by_label("Message to General").focus()
+            await page.get_by_label("Message to General").blur()
+            await asyncio.sleep(0.5)
+            assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 0
             keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v14-test2-{instance_version}"], keys
+            assert keys == [f"noxide-shell-v15-test2-{instance_version}"], keys
             assert not errors, errors
             await browser.close()
             print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers.")
