@@ -68,8 +68,9 @@ mise exec uv -- uv run --with playwright python -m tests.browser_pwa_lifecycle
 
 The browser check starts a disposable local server, with no real vault or model
 calls. It covers password-free startup, offline launches and proxy failures,
-update waiting/activation, in-flight submission protection and multi-tab draft
-preservation. Bump `CACHE` in `pwa/sw.js` whenever packaged shell assets change;
+update waiting/activation, in-flight submission protection, multi-tab draft
+preservation and the seen acknowledgements that suppress push for a reply
+already displayed on a focused device. Bump `CACHE` in `pwa/sw.js` whenever packaged shell assets change;
 the installed version serves its own cached bundle until an update activates.
 
 ### Source files

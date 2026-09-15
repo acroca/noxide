@@ -17,7 +17,8 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True}
+    state = {"revision": 1, "available": True, "authorized": True, "replies": {}}
+    seen = []
     release = asyncio.Event()
     release.set()
     started = asyncio.Event()
@@ -36,7 +37,11 @@ async def main():
                 started.set()
                 await release.wait()
                 return web.json_response({"id": (await request.json())["id"]}, status=202)
-            return web.json_response({"messages": [], "before": None})
+            if request.path == "/api/seen":
+                seen.append(await request.json())
+                return web.json_response({"ok": True})
+            space = request.query.get("space", "general")
+            return web.json_response({"messages": state["replies"].get(space, []), "before": None})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
             name = "icon.svg"
@@ -48,7 +53,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v11", f"noxide-shell-v11-test{state['revision']}")
+            text = text.replace("noxide-shell-v12", f"noxide-shell-v12-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -156,11 +161,36 @@ async def main():
             await expect(other.locator("#update-banner")).to_be_hidden()
             await expect(other.get_by_label("Message to General")).to_have_value("Other tab draft")
             assert await page.evaluate("() => document.documentElement.scrollWidth <= innerWidth")
-            keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v11-test2-{instance_version}"], keys
+
+            # A focused device showing the newest reply acknowledges it once;
+            # a device on another topic, or a hidden one, acknowledges nothing.
+            assert seen == [], seen
+            await other.close()
+            reply = {"id": "r1", "space": "general", "role": "assistant", "text": "Done.", "status": "done",
+                     "created": 1700000000.5, "source": "web", "delivery": "available"}
+            state["replies"]["general"] = [reply]
+            await page.bring_to_front()
+            await expect(page.locator(".message-assistant")).to_be_visible()
+            await page.wait_for_function("() => document.querySelector('#chat-thread') && document.hasFocus()")
+            await asyncio.sleep(3)
+            assert seen == [{"space": "general", "through": 1700000000.5}], seen
+            # Same device, other topic: General's newer reply is not acknowledged.
+            await page.goto(url + "/#chat/topic%3A10")
+            await expect(page.get_by_label("Message to Work")).to_be_visible()
+            state["replies"]["general"] = [reply, {**reply, "id": "r2", "created": 1700000001.5}]
+            await asyncio.sleep(3)
+            assert seen == [{"space": "general", "through": 1700000000.5}], seen
+            # Back on General but unfocused (headless tabs cannot lose focus for real).
+            await page.goto(url + "/#chat")
+            await page.evaluate("() => { document.hasFocus = () => false; }")
+            await asyncio.sleep(3)
+            assert seen == [{"space": "general", "through": 1700000000.5}], seen
+            await page.evaluate("() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); }")
+            await asyncio.sleep(1)
+            assert seen == [{"space": "general", "through": 1700000000.5}, {"space": "general", "through": 1700000001.5}], seen
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow.")
+            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements.")
     finally:
         release.set()
         await runner.cleanup()

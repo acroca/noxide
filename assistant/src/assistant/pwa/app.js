@@ -18,6 +18,7 @@ let topics = [], currentTopic = 'general';
 let serverUnavailable = false, booting = false, pendingMutations = 0;
 let waitingWorker = null, reloadRequested = false, workerChanged = false;
 let hadController = Boolean(navigator.serviceWorker?.controller);
+let ackVisible = () => {};
 const draftKey = topic => `noxide-draft:${topic}`;
 const submissionKey = topic => `noxide-submission:${topic}`;
 const chatURL = topic => '#chat/' + encodeURIComponent(topic);
@@ -36,13 +37,14 @@ function unavailable() {
     $('#unavailable').hidden = false;
   }
 }
-async function api(path, data, method) {
+async function api(path, data, method, background = false) {
   const options = { method: method || (data === undefined ? 'GET' : 'POST'), credentials: 'same-origin', headers: { 'X-Noxide': '1' } };
   if (data !== undefined) {
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(data);
   }
-  const mutation = options.method !== 'GET';
+  // Background acknowledgements never hold up an app update.
+  const mutation = options.method !== 'GET' && !background;
   if (mutation) { pendingMutations++; updateBanner(); }
   try {
     let response, result;
@@ -131,7 +133,21 @@ function renderChat(topic, pageVersion) {
   });
   const active = () => version === pageVersion && Boolean($('#chat-thread'));
   let signature = '', cursor = null, older = [], busy = false, sending = false, loaded = false;
+  let latest = [], acked = 0;
   const button = $('#chat-form button'), area = $('#chat-form textarea');
+  const atEnd = thread => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+  function markSeen() {
+    // Tell the server this device is showing the newest reply: focused, on this
+    // topic, scrolled to the end. Other devices then skip the push for it.
+    // Merely being open, or reading older messages, acknowledges nothing.
+    if (!active() || document.hidden || !document.hasFocus() || !atEnd($('#chat-thread'))) return;
+    const newest = Math.max(0, ...latest.filter(m => m.role === 'assistant').map(m => m.created));
+    if (newest <= acked) return;
+    const previous = acked;
+    acked = newest;
+    api('seen', { space: topic, through: newest }, undefined, true).catch(() => { if (acked === newest) acked = previous; });
+  }
+  ackVisible = markSeen;
   function updateComposer() {
     if (!active()) return;
     button.disabled = !loaded || busy || sending || !navigator.onLine;
@@ -147,11 +163,12 @@ function renderChat(topic, pageVersion) {
     const nextSignature = JSON.stringify([data.messages, older]);
     loaded = true;
     busy = data.messages.some(m => m.role === 'user' && m.source !== 'telegram' && !['done', 'dismissed'].includes(m.status));
+    latest = data.messages;
     updateComposer();
-    if (nextSignature === signature) return;
+    if (nextSignature === signature) { markSeen(); return; }
     const initial = !signature;
     signature = nextSignature;
-    const thread = $('#chat-thread'), nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+    const thread = $('#chat-thread'), nearBottom = atEnd(thread);
     const ids = new Set();
     const messages = [...older, ...data.messages].filter(m => { if (ids.has(m.id)) return false; ids.add(m.id); return true; });
     thread.innerHTML = messages.length ? messages.map(m => `
@@ -166,6 +183,7 @@ function renderChat(topic, pageVersion) {
       catch (e) { toast(e.message); } finally { b.disabled = false; }
     }));
     if (initial || nearBottom) thread.scrollTop = thread.scrollHeight;
+    markSeen();
   }
   $('#older-messages').addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
   $('#clear-chat').addEventListener('click', async () => {
@@ -272,6 +290,8 @@ $('#topic-options').addEventListener('click', event => {
   if (event.target.closest('a')) $('#topic-picker').close();
 });
 window.addEventListener('hashchange', route);
+window.addEventListener('focus', () => ackVisible());
+document.addEventListener('visibilitychange', () => ackVisible());
 function connectivity() {
   const offline = !navigator.onLine || serverUnavailable;
   $('#offline-banner').hidden = !offline;

@@ -243,7 +243,63 @@ async def test_push_triggers_include_reply_reminder_and_test_text(companion):
         notify.assert_called_with("general", "Recorded.")
         service.public_key = "configured"
         assert (await client.post("/api/push/test", json={})).status == 200
-        notify.assert_called_with("general", "Hello there! This is the test reminder")
+        notify.assert_called_with("general", "Hello there! This is the test reminder", grace=False)
+
+
+async def test_push_waits_a_grace_period_and_skips_replies_seen_on_a_focused_device(companion):
+    service, client = companion
+    service.public_key = "configured"
+    with patch.object(service, "_push", new_callable=AsyncMock) as push, \
+            patch("assistant.companion.PUSH_GRACE_SECONDS", 0.05):
+        await client.post("/api/messages", json={"id": "d" * 32, "space": "general", "text": "Hi"})
+        await settle(service)
+        reply = service.db.execute("SELECT created FROM messages WHERE role='assistant' AND space='general'").fetchone()
+        assert service.push_tasks and not push.called
+        assert (await client.post("/api/seen", json={"space": "general", "through": reply["created"]})).status == 200
+        await asyncio.gather(*service.push_tasks)
+        push.assert_not_called()
+
+        # Seen through an older message only: the newer reply still notifies.
+        await client.post("/api/messages", json={"id": "e" * 32, "space": "general", "text": "Again"})
+        await settle(service)
+        assert not push.called
+        await asyncio.gather(*service.push_tasks)
+        push.assert_called_once_with("general", "Recorded.")
+
+        # A device on another topic acknowledges nothing for this one.
+        push.reset_mock()
+        await service.observe_delivery("Your reminder")
+        assert (await client.post("/api/seen", json={"space": "topic:7", "through": 1e12})).status == 404
+        await asyncio.gather(*service.push_tasks)
+        push.assert_called_once_with("general", "Your reminder")
+
+        # The test button never waits and is never suppressed.
+        push.reset_mock()
+        await client.post("/api/seen", json={"space": "general", "through": 1e12})
+        assert (await client.post("/api/push/test", json={})).status == 200
+        await asyncio.gather(*service.push_tasks)
+        push.assert_called_once_with("general", "Hello there! This is the test reminder")
+
+
+async def test_seen_marker_only_advances_and_rejects_bad_input(companion):
+    service, client = companion
+    assert (await client.post("/api/seen", json={"space": "general", "through": 20.0})).status == 200
+    assert (await client.post("/api/seen", json={"space": "general", "through": 10.0})).status == 200
+    assert service.seen["general"] == 20.0
+    for body in ({"space": "general"}, {"space": "general", "through": "soon"},
+                 {"space": "general", "through": float("nan")}, {"space": "wiki/../x.md", "through": 1.0}):
+        assert (await client.post("/api/seen", json=body)).status in (400, 404)
+
+
+async def test_drain_waits_for_delayed_pushes(companion):
+    service, client = companion
+    service.public_key = "configured"
+    with patch.object(service, "_push", new_callable=AsyncMock) as push, \
+            patch("assistant.companion.PUSH_GRACE_SECONDS", 0.05):
+        await service.observe_delivery("Your reminder")
+        assert not push.called
+        await service.drain()
+        push.assert_called_once_with("general", "Your reminder")
 
 
 async def test_pwa_assets_and_shutdown_rejection(companion):

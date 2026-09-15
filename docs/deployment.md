@@ -195,7 +195,11 @@ Notifications use the **channel name** (General or the topic name) as their titl
 and include the reply or reminder text (up
 to 500 characters). Content can appear on your lock screen; control previews
 in your device notification settings. Ordinary Telegram replies still notify
-only through Telegram. Opening
+only through Telegram. A reply or reminder waits five seconds before any push
+goes out; if a focused device is showing that conversation scrolled to the end
+by then, no device is notified. Being open on another topic, unfocused, or
+scrolled up reading older messages does not count, and a device that starts
+showing the reply after the window still gets the push. Opening
 one goes to the corresponding conversation. Delivery depends on the OS,
 browser permissions and network; Telegram remains the primary reminder
 delivery channel in this first version, with successful agent-originated

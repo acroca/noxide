@@ -13,8 +13,10 @@ import html
 import io
 import json
 import logging
+import math
 import re
 import sqlite3
+import time
 from datetime import datetime
 from importlib.resources import files
 from urllib.parse import urlsplit
@@ -31,6 +33,10 @@ from .schedule import Scheduler
 from .tools import VaultTools
 
 logger = logging.getLogger(__name__)
+# A reply displayed on a focused device within this window notifies no device.
+# Longer than the client's poll interval, so the device already showing the
+# conversation gets to acknowledge before phones buzz.
+PUSH_GRACE_SECONDS = 5
 _ASSETS = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css",
            "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
@@ -65,6 +71,9 @@ class Companion:
         self.db.commit()
         self.tasks: dict[str, asyncio.Task] = {}
         self.push_tasks: set[asyncio.Task] = set()
+        # Newest message timestamp a focused device reported displaying, per
+        # space. In-memory only: it only matters within the push grace window.
+        self.seen: dict[str, float] = {}
         self.hot: set[str] = set()
         self.accepting = True
         self.runner: web.AppRunner | None = None
@@ -101,6 +110,7 @@ class Companion:
         self.app.router.add_post("/api/retry", self.retry)
         self.app.router.add_post("/api/clear", self.clear)
         self.app.router.add_post("/api/reset", self.reset)
+        self.app.router.add_post("/api/seen", self.mark_seen)
         self.app.router.add_post("/api/push", self.subscribe)
         self.app.router.add_delete("/api/push", self.unsubscribe)
         self.app.router.add_post("/api/push/test", self.test_push)
@@ -436,15 +446,39 @@ class Companion:
     async def test_push(self, request):
         if not self.public_key:
             raise web.HTTPConflict(text="Push is not configured")
-        self.notify_push("general", "Hello there! This is the test reminder")
+        self.notify_push("general", "Hello there! This is the test reminder", grace=False)
         return web.json_response({"ok": True})
 
-    def notify_push(self, space="general", text=""):
-        if not self.public_key or len(self.push_tasks) >= 2:
+    async def mark_seen(self, request):
+        """A focused device displayed this space through the given timestamp."""
+        data = await request.json()
+        space, through = data.get("space"), data.get("through")
+        self._space(space)
+        if isinstance(through, bool) or not isinstance(through, (int, float)) or not math.isfinite(through):
+            raise web.HTTPBadRequest(text="A message timestamp is required")
+        self.seen[space] = max(self.seen.get(space, 0.0), float(through))
+        return web.json_response({"ok": True})
+
+    def notify_push(self, space="general", text="", *, grace=True):
+        if not self.public_key or len(self.push_tasks) >= 8:
             return
-        task = asyncio.create_task(self._push(space, text))
+        row = self.db.execute("SELECT max(created) FROM messages WHERE space=? AND role='assistant' AND status!='deleted'",
+                              (space,)).fetchone()
+        created = row[0] if row and row[0] is not None else time.time()
+        task = asyncio.create_task(self._push_unless_seen(space, text, created) if grace
+                                   else self._push(space, text))
         self.push_tasks.add(task)
         task.add_done_callback(self.push_tasks.discard)
+
+    async def _push_unless_seen(self, space, text, created):
+        # "Seen" means displayed on a focused device with the thread scrolled
+        # to the end, not proof of reading; a device that acknowledges after
+        # the window still gets the push, since it cannot be retracted.
+        await asyncio.sleep(PUSH_GRACE_SECONDS)
+        if self.seen.get(space, 0.0) >= created:
+            logger.debug("Push skipped for %s: already displayed on a focused device", space)
+            return
+        await self._push(space, text)
 
     async def _push(self, space, text=""):
         from pywebpush import WebPushException, webpush
@@ -489,6 +523,9 @@ class Companion:
     async def drain(self):
         self.accepting = False
         await asyncio.gather(*list(self.tasks.values()), return_exceptions=True)
+        # Replies finishing just before a restart still notify: their pushes
+        # are only a grace period away.
+        await asyncio.gather(*list(self.push_tasks), return_exceptions=True)
 
     async def close(self):
         self.accepting = False
