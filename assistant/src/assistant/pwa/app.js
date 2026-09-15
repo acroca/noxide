@@ -178,7 +178,7 @@ function renderChat(topic, pageVersion) {
     thread.innerHTML = messages.length ? messages.map((m, i) => `
       ${i && m.generation !== messages[i - 1].generation ? divider : ''}
       <article class="message message-${escape(m.role)}">
-        <div class="message-meta"><strong>${m.role === 'user' ? 'You' : escape(agentName)}</strong><time>${escape(dateLabel(m.created))}</time><span>${m.source === 'telegram' ? 'Telegram' : 'Web'}</span>${m.role === 'assistant' && ['failed','partial','pending'].includes(m.delivery) ? `<span>Telegram delivery: ${escape(m.delivery)}</span>` : ''}</div>
+        <div class="message-meta"><strong>${m.role === 'user' ? 'You' : escape(agentName)}</strong><time>${escape(dateLabel(m.created))}</time>${m.role === 'assistant' && !m.reply_to ? '' : `<span>${m.source === 'telegram' ? 'Telegram' : 'Web'}</span>`}${m.role === 'assistant' && ['failed','partial','pending'].includes(m.delivery) ? `<span>Telegram delivery: ${escape(m.delivery)}</span>` : ''}</div>
         <div class="message-body">${m.role === 'user' ? escape(m.text) : markdown(m.text)}</div>
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${m.source !== 'telegram' && ['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
       </article>`).join('') + trailing : `<div class="chat-empty"><h1>${escape(name)}</h1><p>No messages yet. Send a message to start.</p></div>`;

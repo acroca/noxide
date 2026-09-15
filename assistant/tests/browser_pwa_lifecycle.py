@@ -54,7 +54,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v13", f"noxide-shell-v13-test{state['revision']}")
+            text = text.replace("noxide-shell-v14", f"noxide-shell-v14-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -202,8 +202,14 @@ async def main():
             await expect(page.locator(".context-divider")).to_have_count(1)
             assert await page.evaluate("() => document.querySelector('.context-divider').nextElementSibling.textContent.includes('Done.')")
             assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "message message-assistant"
+            # A message the assistant started, such as a reminder, answers no
+            # request, so it carries no channel chip; replies keep theirs.
+            assert await page.locator(".message-meta span").count() == 0
+            state["replies"]["general"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
+            await expect(page.locator(".message-meta span")).to_have_count(1)
+            await expect(page.locator(".message-meta span")).to_have_text("Web")
             keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v13-test2-{instance_version}"], keys
+            assert keys == [f"noxide-shell-v14-test2-{instance_version}"], keys
             assert not errors, errors
             await browser.close()
             print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers.")
