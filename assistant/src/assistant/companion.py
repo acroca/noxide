@@ -8,6 +8,7 @@ side effects silently after a crash.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html
 import io
@@ -31,12 +32,29 @@ from .conversations import WEB_CHAT_ID, ConversationArchive
 from .copilot import CopilotUnavailableError
 from .schedule import Scheduler
 from .tools import VaultTools
+from .transcribe import Transcriber, TranscriptionError
 
 logger = logging.getLogger(__name__)
 # A reply displayed on a focused device within this window notifies no device.
 # Longer than the client's poll interval, so the device already showing the
 # conversation gets to acknowledge before phones buzz.
 PUSH_GRACE_SECONDS = 5
+# Uploads match Telegram's 20 MB download cap; bodies are read from the
+# stream in chunks, so the app-wide JSON body limit does not apply to them.
+UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENTS = 4
+# Declared type → (magic prefixes, stored extension). Sniffing keeps an
+# SVG or HTML body from landing in the vault under an image name.
+_IMAGE_TYPES = {
+    "image/jpeg": ((b"\xff\xd8\xff",), "jpg"),
+    "image/png": ((b"\x89PNG\r\n\x1a\n",), "png"),
+    "image/webp": ((b"RIFF",), "webp"),
+    "image/gif": ((b"GIF87a", b"GIF89a"), "gif"),
+}
+_ATTACHMENT_PATH = re.compile(r"attachments/\d{4}-\d{2}-\d{2}-[0-9a-f]{6}\.(jpg|png|webp|gif)")
+_IMAGE_NOTE = "[attached image — already stored in the vault at {path}; link it from a note if it is worth keeping, otherwise leave it]"
+_IMAGE_NOTE_N = "[attached image {n} of {total} — already stored in the vault at {path}; link it from a note if it is worth keeping, otherwise leave it]"
+_NO_CAPTION = "The user sent this image without a caption."
 _ASSETS = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css",
            "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
@@ -52,8 +70,9 @@ _WEB_CONTEXT = (
 
 class Companion:
     def __init__(self, cfg: Config, agent: Agent, vault: VaultTools, scheduler: Scheduler,
-                 archive: ConversationArchive | None = None):
+                 archive: ConversationArchive | None = None, transcriber: Transcriber | None = None):
         self.cfg, self.agent, self.vault, self.scheduler = cfg, agent, vault, scheduler
+        self.transcriber = transcriber
         self._owns_archive = archive is None
         self.archive = archive or ConversationArchive(cfg.state_dir)
         self.db = self.archive.db
@@ -110,6 +129,9 @@ class Companion:
         self.app.router.add_post("/api/retry", self.retry)
         self.app.router.add_post("/api/reset", self.reset)
         self.app.router.add_post("/api/seen", self.mark_seen)
+        self.app.router.add_post("/api/attachments", self.upload)
+        self.app.router.add_get("/api/attachment", self.attachment)
+        self.app.router.add_post("/api/transcribe", self.transcribe)
         self.app.router.add_post("/api/push", self.subscribe)
         self.app.router.add_delete("/api/push", self.unsubscribe)
         self.app.router.add_post("/api/push/test", self.test_push)
@@ -135,7 +157,7 @@ class Companion:
             logger.exception("Companion request failed")
             response = web.json_response({"error": "Request failed; check server logs"}, status=500)
         response.headers.update({
-            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            "Cache-Control": response.headers.get("Cache-Control", "no-store"), "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
             "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; "
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
@@ -178,7 +200,8 @@ class Companion:
 
     async def session(self, request):
         return web.json_response({"push_key": self.public_key, "timezone": self.cfg.timezone,
-                                  "agent_name": self.cfg.agent_name})
+                                  "agent_name": self.cfg.agent_name,
+                                  "voice": self.transcriber is not None})
 
     def _space(self, value):
         if value == "general":
@@ -281,8 +304,9 @@ class Companion:
                                   "before": rows[99]["created"] if len(rows) > 100 else None,
                                   "generation": self.archive.generation(space)})
 
-    def _insert(self, space, role, text, status, *, message_id=None, reply_to=None):
-        return self.archive.insert(space, role, text, status, message_id=message_id, reply_to=reply_to)
+    def _insert(self, space, role, text, status, *, message_id=None, reply_to=None, metadata=None):
+        return self.archive.insert(space, role, text, status, message_id=message_id, reply_to=reply_to,
+                                   metadata=metadata)
 
     async def submit(self, request):
         if not self.accepting:
@@ -292,8 +316,9 @@ class Companion:
             raise web.HTTPServiceUnavailable(text="Service restarting; your draft has not been sent")
         space, text, message_id = data.get("space"), data.get("text"), data.get("id")
         self._space(space)
-        if not isinstance(text, str) or not text.strip() or len(text) > 20000:
-            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters")
+        attachments = self._attachments(data.get("attachments", []))
+        if not isinstance(text, str) or len(text) > 20000 or not (text.strip() or attachments):
+            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters or an image")
         if not isinstance(message_id, str) or not re.fullmatch(r"[a-f0-9-]{32,36}", message_id):
             raise web.HTTPBadRequest(text="A valid message ID is required")
         existing = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
@@ -306,9 +331,39 @@ class Companion:
         if self.db.execute("SELECT 1 FROM messages WHERE space=? AND source='web' AND role='user' AND status NOT IN ('done','dismissed','deleted')",
                            (space,)).fetchone():
             raise web.HTTPConflict(text="Finish or clear the pending message in this space first")
-        self._insert(space, "user", text, "queued", message_id=message_id)
+        self._insert(space, "user", text, "queued", message_id=message_id,
+                     metadata={"attachments": attachments} if attachments else None)
         self._launch(message_id)
         return web.json_response({"id": message_id}, status=202)
+
+    def _attachments(self, value):
+        """Validate stored attachment paths a message refers to."""
+        if not isinstance(value, list) or len(value) > MAX_ATTACHMENTS:
+            raise web.HTTPBadRequest(text=f"Attach up to {MAX_ATTACHMENTS} images per message")
+        for path in value:
+            if not isinstance(path, str) or not _ATTACHMENT_PATH.fullmatch(path) or not self._attachment_file(path).is_file():
+                raise web.HTTPBadRequest(text="Unknown attachment; upload it again")
+        return value
+
+    def _attachment_file(self, path):
+        if not _ATTACHMENT_PATH.fullmatch(path or ""):
+            raise web.HTTPBadRequest(text="Not an attachment path")
+        return self.vault.abs_path(path)
+
+    def _image_turn(self, row):
+        """The model-facing text and vision input for a stored web message."""
+        text = row["text"]
+        attachments = json.loads(row["metadata"] or "{}").get("attachments", [])
+        if not attachments:
+            return text, None
+        notes = [_IMAGE_NOTE.format(path=attachments[0])] if len(attachments) == 1 else [
+            _IMAGE_NOTE_N.format(n=n, total=len(attachments), path=path) for n, path in enumerate(attachments, 1)]
+        urls = []
+        for path in attachments:
+            data = self._attachment_file(path).read_bytes()
+            mime = next((mime for mime, (_, ext) in _IMAGE_TYPES.items() if path.endswith("." + ext)), "image/jpeg")
+            urls.append(f"data:{mime};base64," + base64.b64encode(data).decode())
+        return (text.strip() or _NO_CAPTION) + "\n\n" + "\n".join(notes), urls
 
     def _launch(self, message_id):
         task = asyncio.create_task(self._process(message_id))
@@ -329,13 +384,15 @@ class Companion:
         try:
             thread = self._space(row["space"])
             archive_kwargs = {"message_id": message_id} if getattr(self.agent, "archive", None) is self.archive else {}
+            text, image_data_urls = self._image_turn(row)
+            if image_data_urls:
+                archive_kwargs["image_data_urls"] = image_data_urls
             if message_id in self.hot:
-                reply = await self.agent.retry_message(WEB_CHAT_ID, thread, row["text"],
+                reply = await self.agent.retry_message(WEB_CHAT_ID, thread, text,
                                                        str(row["created"]), hot=True,
                                                        send_message_fn=send, extra_context=_WEB_CONTEXT, **archive_kwargs)
             else:
                 self.hot.add(message_id)
-                text = row["text"]
                 if row["error"]:
                     text = "[Explicit retry after interruption; earlier work may have partially completed. Re-read state before acting.] " + text
                 if row["space"].startswith("wiki/"):
@@ -435,6 +492,51 @@ class Companion:
             raise web.HTTPConflict(text="Push is not configured")
         self.notify_push("general", "Hello there! This is the test reminder", grace=False)
         return web.json_response({"ok": True})
+
+    async def _read_upload(self, request):
+        """Read a raw upload body in chunks, refusing past the cap."""
+        chunks, size = [], 0
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            size += len(chunk)
+            if size > UPLOAD_BYTES:
+                raise web.HTTPRequestEntityTooLarge(max_size=UPLOAD_BYTES, actual_size=size,
+                                                    text=f"Uploads are limited to {UPLOAD_BYTES // 1024 // 1024} MB")
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            raise web.HTTPBadRequest(text="Empty upload")
+        return data
+
+    async def upload(self, request):
+        """Store one image in the vault's attachments folder, as Telegram photos are."""
+        declared = request.content_type
+        if declared not in _IMAGE_TYPES:
+            raise web.HTTPBadRequest(text="Only JPEG, PNG, WebP and GIF images can be attached")
+        data = await self._read_upload(request)
+        magic, ext = _IMAGE_TYPES[declared]
+        if not data.startswith(magic):
+            raise web.HTTPBadRequest(text="That file is not the image type it claims to be")
+        path = await asyncio.to_thread(self.vault.save_attachment, data, ext)
+        return web.json_response({"path": path, "bytes": len(data)})
+
+    async def attachment(self, request):
+        file = self._attachment_file(request.query.get("path", ""))
+        if not file.is_file():
+            raise web.HTTPNotFound(text="Attachment not found")
+        mime = next(mime for mime, (_, ext) in _IMAGE_TYPES.items() if file.suffix == "." + ext)
+        return web.Response(body=await asyncio.to_thread(file.read_bytes), content_type=mime,
+                            headers={"Cache-Control": "private, max-age=86400"})
+
+    async def transcribe(self, request):
+        """Turn a browser recording into text; the client sends the text as a normal message."""
+        if self.transcriber is None:
+            raise web.HTTPConflict(text="Voice messages aren't set up: set ELEVENLABS_API_KEY on the server")
+        data = await self._read_upload(request)
+        try:
+            text = await self.transcriber.transcribe(data)
+        except TranscriptionError as exc:
+            raise web.HTTPBadGateway(text=f"Couldn't transcribe that: {exc}") from exc
+        return web.json_response({"text": text})
 
     async def mark_seen(self, request):
         """A focused device displayed this space through the given timestamp."""

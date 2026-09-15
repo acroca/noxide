@@ -55,7 +55,7 @@ not a multi-tenant service. The optional PWA runs alongside Telegram, not instea
 | **Documents** | PDFs, scans and text files stored and read on demand — digital PDFs parsed locally, scans transcribed via vision |
 | **Bursts** | Messages that arrive within a second of each other — a WhatsApp share, a few quick lines — are handled as one turn with one reply |
 | **Rooms** | Telegram forum topics become separate rooms with their own history and prompt, handled in parallel, sharing one vault |
-| **Web companion** | Chat with a topic picker, a raw read-only Now page, saved drafts and opt-in push; private-network access only |
+| **Web companion** | Chat with a topic picker, pasted or attached images, voice notes, a raw read-only Now page, saved drafts and opt-in push; private-network access only |
 | **Conversation archive** | Shared home Telegram/PWA topic history in SQLite; five recent exchanges by default, older text retrieved on demand |
 | **Skills** | Stored procedures in markdown that the bot consults — and refines — as it works |
 | **Bulk fan-out** | One instruction over up to 50 items, processed in parallel by read-only worker sub-agents |
@@ -168,8 +168,8 @@ other LLM frameworks.
 The optional [web companion](docs/deployment.md#web-companion-pwa) opens straight
 into Chat, with General and a switcher for your Telegram topics. A separate Now
 tab shows `wiki/now.md` as read-only text. It shares the vault and assistant,
-keeps Telegram working, and supports opt-in push notifications. No separate
-frontend deployment.
+keeps Telegram working, takes pasted or attached images and voice notes, and
+supports opt-in push notifications. No separate frontend deployment.
 
 Noxide is the project; `AGENT_NAME` / `[assistant] name` sets your instance's
 name. It appears in the app and model identity; push titles show the channel.

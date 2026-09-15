@@ -268,9 +268,22 @@ Stop the service before copying its SQLite database for a consistent backup.
 Generated replies remain readable in the web timeline if Telegram delivery fails;
 the delivery status is recorded separately, without rerunning completed writes.
 
-Web uploads, voice capture, token streaming,
-automatic background retries and replacing Telegram entirely are not part of
-this first version. Built-in maintenance schedules are configured server-side.
+**Images and voice.** The composer takes images three ways: the attach
+button, drag and drop, and pasting a screenshot or copied picture straight into
+the text field. Up to four per message; each is decoded on the device and
+re-encoded as JPEG within 2000px (so iPhone HEIC photos and multi-megabyte
+originals arrive as ordinary JPEGs), stored in the vault's `attachments/`
+folder exactly like a Telegram photo, shown to the model for that turn only,
+and rendered as a thumbnail in the timeline. The server accepts only JPEG,
+PNG, WebP and GIF bodies up to 20 MB and checks the bytes match the declared
+type. When `ELEVENLABS_API_KEY` is set, a microphone button records a voice
+note in the browser (tap to start, tap to stop, up to five minutes) and puts
+the transcript into the text field for you to review and send; nothing is
+sent automatically. Recording needs microphone permission and, on iPhone, an
+installed app on a supported iOS version. Without the key the button is
+hidden. Token streaming, automatic background retries and replacing Telegram
+entirely are not part of this version. Built-in maintenance schedules are
+configured server-side.
 
 ### Voice messages
 

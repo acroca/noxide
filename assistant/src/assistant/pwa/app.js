@@ -7,7 +7,11 @@ const paths = {
   settings: 'M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1zM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
   refresh: 'M20 7v5h-5M4 17v-5h5M6 6a8 8 0 0 1 14 6M4 12a8 8 0 0 0 14 6',
   send: 'M12 19V5m-5 5 5-5 5 5',
+  image: 'M4 5h16v14H4zM4 15l5-5 4 4 3-3 4 4M15.5 9.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0',
+  mic: 'M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3M8 21h8',
 };
+const MAX_IMAGES = 4, IMAGE_EDGE = 2000, KEEP_ORIGINAL_BYTES = 4 * 1024 * 1024, MAX_RECORDING_MS = 5 * 60 * 1000;
+const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 function icon(name) {
   return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
 }
@@ -66,6 +70,52 @@ async function api(path, data, method, background = false) {
     if (mutation) { pendingMutations--; updateBanner(); }
   }
 }
+async function upload(path, blob) {
+  // Raw-body uploads (images, recordings); JSON calls go through api().
+  pendingMutations++; updateBanner();
+  try {
+    let response, result;
+    try {
+      response = await fetch(`/api/${path}`, { method: 'POST', credentials: 'same-origin', headers: { 'X-Noxide': '1', 'Content-Type': blob.type }, body: blob, signal: AbortSignal.timeout(180000) });
+      if (response.status >= 500) throw new Error('Server unavailable');
+      result = await response.json();
+    } catch {
+      unavailable();
+      throw new Error(`Cannot reach ${agentName} right now.`);
+    }
+    serverUnavailable = false;
+    connectivity();
+    if (!response.ok) throw new Error(result.error || 'Upload failed');
+    return result;
+  } finally { pendingMutations--; updateBanner(); }
+}
+async function prepareImage(file) {
+  // Phones hand over HEIC and multi-megabyte originals: decode on the device
+  // and re-encode as JPEG within 2000px, keeping small accepted files as they are.
+  let bitmap;
+  try { bitmap = await createImageBitmap(file); }
+  catch {
+    if (IMAGE_TYPES.includes(file.type) && file.size <= KEEP_ORIGINAL_BYTES) return file;
+    throw new Error(`Couldn't read ${file.name || 'that image'}.`);
+  }
+  const scale = Math.min(1, IMAGE_EDGE / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1 && IMAGE_TYPES.includes(file.type) && file.size <= KEEP_ORIGINAL_BYTES) { bitmap.close(); return file; }
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bitmap.width * scale); canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+  if (!blob) throw new Error(`Couldn't convert ${file.name || 'that image'}.`);
+  return blob;
+}
+function attachmentsOf(message) {
+  try { return JSON.parse(message.metadata || '{}').attachments || []; } catch { return []; }
+}
+function thumbnails(message) {
+  const paths = attachmentsOf(message);
+  if (!paths.length) return '';
+  return `<div class="message-images">${paths.map(p => { const src = '/api/attachment?path=' + encodeURIComponent(p); return `<a href="${src}" target="_blank" rel="noopener"><img src="${src}" alt="Attached image" loading="lazy"></a>`; }).join('')}</div>`;
+}
 function inline(text) {
   return escape(text).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 }
@@ -117,10 +167,14 @@ function renderChat(topic, pageVersion) {
       <button id="older-messages" class="quiet older" hidden>Load earlier messages</button>
       <div id="chat-thread" class="chat-thread" role="log" aria-label="${escape(name)} messages"><div class="loading">Loading messages…</div></div>
       <form id="chat-form" class="chat-composer">
-        <textarea aria-label="Message to ${escape(name)}" rows="2" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…" required>${escape(draft(topic))}</textarea>
+        <div id="composer-images" class="composer-images" hidden></div>
+        <button id="attach-image" class="tool-button" type="button" aria-label="Attach image">${icon('image')}</button>
+        <input id="image-input" type="file" accept="image/*" multiple hidden>
+        <textarea aria-label="Message to ${escape(name)}" rows="2" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft(topic))}</textarea>
+        <button id="record-voice" class="tool-button" type="button" aria-label="Record voice message" hidden>${icon('mic')}</button>
         <button class="send-button" type="submit" aria-label="Send message">${icon('send')}</button>
       </form>
-      <p id="chat-status" class="chat-status" role="status">Writing in ${escape(name)}</p>
+      <p id="chat-status" class="chat-status" role="status">Writing in ${escape(name)} <button id="discard-recording" class="quiet danger" type="button" hidden>Discard recording</button></p>
     </section>`;
   $('#chat-topic').addEventListener('click', () => {
     const picker = $('#topic-picker');
@@ -133,8 +187,8 @@ function renderChat(topic, pageVersion) {
   });
   const active = () => version === pageVersion && Boolean($('#chat-thread'));
   let signature = '', cursor = null, older = [], busy = false, sending = false, loaded = false;
-  let latest = [], acked = 0;
-  const button = $('#chat-form button'), area = $('#chat-form textarea');
+  let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
+  const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
   const atEnd = thread => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
   function markSeen() {
     // Tell the server this device is showing the newest reply: focused, on this
@@ -157,10 +211,105 @@ function renderChat(topic, pageVersion) {
   new ResizeObserver(() => { if (stickToEnd) thread.scrollTop = thread.scrollHeight; }).observe(thread);
   function updateComposer() {
     if (!active()) return;
-    button.disabled = !loaded || busy || sending || !navigator.onLine;
-    $('#chat-status').textContent = !navigator.onLine ? 'Offline. Your draft stays on this device.'
-      : busy ? 'Finish or clear the pending message before sending another.' : `Writing in ${name}`;
+    button.disabled = !loaded || busy || sending || !navigator.onLine || Boolean(recorder);
+    $('#attach-image').disabled = sending || images.length >= MAX_IMAGES;
+    $('#discard-recording').hidden = !recorder;
+    $('#chat-status').firstChild.textContent = (!navigator.onLine ? 'Offline. Your draft stays on this device.'
+      : activity ? activity
+      : busy ? 'Finish or clear the pending message before sending another.' : `Writing in ${name}`) + ' ';
   }
+  function setActivity(text) { activity = text; updateComposer(); }
+  function renderImages() {
+    const strip = $('#composer-images');
+    strip.hidden = !images.length;
+    strip.innerHTML = images.map((image, i) => `<figure><img src="${image.url}" alt="Image ${i + 1} to attach"><button type="button" data-remove="${i}" aria-label="Remove image ${i + 1}">×</button></figure>`).join('');
+    strip.querySelectorAll('[data-remove]').forEach(b => b.addEventListener('mousedown', event => event.preventDefault()));
+    strip.querySelectorAll('[data-remove]').forEach(b => b.addEventListener('click', () => {
+      const [removed] = images.splice(Number(b.dataset.remove), 1);
+      URL.revokeObjectURL(removed.url);
+      renderImages(); updateComposer();
+    }));
+  }
+  async function addImages(files) {
+    for (const file of files) {
+      if (!active()) return;
+      if (images.length >= MAX_IMAGES) { toast(`Up to ${MAX_IMAGES} images per message.`); break; }
+      try {
+        const blob = await prepareImage(file);
+        images.push({ blob, url: URL.createObjectURL(blob), path: null });
+      } catch (e) { toast(e.message); }
+    }
+    renderImages(); updateComposer();
+  }
+  function clearImages() {
+    images.forEach(image => URL.revokeObjectURL(image.url));
+    images = []; renderImages();
+  }
+  // Composer buttons leave focus in the textarea: the keyboard stays open
+  // across a send, and blurring would shift the layout under the tap.
+  form.querySelectorAll('button').forEach(b => b.addEventListener('mousedown', event => event.preventDefault()));
+  $('#attach-image').addEventListener('click', () => $('#image-input').click());
+  $('#image-input').addEventListener('change', event => { addImages([...event.target.files]); event.target.value = ''; });
+  area.addEventListener('paste', event => {
+    // Screenshots and copied pictures land as files; text pastes stay untouched.
+    const files = [...(event.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'));
+    if (!files.length) return;
+    event.preventDefault();
+    addImages(files);
+  });
+  form.addEventListener('dragover', event => { if ([...event.dataTransfer.types].includes('Files')) { event.preventDefault(); form.classList.add('dragover'); } });
+  form.addEventListener('dragleave', () => form.classList.remove('dragover'));
+  form.addEventListener('drop', event => {
+    form.classList.remove('dragover');
+    const files = [...event.dataTransfer.files].filter(f => f.type.startsWith('image/') || /\.hei[cf]$/i.test(f.name));
+    if (!files.length) return;
+    event.preventDefault();
+    addImages(files);
+  });
+  const voiceSupported = Boolean(session?.voice && window.MediaRecorder && navigator.mediaDevices?.getUserMedia);
+  $('#record-voice').hidden = !voiceSupported;
+  function stopRecording(discard = false) {
+    if (!recorder) return;
+    recorder.discard = discard;
+    if (recorder.state !== 'inactive') recorder.stop();
+  }
+  async function startRecording() {
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { toast('Microphone permission was not granted. You can change it in your device settings.'); return; }
+    const mimeType = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find(t => MediaRecorder.isTypeSupported(t));
+    const chunks = [];
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    recorder.addEventListener('dataavailable', event => { if (event.data.size) chunks.push(event.data); });
+    recorder.addEventListener('stop', async () => {
+      const { discard } = recorder, type = recorder.mimeType || mimeType || 'audio/webm';
+      stream.getTracks().forEach(track => track.stop());
+      clearInterval(recordTicker); recorder = null;
+      $('#record-voice').classList.remove('recording'); $('#record-voice').setAttribute('aria-label', 'Record voice message');
+      if (!active()) return;
+      const blob = new Blob(chunks, { type: type.split(';')[0] });
+      if (discard || blob.size < 1000) { setActivity(''); if (!discard) toast('Nothing was recorded.'); return; }
+      setActivity('Transcribing…');
+      try {
+        const { text } = await upload('transcribe', blob);
+        if (!active()) return;
+        area.value = area.value.trim() ? area.value.replace(/\s*$/, ' ') + text : text;
+        area.dispatchEvent(new Event('input'));
+        area.focus();
+      } catch (e) { toast(e.message); } finally { setActivity(''); }
+    });
+    recorder.start(1000);
+    recordStarted = Date.now();
+    $('#record-voice').classList.add('recording'); $('#record-voice').setAttribute('aria-label', 'Stop recording');
+    const tick = () => {
+      const seconds = Math.round((Date.now() - recordStarted) / 1000);
+      setActivity(`Recording ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} · tap the mic to stop`);
+      if (Date.now() - recordStarted >= MAX_RECORDING_MS) stopRecording();
+    };
+    tick(); recordTicker = setInterval(tick, 1000);
+  }
+  $('#record-voice').addEventListener('click', () => { if (recorder) stopRecording(); else startRecording().catch(e => toast(e.message)); });
+  $('#discard-recording').addEventListener('click', () => stopRecording(true));
   async function loadMessages(loadOlder = false) {
     const data = await api('messages?space=' + encodeURIComponent(topic) + (loadOlder ? `&before=${cursor}` : ''));
     if (!active()) return;
@@ -186,7 +335,7 @@ function renderChat(topic, pageVersion) {
       ${i && m.generation !== messages[i - 1].generation ? divider : ''}
       <article class="message message-${escape(m.role)}">
         <div class="message-meta"><strong>${m.role === 'user' ? 'You' : escape(agentName)}</strong><time>${escape(dateLabel(m.created))}</time>${m.role === 'assistant' && !m.reply_to ? '' : `<span>${m.source === 'telegram' ? 'Telegram' : 'Web'}</span>`}${m.role === 'assistant' && ['failed','partial','pending'].includes(m.delivery) ? `<span>Telegram delivery: ${escape(m.delivery)}</span>` : ''}</div>
-        <div class="message-body">${m.role === 'user' ? escape(m.text) : markdown(m.text)}</div>
+        <div class="message-body">${m.role === 'user' ? thumbnails(m) + escape(m.text) : markdown(m.text)}</div>
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${m.source !== 'telegram' && ['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
       </article>`).join('') + trailing : `<div class="chat-empty"><h1>${escape(name)}</h1><p>No messages yet. Send a message to start.</p></div>`;
     $$('[data-retry]').forEach(b => b.addEventListener('click', async () => {
@@ -216,22 +365,31 @@ function renderChat(topic, pageVersion) {
   });
   $('#chat-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (sending || busy || !loaded) return;
-    const text = area.value.trim(); if (!text) return;
+    if (sending || busy || !loaded || recorder) return;
+    const text = area.value.trim(); if (!text && !images.length) return;
     if (!navigator.onLine) { toast('You’re offline. Your draft has not been sent.'); return; }
     sending = true; updateComposer();
     try {
+      for (const [i, image] of images.entries()) {
+        // Uploaded paths stick to the image, so a retried send reuses them.
+        if (image.path) continue;
+        setActivity(`Uploading image ${i + 1} of ${images.length}…`);
+        image.path = (await upload('attachments', image.blob)).path;
+      }
+      setActivity('');
+      const attachments = images.map(image => image.path);
       let pending;
       try { pending = JSON.parse(localStorage.getItem(submissionKey(topic))); } catch {}
-      if (pending?.text !== text) pending = { id: crypto.randomUUID(), text };
+      if (pending?.text !== text || JSON.stringify(pending?.attachments || []) !== JSON.stringify(attachments)) pending = { id: crypto.randomUUID(), text, attachments };
       localStorage.setItem(submissionKey(topic), JSON.stringify(pending));
-      await api('messages', { id: pending.id, space: topic, text });
+      await api('messages', { id: pending.id, space: topic, text, attachments });
       // Do not erase a new draft typed while the request was in flight.
       if (draft(topic).trim() === text) localStorage.removeItem(draftKey(topic));
       localStorage.removeItem(submissionKey(topic));
       if (area.value.trim() === text) area.value = '';
+      clearImages();
       await loadMessages();
-    } catch (e) { toast(e.message); } finally { sending = false; updateComposer(); }
+    } catch (e) { toast(e.message); } finally { sending = false; setActivity(''); }
   });
   updateComposer();
   loadMessages().catch(e => { if (active()) { $('#chat-thread').textContent = e.message; toast(e.message); } });

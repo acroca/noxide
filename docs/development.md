@@ -71,7 +71,8 @@ calls. It covers password-free startup, offline launches and proxy failures,
 update waiting/activation, in-flight submission protection, multi-tab draft
 preservation, the seen acknowledgements that suppress push for a reply
 already displayed on a focused device, reset dividers and the thread staying
-anchored to its end when the composer blurs. Bump `CACHE` in `pwa/sw.js` whenever packaged shell assets change;
+anchored to its end when the composer blurs, pasted images and the voice
+button. Bump `CACHE` in `pwa/sw.js` whenever packaged shell assets change;
 the installed version serves its own cached bundle until an update activates.
 
 ### Source files

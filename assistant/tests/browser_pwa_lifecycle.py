@@ -17,8 +17,8 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True, "replies": {}, "generation": 0}
-    seen = []
+    state = {"revision": 1, "available": True, "authorized": True, "replies": {}, "generation": 0, "voice": False}
+    seen, uploads, submissions = [], [], []
     release = asyncio.Event()
     release.set()
     started = asyncio.Event()
@@ -30,13 +30,19 @@ async def main():
             if not state["authorized"]:
                 return web.json_response({"error": "Sign in to continue"}, status=401)
             if request.path == "/api/session":
-                return web.json_response({"timezone": "UTC", "push_key": "", "agent_name": agent_name})
+                return web.json_response({"timezone": "UTC", "push_key": "", "agent_name": agent_name, "voice": state["voice"]})
+            if request.path == "/api/attachments":
+                uploads.append((request.content_type, await request.read()))
+                return web.json_response({"path": f"attachments/2026-09-15-{len(uploads):06x}.png"})
+            if request.path == "/api/attachment":
+                return web.Response(body=uploads[-1][1], content_type="image/png")
             if request.path == "/api/topics":
                 return web.json_response({"topics": [{"id": "general", "name": "General"}, {"id": "topic:10", "name": "Work"}]})
             if request.path == "/api/messages" and request.method == "POST":
                 started.set()
                 await release.wait()
-                return web.json_response({"id": (await request.json())["id"]}, status=202)
+                submissions.append(await request.json())
+                return web.json_response({"id": submissions[-1]["id"]}, status=202)
             if request.path == "/api/seen":
                 seen.append(await request.json())
                 return web.json_response({"ok": True})
@@ -54,7 +60,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v15", f"noxide-shell-v15-test{state['revision']}")
+            text = text.replace("noxide-shell-v16", f"noxide-shell-v16-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -229,11 +235,42 @@ async def main():
             await page.get_by_label("Message to General").blur()
             await asyncio.sleep(0.5)
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 0
+            # Images: a pasted screenshot becomes a pending thumbnail, is
+            # uploaded on send, and the stored path rides on the message.
+            assert await page.locator("#record-voice").is_hidden()  # no transcriber configured
+            paste = """async () => {
+                const canvas = document.createElement('canvas'); canvas.width = 3000; canvas.height = 10;
+                canvas.getContext('2d').fillStyle = '#c33'; canvas.getContext('2d').fillRect(0, 0, 3000, 10);
+                const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+                const transfer = new DataTransfer();
+                transfer.items.add(new File([blob], 'shot.png', {type: 'image/png'}));
+                document.querySelector('#chat-form textarea').dispatchEvent(new ClipboardEvent('paste', {clipboardData: transfer, bubbles: true}));
+            }"""
+            await page.evaluate(paste)
+            await expect(page.locator("#composer-images img")).to_have_count(1)
+            await page.evaluate(paste)
+            await expect(page.locator("#composer-images img")).to_have_count(2)
+            await page.get_by_role("button", name="Remove image 2").click()
+            await expect(page.locator("#composer-images img")).to_have_count(1)
+            await area.fill("What is this?")
+            await page.get_by_role("button", name="Send message", exact=True).click()
+            await expect(page.locator("#composer-images")).to_be_hidden()
+            await expect(area).to_have_value("")
+            assert len(uploads) == 1 and uploads[0][0] == "image/jpeg" and uploads[0][1][:3] == b"\xff\xd8\xff", uploads[0][0]
+            assert submissions[-1]["text"] == "What is this?" and submissions[-1]["attachments"] == ["attachments/2026-09-15-000001.png"]
+            state["replies"]["general"].append({"id": "u9", "space": "general", "role": "user", "text": "What is this?", "status": "done",
+                                                "created": 1700000100, "source": "web", "generation": 1,
+                                                "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png"]})})
+            await expect(page.locator(".message-user .message-images img")).to_have_count(1)
+            assert await page.locator(".message-user .message-images a").get_attribute("href") == "/api/attachment?path=attachments%2F2026-09-15-000001.png"
+            state["voice"] = True
+            await page.reload()
+            await expect(page.get_by_role("button", name="Record voice message")).to_be_visible()
             keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v15-test2-{instance_version}"], keys
+            assert keys == [f"noxide-shell-v16-test2-{instance_version}"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers.")
+            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers, pasted images, voice button.")
     finally:
         release.set()
         await runner.cleanup()

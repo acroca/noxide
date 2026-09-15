@@ -979,6 +979,7 @@ class Agent:
         send_message_fn: SendMessageFn | None = None,
         extra_context: str | None = None,
         message_id: str | None = None,
+        image_data_urls: list[str] | None = None,
     ) -> str | None:
         """Replay a user message that failed during a Copilot outage.
 
@@ -1034,6 +1035,9 @@ class Agent:
                 reply, touched = await self._run_locked(
                     chat_id, note, thread_id=thread_id, unwind_on_unavailable=True,
                     send_message_fn=send_message_fn, extra_context=extra_context,
+                    # A cold replay shows the pictures again; a hot one's turn
+                    # already carried them.
+                    image_data_urls=None if hot else image_data_urls,
                 )
             except BaseException as exc:
                 if self.archive and message_id:

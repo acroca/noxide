@@ -1,7 +1,9 @@
 """The web companion's trust boundary and accepted-message lifecycle."""
 
 import asyncio
+import base64
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -451,3 +453,65 @@ def test_pwa_config_rejects_insecure_or_ambiguous_origins(tmp_path, origin):
     cfg = Config(state_dir=tmp_path, pwa_enabled=True, pwa_origin=origin)
     with pytest.raises(ConfigError, match="pwa.origin"):
         cfg.validate_for_run()
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 64
+
+
+async def test_image_upload_is_sniffed_capped_stored_and_served(companion):
+    service, client = companion
+    response = await client.post("/api/attachments", data=PNG, headers={"Content-Type": "image/png"})
+    assert response.status == 200
+    path = (await response.json())["path"]
+    assert re.fullmatch(r"attachments/\d{4}-\d{2}-\d{2}-[0-9a-f]{6}\.png", path)
+    assert (service.cfg.vault_path / path).read_bytes() == PNG
+    served = await client.get("/api/attachment", params={"path": path})
+    assert served.status == 200 and served.content_type == "image/png" and await served.read() == PNG
+    for bad in ("wiki/now.md", "attachments/../wiki/now.md", "attachments/missing.png", ""):
+        assert (await client.get("/api/attachment", params={"path": bad})).status in (400, 404)
+    # Bytes that are not the declared image, and undeclared types, are refused.
+    assert (await client.post("/api/attachments", data=b"<svg onload=alert(1)>", headers={"Content-Type": "image/png"})).status == 400
+    assert (await client.post("/api/attachments", data=b"<svg/>", headers={"Content-Type": "image/svg+xml"})).status == 400
+    with patch("assistant.companion.UPLOAD_BYTES", 32):
+        assert (await client.post("/api/attachments", data=PNG, headers={"Content-Type": "image/png"})).status == 413
+    assert len(list((service.cfg.vault_path / "attachments").iterdir())) == 1
+
+
+async def test_message_with_attachments_reaches_the_model_as_vision_input(companion):
+    service, client = companion
+    paths = [(await (await client.post("/api/attachments", data=PNG, headers={"Content-Type": "image/png"})).json())["path"]
+             for _ in range(2)]
+    assert (await client.post("/api/messages", json={"id": "f" * 32, "space": "general", "text": "", "attachments": ["wiki/now.md"]})).status == 400
+    assert (await client.post("/api/messages", json={"id": "f" * 32, "space": "general", "text": "", "attachments": paths * 3})).status == 400
+    assert (await client.post("/api/messages", json={"id": "f" * 32, "space": "general", "text": ""})).status == 400
+    assert (await client.post("/api/messages", json={"id": "f" * 32, "space": "general", "text": "", "attachments": paths})).status == 202
+    await settle(service)
+    call = service.agent.run.call_args
+    assert call.kwargs["image_data_urls"] == ["data:image/png;base64," + base64.b64encode(PNG).decode()] * 2
+    assert "without a caption" in call.args[1]
+    assert all(f"[attached image {n} of 2 — already stored in the vault at {path}" in call.args[1] for n, path in enumerate(paths, 1))
+    rows = (await (await client.get("/api/messages")).json())["messages"]
+    assert rows[0]["text"] == "" and json.loads(rows[0]["metadata"])["attachments"] == paths
+    # A caption keeps its own text; the stored-path note follows it.
+    service.agent.run.reset_mock()
+    assert (await client.post("/api/messages", json={"id": "1" * 32, "space": "general", "text": "What plant?", "attachments": paths[:1]})).status == 202
+    await settle(service)
+    text = service.agent.run.call_args.args[1]
+    assert text.startswith("What plant?\n\n[attached image — already stored in the vault at ")
+
+
+async def test_transcribe_endpoint_needs_a_transcriber_and_reports_failures(companion):
+    from assistant.transcribe import TranscriptionError
+
+    service, client = companion
+    assert (await (await client.get("/api/session")).json())["voice"] is False
+    assert (await client.post("/api/transcribe", data=b"audio", headers={"Content-Type": "audio/mp4"})).status == 409
+    service.transcriber = MagicMock(transcribe=AsyncMock(return_value="hola mundo"))
+    assert (await (await client.get("/api/session")).json())["voice"] is True
+    response = await client.post("/api/transcribe", data=b"audio", headers={"Content-Type": "audio/mp4"})
+    assert response.status == 200 and (await response.json())["text"] == "hola mundo"
+    service.transcriber.transcribe.assert_awaited_once_with(b"audio")
+    service.transcriber.transcribe.side_effect = TranscriptionError("credits are used up")
+    response = await client.post("/api/transcribe", data=b"audio", headers={"Content-Type": "audio/mp4"})
+    assert response.status == 502 and "credits" in (await response.json())["error"]
+    assert (await client.post("/api/transcribe", data=b"", headers={"Content-Type": "audio/mp4"})).status == 400

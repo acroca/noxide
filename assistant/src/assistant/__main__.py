@@ -273,7 +273,7 @@ async def _run(config_path: Path | None) -> None:
     if cfg.pwa_enabled:
         from .companion import Companion
 
-        companion = Companion(cfg, agent, vault, scheduler, archive=archive)
+        companion = Companion(cfg, agent, vault, scheduler, archive=archive, transcriber=transcriber)
 
     usage_task = asyncio.create_task(tracker.run())
     lifecycle = Lifecycle()
