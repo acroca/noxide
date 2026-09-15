@@ -1,5 +1,5 @@
 // Bump this when packaged shell assets change so existing installs offer an update.
-const CACHE = 'noxide-shell-v16-__INSTANCE_VERSION__';
+const CACHE = 'noxide-shell-v17-__INSTANCE_VERSION__';
 const AGENT_NAME = "__AGENT_NAME__";
 const SHELL = ['/', '/app.js', '/style.css', '/icon.svg', '/icon-192.png', '/icon-512.png', '/manifest.webmanifest'];
 self.addEventListener('install', event => { event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))); });
@@ -30,15 +30,24 @@ self.addEventListener('push', event => {
     if (typeof data.body === 'string' && data.body.trim()) body = data.body;
   } catch {}
   event.waitUntil(self.registration.showNotification(channel || (space === 'general' ? 'General' : name), {
-    body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png', tag: 'noxide-update', data: {url: '/#chat/'+encodeURIComponent(space)}
+    body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png', tag: 'noxide-update', data: {space}
   }));
 });
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  const target = new URL(event.notification.data?.url || '/#chat', self.location.origin);
-  if (target.origin !== self.location.origin) return;
+  const data = event.notification.data;
+  const space = typeof data?.space === 'string' && data.space ? data.space : 'general';
+  const target = new URL('/#chat/' + encodeURIComponent(space), self.location.origin);
   event.waitUntil(self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(async clients => {
-    for (const client of clients) { if (new URL(client.url).origin === self.location.origin) { await client.navigate(target.href); return client.focus(); } }
+    // The open app switches its own hash: a full navigation would drop an open
+    // draft, and WindowClient.navigate() rejects for clients this worker does
+    // not control, which used to abort the click before anything opened.
+    for (const client of clients) {
+      if (new URL(client.url).origin !== self.location.origin) continue;
+      try { await client.focus(); } catch { continue; }
+      client.postMessage({type: 'OPEN_SPACE', space});
+      return;
+    }
     return self.clients.openWindow(target.href);
   }));
 });

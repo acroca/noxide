@@ -60,7 +60,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v16", f"noxide-shell-v16-test{state['revision']}")
+            text = text.replace("noxide-shell-v17", f"noxide-shell-v17-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -195,6 +195,16 @@ async def main():
             await page.evaluate("() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); }")
             await asyncio.sleep(1)
             assert seen == [{"space": "general", "through": 1700000000.5}, {"space": "general", "through": 1700000001.5}], seen
+            # A notification click: the worker names the channel and the page
+            # switches its own hash, keeping the General draft it never left.
+            await page.evaluate("() => document.querySelector('#settings').close()")  # modal would trap focus
+            await page.get_by_label("Message to General").fill("half-written")
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_SPACE', space: 'topic:10'}}))")
+            await expect(page.get_by_label("Message to Work")).to_be_visible()
+            assert await page.evaluate("() => location.hash") == "#chat/topic%3A10"
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_SPACE', space: 'general'}}))")
+            await expect(page.get_by_label("Message to General")).to_have_value("half-written")
+            await page.get_by_label("Message to General").fill("")
 
             # Reset context draws a divider: after the last message when
             # nothing has followed yet, then between generations.
@@ -267,7 +277,7 @@ async def main():
             await page.reload()
             await expect(page.get_by_role("button", name="Record voice message")).to_be_visible()
             keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v16-test2-{instance_version}"], keys
+            assert keys == [f"noxide-shell-v17-test2-{instance_version}"], keys
             assert not errors, errors
             await browser.close()
             print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers, pasted images, voice button.")

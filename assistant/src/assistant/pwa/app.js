@@ -529,6 +529,12 @@ $('#reload-update').addEventListener('click', () => {
   }, 10000);
 });
 if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', event => {
+    // A notification click: the worker focuses this window and names the channel.
+    if (event.data?.type !== 'OPEN_SPACE' || typeof event.data.space !== 'string') return;
+    const target = chatURL(event.data.space);
+    if (location.hash === target) route(); else location.hash = target;
+  });
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     // Initial installation takes control too; it is not an app update.
     if (!hadController) { hadController = true; return; }
