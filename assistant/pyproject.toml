@@ -11,11 +11,11 @@ dependencies = [
     "apscheduler>=3.10",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
-    "dateparser>=1.4.2",
+    "dateparser>=1.4.3",
     "trafilatura>=2.2.0",
     "watchfiles>=0.21",
     "tomli>=2.0; python_version < '3.11'",
-    "pypdf>=6.16.2",
+    "pypdf>=6.18.0",
     "pypdfium2>=5.13.0",
     "pillow>=12.3.0",
 ]
@@ -37,7 +37,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
-    "ruff>=0.16.5",
+    "ruff>=0.16.7",
 ]
 
 [tool.ruff]
