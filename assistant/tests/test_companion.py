@@ -167,6 +167,17 @@ async def test_restart_marks_interrupted_work_without_replaying(companion):
     assert "Explicit retry after interruption" in service.agent.run.call_args.args[1]
 
 
+async def test_messages_open_on_a_small_page_with_older_ones_behind_a_cursor(companion):
+    service, client = companion
+    for i in range(21):
+        service._insert("general", "user", f"m{i}", "done")
+    data = await (await client.get("/api/messages")).json()
+    assert [m["text"] for m in data["messages"]] == [f"m{i}" for i in range(1, 21)]
+    assert data["before"] == data["messages"][0]["created"]
+    older = await (await client.get(f"/api/messages?before={data['before']}")).json()
+    assert [m["text"] for m in older["messages"]] == ["m0"] and older["before"] is None
+
+
 async def test_reset_marks_a_new_generation_the_timeline_can_draw(companion):
     service, client = companion
     service._insert("general", "user", "before", "done")

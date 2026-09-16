@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # Longer than the client's poll interval, so the device already showing the
 # conversation gets to acknowledge before phones buzz.
 PUSH_GRACE_SECONDS = 5
+# Newest messages a topic opens with; the same page feeds the 2.2s poll, so it
+# is kept small. Earlier pages load behind the timeline's manual link.
+MESSAGE_PAGE = 20
 # Uploads match Telegram's 20 MB download cap; bodies are read from the
 # stream in chunks, so the app-wide JSON body limit does not apply to them.
 UPLOAD_BYTES = 20 * 1024 * 1024
@@ -296,12 +299,12 @@ class Companion:
         space = request.query.get("space", "general")
         self._space(space)
         before = float(request.query.get("before", "inf"))
-        rows = self.db.execute("SELECT * FROM messages WHERE space=? AND status!='deleted' AND created<? ORDER BY created DESC LIMIT 101",
-                               (space, before)).fetchall()
+        rows = self.db.execute("SELECT * FROM messages WHERE space=? AND status!='deleted' AND created<? ORDER BY created DESC LIMIT ?",
+                               (space, before, MESSAGE_PAGE + 1)).fetchall()
         # The current generation lets the timeline draw a divider after a
         # reset that no message has followed yet.
-        return web.json_response({"messages": [dict(r) for r in reversed(rows[:100])],
-                                  "before": rows[99]["created"] if len(rows) > 100 else None,
+        return web.json_response({"messages": [dict(r) for r in reversed(rows[:MESSAGE_PAGE])],
+                                  "before": rows[MESSAGE_PAGE - 1]["created"] if len(rows) > MESSAGE_PAGE else None,
                                   "generation": self.archive.generation(space)})
 
     def _insert(self, space, role, text, status, *, message_id=None, reply_to=None, metadata=None):
