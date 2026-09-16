@@ -58,9 +58,8 @@ async def main():
         if name == 'index.html':
             text = text.replace('__AGENT_NAME__', agent_name)
         if name == "sw.js":
-            text = text.replace('__INSTANCE_VERSION__', instance_version)
+            text = text.replace('__INSTANCE_VERSION__', f"{instance_version}-test{state['revision']}")
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v19", f"noxide-shell-v19-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -317,7 +316,7 @@ async def main():
             await page.reload()
             await expect(page.get_by_role("button", name="Record voice message")).to_be_visible()
             keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v19-test2-{instance_version}"], keys
+            assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
             print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers, pasted images, voice button.")

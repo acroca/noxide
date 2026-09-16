@@ -239,9 +239,9 @@ No reinstall is needed. The first upgrade from an older version without the
 banner may require closing all app windows and reopening once.
 
 The service worker serves a versioned shell bundle, never a mixture of cached
-and freshly fetched UI files. Releases changing packaged UI assets must bump
-the cache version in `pwa/sw.js`; unfinished downloads do not replace the
-currently installed worker.
+and freshly fetched UI files. The cache version is a hash of the packaged UI
+files stamped by the server, so any release that changes them is a new
+version; unfinished downloads do not replace the currently installed worker.
 
 Telegram inputs (including combined bursts, voice transcripts and attachment
 references) and final assistant replies are archived alongside web messages in

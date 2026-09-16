@@ -1,5 +1,6 @@
-// Bump this when packaged shell assets change so existing installs offer an update.
-const CACHE = 'noxide-shell-v19-__INSTANCE_VERSION__';
+// The server stamps a hash of every shell file here, so any asset change is a
+// new version and existing installs offer an update; nothing to bump by hand.
+const CACHE = 'noxide-shell-__INSTANCE_VERSION__';
 const AGENT_NAME = "__AGENT_NAME__";
 const SHELL = ['/', '/app.js', '/theme.js', '/style.css', '/icon.svg', '/icon-192.png', '/icon-512.png', '/manifest.webmanifest'];
 self.addEventListener('install', event => { event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))); });

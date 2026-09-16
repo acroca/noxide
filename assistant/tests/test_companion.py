@@ -250,7 +250,9 @@ async def test_agent_name_in_shell_manifest_session_and_worker(companion):
     assert f'const AGENT_NAME = {json.dumps(name)};' in worker
     service.cfg.agent_name = 'Cedar'
     renamed_worker = await (await client.get('/sw.js')).text()
-    assert worker.splitlines()[1] != renamed_worker.splitlines()[1]
+    def cache_line(text):
+        return next(line for line in text.splitlines() if line.startswith('const CACHE'))
+    assert cache_line(worker) != cache_line(renamed_worker)
 
 
 async def test_push_triggers_include_reply_reminder_and_test_text(companion):
@@ -320,6 +322,29 @@ async def test_drain_waits_for_delayed_pushes(companion):
         assert not push.called
         await service.drain()
         push.assert_called_once_with("general", "Your reminder")
+
+
+def test_shell_revision_follows_every_shell_file_and_the_instance_name(tmp_path):
+    from assistant.companion import _ASSETS, shell_revision
+
+    for name in set(_ASSETS.values()):
+        (tmp_path / name).write_bytes(b"v1 " + name.encode())
+    base = shell_revision("Juniper", tmp_path)
+    assert len(base) == 12 and base == shell_revision("Juniper", tmp_path)
+    assert shell_revision("Cedar", tmp_path) != base
+    for name in sorted(set(_ASSETS.values())):
+        (tmp_path / name).write_bytes(b"v2 " + name.encode())
+        changed = shell_revision("Juniper", tmp_path)
+        assert changed != base, name
+        base = changed
+
+
+async def test_served_worker_carries_the_shell_revision(companion):
+    from assistant.companion import shell_revision
+    service, client = companion
+    worker = await (await client.get("/sw.js")).text()
+    assert f"noxide-shell-{shell_revision(service.cfg.agent_name)}" in worker
+    assert "__INSTANCE_VERSION__" not in worker
 
 
 async def test_pwa_assets_and_shutdown_rejection(companion):

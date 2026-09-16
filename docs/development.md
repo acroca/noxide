@@ -72,8 +72,9 @@ update waiting/activation, in-flight submission protection, multi-tab draft
 preservation, the seen acknowledgements that suppress push for a reply
 already displayed on a focused device, reset dividers and the thread staying
 anchored to its end when the composer blurs, pasted images and the voice
-button. Bump `CACHE` in `pwa/sw.js` whenever packaged shell assets change;
-the installed version serves its own cached bundle until an update activates.
+button. The worker's cache version is a server-stamped hash of every shell
+file, so any asset change is a new version without a manual bump; the
+installed version serves its own cached bundle until an update activates.
 
 ### Source files
 

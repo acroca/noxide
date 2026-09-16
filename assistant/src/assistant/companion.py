@@ -61,6 +61,23 @@ _NO_CAPTION = "The user sent this image without a caption."
 _ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/style.css": "style.css",
            "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
+
+
+def shell_revision(agent_name, root=None):
+    """The worker's cache version: a hash of the instance name and every shell file.
+
+    Any change to a packaged asset yields a new version, so a device that
+    installed the previous one is offered the update; a manual bump used to be
+    required and was skipped once (2026-09-16). Renaming the instance refreshes
+    the shell without changing app identity.
+    """
+    digest = hashlib.sha256(agent_name.encode())
+    root = root if root is not None else files("assistant") / "pwa"
+    for name in sorted(set(_ASSETS.values())):
+        digest.update(name.encode() + b"\0" + (root / name).read_bytes() + b"\0")
+    return digest.hexdigest()[:12]
+
+
 _MIMES = {".html": "text/html", ".js": "application/javascript", ".css": "text/css",
           ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml"}
 _WEB_CONTEXT = (
@@ -178,9 +195,7 @@ class Companion:
             manifest.update(name=self.cfg.agent_name, short_name=self.cfg.agent_name)
             content = json.dumps(manifest, ensure_ascii=False)
         elif name == "sw.js":
-            # Renaming refreshes the cached shell without changing app identity.
-            revision = hashlib.sha256(self.cfg.agent_name.encode()).hexdigest()[:12]
-            content = content.replace("__INSTANCE_VERSION__", revision)
+            content = content.replace("__INSTANCE_VERSION__", shell_revision(self.cfg.agent_name))
             content = content.replace('"__AGENT_NAME__"', json.dumps(self.cfg.agent_name))
         return web.Response(text=content,
                             content_type=_MIMES["." + name.rsplit(".", 1)[-1]])
