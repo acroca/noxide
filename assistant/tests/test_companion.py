@@ -313,7 +313,7 @@ async def test_drain_waits_for_delayed_pushes(companion):
 
 async def test_pwa_assets_and_shutdown_rejection(companion):
     service, client = companion
-    for path in ("/", "/app.js", "/style.css", "/sw.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"):
+    for path in ("/", "/app.js", "/theme.js", "/style.css", "/sw.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"):
         response = await client.get(path)
         assert response.status == 200
         assert await response.read()

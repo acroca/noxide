@@ -55,7 +55,7 @@ _ATTACHMENT_PATH = re.compile(r"attachments/\d{4}-\d{2}-\d{2}-[0-9a-f]{6}\.(jpg|
 _IMAGE_NOTE = "[attached image — already stored in the vault at {path}; link it from a note if it is worth keeping, otherwise leave it]"
 _IMAGE_NOTE_N = "[attached image {n} of {total} — already stored in the vault at {path}; link it from a note if it is worth keeping, otherwise leave it]"
 _NO_CAPTION = "The user sent this image without a caption."
-_ASSETS = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css",
+_ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/style.css": "style.css",
            "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
 _MIMES = {".html": "text/html", ".js": "application/javascript", ".css": "text/css",

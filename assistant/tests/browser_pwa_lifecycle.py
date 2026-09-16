@@ -52,7 +52,7 @@ async def main():
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
             name = "icon.svg"
-        if name not in {"index.html", "app.js", "sw.js", "style.css", "icon.svg", "manifest.webmanifest"}:
+        if name not in {"index.html", "app.js", "theme.js", "sw.js", "style.css", "icon.svg", "manifest.webmanifest"}:
             raise web.HTTPNotFound()
         text = (assets / name).read_text()
         if name == 'index.html':
@@ -60,7 +60,7 @@ async def main():
         if name == "sw.js":
             text = text.replace('__INSTANCE_VERSION__', instance_version)
             text = text.replace('"__AGENT_NAME__"', json.dumps(agent_name))
-            text = text.replace("noxide-shell-v17", f"noxide-shell-v17-test{state['revision']}")
+            text = text.replace("noxide-shell-v18", f"noxide-shell-v18-test{state['revision']}")
         mime = {"html": "text/html", "js": "application/javascript", "css": "text/css", "svg": "image/svg+xml", "webmanifest": "application/manifest+json"}[name.rsplit(".", 1)[-1]]
         return web.Response(text=text, content_type=mime, headers={"Cache-Control": "no-store"})
 
@@ -206,6 +206,38 @@ async def main():
             await expect(page.get_by_label("Message to General")).to_have_value("half-written")
             await page.get_by_label("Message to General").fill("")
 
+            # Appearance: an explicit choice overrides the device scheme and
+            # survives a reload without flashing; System clears the override
+            # and a dark device gets the dark palette with nothing stored.
+            background = "() => getComputedStyle(document.body).backgroundColor"
+            theme_attr = "() => document.documentElement.dataset.theme ?? null"
+            assert await page.evaluate(theme_attr) is None
+            light = await page.evaluate(background)
+            await page.get_by_role("button", name="Preferences", exact=True).click()
+            await expect(page.get_by_label("System", exact=True)).to_be_checked()
+            await page.get_by_label("Dark", exact=True).check()
+            assert await page.evaluate(theme_attr) == "dark"
+            dark = await page.evaluate(background)
+            assert dark != light, (dark, light)
+            await page.reload()
+            await expect(page.get_by_label("Message to General")).to_be_visible()
+            assert await page.evaluate(theme_attr) == "dark"
+            assert await page.evaluate(background) == dark
+            assert await page.evaluate("() => document.querySelector('meta[name=theme-color]').content") != "#eeeee7"
+            await page.get_by_role("button", name="Preferences", exact=True).click()
+            await expect(page.get_by_label("Dark", exact=True)).to_be_checked()
+            await page.get_by_label("System", exact=True).check()
+            assert await page.evaluate(theme_attr) is None
+            assert await page.evaluate(background) == light
+            await page.evaluate("() => document.querySelector('#settings').close()")
+            night = await browser.new_context(viewport={"width": 390, "height": 844}, color_scheme="dark")
+            night_page = await night.new_page()
+            await night_page.goto(url + "/#chat")
+            await expect(night_page.get_by_label("Message to General")).to_be_visible()
+            assert await night_page.evaluate(theme_attr) is None
+            assert await night_page.evaluate(background) == dark
+            await night.close()
+
             # Reset context draws a divider: after the last message when
             # nothing has followed yet, then between generations.
             assert await page.locator(".context-divider").count() == 0
@@ -277,7 +309,7 @@ async def main():
             await page.reload()
             await expect(page.get_by_role("button", name="Record voice message")).to_be_visible()
             keys = await page.evaluate("() => caches.keys()")
-            assert keys == [f"noxide-shell-v17-test2-{instance_version}"], keys
+            assert keys == [f"noxide-shell-v18-test2-{instance_version}"], keys
             assert not errors, errors
             await browser.close()
             print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers, pasted images, voice button.")

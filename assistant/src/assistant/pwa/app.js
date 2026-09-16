@@ -24,6 +24,8 @@ let waitingWorker = null, reloadRequested = false, workerChanged = false;
 let hadController = Boolean(navigator.serviceWorker?.controller);
 let ackVisible = () => {};
 const draftKey = topic => `noxide-draft:${topic}`;
+const THEME_KEY = 'noxide-theme';
+function themePreference() { try { return localStorage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; } }
 const submissionKey = topic => `noxide-submission:${topic}`;
 const chatURL = topic => '#chat/' + encodeURIComponent(topic);
 const topicName = topic => topics.find(t => t.id === topic)?.name || 'General';
@@ -463,6 +465,8 @@ window.addEventListener('online', () => { connectivity(); if (session) route(); 
 window.addEventListener('offline', connectivity);
 async function openSettings() {
   if (!$('#settings').open) $('#settings').showModal();
+  const theme = themePreference();
+  $$('input[name="theme"]').forEach(input => { input.checked = input.value === theme; });
   const supported = 'serviceWorker' in navigator && 'PushManager' in window;
   $('#push-toggle').disabled = !supported || !session?.push_key;
   $('#push-status').textContent = !session?.push_key ? 'Push is not configured. Set pwa.push_contact on your server.' : !supported ? 'Install this app on your Home Screen, or use a browser that supports web push.' : 'Notifications are optional and controlled by this device.';
@@ -474,6 +478,12 @@ async function openSettings() {
   }
 }
 $('#settings-button').addEventListener('click', () => openSettings().catch(e => toast(e.message)));
+$$('input[name="theme"]').forEach(input => input.addEventListener('change', () => {
+  const choice = input.value;
+  try { if (choice === 'system') localStorage.removeItem(THEME_KEY); else localStorage.setItem(THEME_KEY, choice); }
+  catch { toast('This browser cannot save preferences. The theme applies until you close the app.'); }
+  window.applyTheme?.(choice); // theme.js; 'system' clears the override
+}));
 $('#mobile-settings').addEventListener('click', () => openSettings().catch(e => toast(e.message)));
 $('#push-toggle').addEventListener('click', async () => {
   const button = $('#push-toggle'); button.disabled = true;

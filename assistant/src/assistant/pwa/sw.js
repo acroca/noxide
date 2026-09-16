@@ -1,7 +1,7 @@
 // Bump this when packaged shell assets change so existing installs offer an update.
-const CACHE = 'noxide-shell-v17-__INSTANCE_VERSION__';
+const CACHE = 'noxide-shell-v18-__INSTANCE_VERSION__';
 const AGENT_NAME = "__AGENT_NAME__";
-const SHELL = ['/', '/app.js', '/style.css', '/icon.svg', '/icon-192.png', '/icon-512.png', '/manifest.webmanifest'];
+const SHELL = ['/', '/app.js', '/theme.js', '/style.css', '/icon.svg', '/icon-192.png', '/icon-512.png', '/manifest.webmanifest'];
 self.addEventListener('install', event => { event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))); });
 self.addEventListener('activate', event => { event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key.startsWith('noxide-shell-') && key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim())); });
 self.addEventListener('message', event => {
