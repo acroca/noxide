@@ -86,16 +86,18 @@ async def main():
             await expect(page.locator("#update-banner")).to_be_hidden()
 
             # Simulate the phone's home-indicator inset without a software
-            # keyboard: composer focus removes it; blur restores it.
+            # keyboard: the nav carries it; composer focus hides the nav
+            # altogether so nothing of ours sits between input and keyboard.
             await page.add_style_tag(content=":root{--navigation-safe-area:34px}")
             await area.blur()
             await expect(page.locator('.mobile-nav')).to_have_css('padding-bottom', '40px')
+            await expect(page.locator('.mobile-nav')).to_have_css('height', '85px')
             await area.focus()
             await page.set_viewport_size({"width": 390, "height": 544})
-            await expect(page.locator('.mobile-nav')).to_have_css('padding-bottom', '6px')
-            await expect(page.locator('.mobile-nav')).to_have_css('height', '51px')
+            await expect(page.locator('.mobile-nav')).to_be_hidden()
             await page.set_viewport_size({"width": 390, "height": 844})
             await area.blur()
+            await expect(page.locator('.mobile-nav')).to_be_visible()
             await expect(page.locator('.mobile-nav')).to_have_css('height', '85px')
             assert await page.locator('select').count() == 0
             await page.get_by_role('button', name='Change topic: General').click()
@@ -263,7 +265,7 @@ async def main():
             state["replies"]["general"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
             await expect(page.locator(".message-meta span")).to_have_count(1)
             await expect(page.locator(".message-meta span")).to_have_text("Web")
-            # Blurring the composer restores the nav inset and shrinks the thread;
+            # Blurring the composer brings the nav back and shrinks the thread;
             # the thread stays anchored to its end, unless the reader scrolled up.
             # Chromium re-anchors a shrinking scroller by itself, so this cannot
             # fail here without the fix; WebKit (iOS) leaves the offset and ends
