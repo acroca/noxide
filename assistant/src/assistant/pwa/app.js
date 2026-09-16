@@ -172,7 +172,7 @@ function renderChat(topic, pageVersion) {
         <div id="composer-images" class="composer-images" hidden></div>
         <button id="attach-image" class="tool-button" type="button" aria-label="Attach image">${icon('image')}</button>
         <input id="image-input" type="file" accept="image/*" multiple hidden>
-        <textarea aria-label="Message to ${escape(name)}" rows="2" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft(topic))}</textarea>
+        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft(topic))}</textarea>
         <button id="record-voice" class="tool-button" type="button" aria-label="Record voice message" hidden>${icon('mic')}</button>
         <button class="send-button" type="submit" aria-label="Send message">${icon('send')}</button>
       </form>
@@ -191,6 +191,10 @@ function renderChat(topic, pageVersion) {
   let signature = '', cursor = null, older = [], busy = false, sending = false, loaded = false;
   let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
   const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
+  // One line tall, growing with the text up to the stylesheet's cap; the thread's
+  // ResizeObserver keeps it anchored to its end as the composer takes room.
+  const fit = () => { area.style.height = 'auto'; area.style.height = area.scrollHeight + 'px'; };
+  fit();
   const atEnd = thread => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
   function markSeen() {
     // Tell the server this device is showing the newest reply: focused, on this
@@ -355,6 +359,7 @@ function renderChat(topic, pageVersion) {
     catch (e) { toast(e.message); }
   });
   area.addEventListener('input', () => {
+    fit();
     try { localStorage.setItem(draftKey(topic), area.value); } catch { toast('This browser cannot save drafts. Keep this tab open.'); }
   });
   area.addEventListener('keydown', event => {
@@ -388,7 +393,7 @@ function renderChat(topic, pageVersion) {
       // Do not erase a new draft typed while the request was in flight.
       if (draft(topic).trim() === text) localStorage.removeItem(draftKey(topic));
       localStorage.removeItem(submissionKey(topic));
-      if (area.value.trim() === text) area.value = '';
+      if (area.value.trim() === text) { area.value = ''; fit(); }
       clearImages();
       await loadMessages();
     } catch (e) { toast(e.message); } finally { sending = false; setActivity(''); }
@@ -508,7 +513,7 @@ $('#clear-local-drafts').addEventListener('click', async () => {
   try {
     Object.keys(localStorage).filter(k => k.startsWith('noxide-draft:')).forEach(k => localStorage.removeItem(k));
     const area = $('#chat-form textarea');
-    if (area) area.value = '';
+    if (area) { area.value = ''; area.style.height = 'auto'; }
     toast('Local drafts cleared.');
   } catch (e) { toast(e.message); }
 });

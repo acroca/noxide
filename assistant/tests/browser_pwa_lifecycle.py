@@ -206,6 +206,14 @@ async def main():
             await expect(page.get_by_label("Message to General")).to_have_value("half-written")
             await page.get_by_label("Message to General").fill("")
 
+            # The composer starts one line tall and grows with the text.
+            height = "() => document.querySelector('#chat-form textarea').offsetHeight"
+            one_line = await page.evaluate(height)
+            await page.get_by_label("Message to General").fill("one\ntwo\nthree\nfour")
+            assert await page.evaluate(height) > one_line
+            await page.get_by_label("Message to General").fill("")
+            assert await page.evaluate(height) == one_line
+
             # Appearance: an explicit choice overrides the device scheme and
             # survives a reload without flashing; System clears the override
             # and a dark device gets the dark palette with nothing stored.
