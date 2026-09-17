@@ -126,8 +126,8 @@ run lock. Other Telegram chats remain isolated. Now is a read-only,
 plain-text display of `wiki/now.md`, preserving all sections and Markdown as
 written. Opening Now never calls the model. There are no dashboard cards,
 project navigation, or task/reminder buttons; make changes through chat.
-Conversations from the earlier project-based and topic-based web chats stay in
-the archive under their old keys; they are no longer listed and are not merged.
+Conversations from the earlier project-based and topic-based web chats are
+merged into the one chat on the first start after the upgrade.
 
 On desktop, Enter sends and Shift+Enter inserts a newline. On touch-first mobile
 devices, Return inserts a newline and the adjacent send button submits. Bottom

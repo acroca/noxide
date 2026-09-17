@@ -142,7 +142,7 @@ async def test_notes_survive_restart_without_double_injection(setup):
     assert "Medicine reminder" in str(Agent(vault, archive=archive)._get_history(WEB_CHAT_ID).messages())
 
 
-def test_legacy_web_context_migration_is_once_and_stays_in_its_space(tmp_path):
+def test_legacy_web_context_migration_is_once_and_lands_in_the_home_chat(tmp_path):
     db = sqlite3.connect(tmp_path / "companion.sqlite3")
     db.executescript("""CREATE TABLE messages(id TEXT PRIMARY KEY, space TEXT, role TEXT, text TEXT,
         status TEXT, created REAL, reply_to TEXT, error TEXT DEFAULT '');
@@ -150,13 +150,13 @@ def test_legacy_web_context_migration_is_once_and_stays_in_its_space(tmp_path):
         INSERT INTO messages VALUES ('answer','wiki/projects/garden.md','assistant','Noted','done',2,'old','');""")
     db.close()
     archive = ConversationArchive(tmp_path)
-    assert len(archive.load_context("wiki/projects/garden.md")) == 2
-    assert archive.load_context("general") == []
-    assert "Watered" not in str(Agent(VaultTools(tmp_path / "vault"), archive=archive)._get_history(WEB_CHAT_ID).messages())
+    assert archive.load_context("wiki/projects/garden.md") == []
+    assert [r["content"] for r in archive.load_context("general")] == ["Watered", "Noted"]
+    assert "Watered" in str(Agent(VaultTools(tmp_path / "vault"), archive=archive)._get_history(WEB_CHAT_ID).messages())
     archive.close()
     archive = ConversationArchive(tmp_path)
-    assert len(archive.load_context("wiki/projects/garden.md")) == 2
-    assert archive.get("old")["space"] == "wiki/projects/garden.md"
+    assert len(archive.load_context("general")) == 2
+    assert archive.get("old")["space"] == "general"
     archive.close()
 
 
@@ -193,16 +193,19 @@ def test_threaded_telegram_spaces_are_flattened_once_into_their_chat(tmp_path):
     try:
         spaces = {row[0] for table in ("messages", "context_records", "context_generations", "pending_notes")
                   for row in archive.db.execute(f"SELECT DISTINCT space FROM {table}")}
-        assert spaces == {"telegram:123", "topic:5", "general"}
+        assert spaces == {"telegram:123", "general"}
         assert {archive.get(i)["space"] for i in ("m0", "m7")} == {"telegram:123"}
         assert [r["content"] for r in archive.load_context("telegram:123")] == ["thread zero", "thread seven"]
         assert [n["content"] for n in archive.notes("telegram:123")] == ["note zero", "note seven"]
         assert archive.generation("telegram:123") == 5
         assert archive.generation("telegram:123:0") == archive.generation("telegram:123:7") == 0
-        assert archive.get("t5")["space"] == "topic:5" and archive.get("g")["space"] == "general"
-        assert [r["content"] for r in archive.load_context("topic:5")] == ["home topic"]
-        assert [n["content"] for n in archive.notes("topic:5")] == ["note topic"]
-        assert archive.generation("topic:5") == 3 and archive.generation("general") == 1
+        # The home topic joins the one chat, in the era of the general row it precedes
+        # (the message column was just added with default 0; the context record says 1).
+        assert archive.get("t5")["space"] == archive.get("g")["space"] == "general"
+        assert archive.get("t5")["generation"] == archive.get("g")["generation"] == 0
+        assert [(r["content"], r["generation"]) for r in archive.load_context("general")] == [("home topic", 1), ("home", 1)]
+        assert [n["content"] for n in archive.notes("general")] == ["note topic", "note home"]
+        assert archive.generation("topic:5") == 0 and archive.generation("general") == 1
         assert archive.db.execute("SELECT value FROM archive_meta WHERE key='flat_spaces'").fetchone()[0] == "1"
         # Reopening must not migrate again: a threaded space added afterwards stays as written.
         archive.db.execute("INSERT INTO context_generations VALUES ('telegram:123:9', 9)")
@@ -213,6 +216,61 @@ def test_threaded_telegram_spaces_are_flattened_once_into_their_chat(tmp_path):
     try:
         assert archive.generation("telegram:123:9") == 9
         assert archive.generation("telegram:123") == 5
+    finally:
+        archive.close()
+
+
+def test_old_rooms_merge_into_the_home_chat_without_inventing_resets(tmp_path):
+    db = sqlite3.connect(tmp_path / "companion.sqlite3")
+    db.executescript("""CREATE TABLE messages(id TEXT PRIMARY KEY, space TEXT, role TEXT, text TEXT,
+        status TEXT, created REAL, reply_to TEXT, error TEXT DEFAULT '', generation INTEGER DEFAULT 0);
+        CREATE TABLE context_records(id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT, exchange_id TEXT,
+        role TEXT, content TEXT, completed_at TEXT, generation INTEGER);
+        CREATE TABLE context_generations(space TEXT PRIMARY KEY, generation INTEGER);
+        CREATE TABLE pending_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT, content TEXT);
+        CREATE TABLE archive_meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE seen(space TEXT PRIMARY KEY, through REAL);
+        INSERT INTO archive_meta VALUES ('context_import','1'),('flat_spaces','1');
+        INSERT INTO messages VALUES ('g1','general','user','first','done',1,NULL,'',0);
+        INSERT INTO messages VALUES ('g2','general','assistant','after reset','done',5,NULL,'',1);
+        INSERT INTO messages VALUES ('ta','topic:9','user','before everything','done',0.5,NULL,'',0);
+        INSERT INTO messages VALUES ('tb','topic:9','assistant','old era','done',3,NULL,'',2);
+        INSERT INTO messages VALUES ('tc','topic:9','assistant','new era','done',7,NULL,'',2);
+        INSERT INTO messages VALUES ('w','wiki/projects/garden.md','user','project chat','done',6,NULL,'',4);
+        INSERT INTO context_records(space,exchange_id,role,content,completed_at,generation)
+            VALUES ('topic:9','ta','user','before everything','0.5',0),
+                   ('general','g1','user','first','1',0),
+                   ('topic:9','tb','assistant','old era','3',2),
+                   ('general','g2','assistant','after reset','5',1),
+                   ('wiki/projects/garden.md','w','user','project chat','6',4),
+                   ('topic:9','tc','assistant','new era','7',2);
+        INSERT INTO context_generations VALUES ('general',1),('topic:9',2),('wiki/projects/garden.md',4);
+        INSERT INTO pending_notes(space,content) VALUES ('topic:9','room note');
+        INSERT INTO seen VALUES ('general',4.0),('topic:9',6.5);""")
+    db.commit()
+    db.close()
+    archive = ConversationArchive(tmp_path)
+    try:
+        rows = archive.db.execute("SELECT id, space, generation FROM messages ORDER BY created").fetchall()
+        assert [(r["id"], r["space"], r["generation"]) for r in rows] == [
+            ("ta", "general", 0), ("g1", "general", 0), ("tb", "general", 0),
+            ("g2", "general", 1), ("w", "general", 1), ("tc", "general", 1)]
+        assert [(r["content"], r["generation"]) for r in archive.load_context("general")] == [
+            ("before everything", 0), ("first", 0), ("old era", 0),
+            ("after reset", 1), ("project chat", 1), ("new era", 1)]
+        history = Agent(VaultTools(tmp_path / "vault"), archive=archive)._get_history(WEB_CHAT_ID).messages()
+        assert "new era" in str(history) and "project chat" in str(history) and "old era" not in str(history)
+        assert [n["content"] for n in archive.notes("general")] == ["room note"]
+        assert archive.generation("general") == 1 and archive.generation("topic:9") == 0
+        assert [tuple(r) for r in archive.db.execute("SELECT space, through FROM seen")] == [("general", 6.5)]
+        assert archive.db.execute("SELECT value FROM archive_meta WHERE key='merge_home_spaces'").fetchone()[0] == "1"
+        archive.db.execute("INSERT INTO context_generations VALUES ('topic:2', 7)")
+        archive.db.commit()
+    finally:
+        archive.close()
+    archive = ConversationArchive(tmp_path)
+    try:
+        assert archive.generation("topic:2") == 7  # migrated once, never again
     finally:
         archive.close()
 

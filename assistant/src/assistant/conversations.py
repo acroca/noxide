@@ -6,6 +6,7 @@ automatic model context; unfinished tool protocol remains process-local.
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import secrets
@@ -26,6 +27,20 @@ def conversation_space(chat_id: int) -> str:
 # Spaces from before topics were removed (2026-09-17) carried a thread id:
 # ``telegram:<chat>:<thread>``. Threads of one chat fold into that chat.
 _THREADED_SPACE = re.compile(r"(telegram:-?\d+):\d+")
+# Home-chat spaces from before topics were removed: forum-topic rooms and the
+# even older per-project web chats. Both fold into the one chat.
+_LEGACY_HOME_SPACE = re.compile(r"topic:\d+|wiki/.+")
+
+
+def _era(eras, position):
+    """The generation in force at ``position`` of a time-ordered (key, generation) list.
+
+    Rows older than the first entry join the first era, so nothing precedes it
+    with a different generation and the timeline draws no divider there.
+    """
+    if not eras:
+        return 0
+    return eras[max(position - 1, 0)][1]
 
 
 class ConversationArchive:
@@ -73,6 +88,7 @@ class ConversationArchive:
                         ("Service restarted. Work may have partially completed. Review before retrying.",))
         self._import_existing_web_context()
         self._flatten_threaded_spaces()
+        self._merge_legacy_home_spaces()
         self.db.commit()
 
     def _import_existing_web_context(self):
@@ -95,9 +111,7 @@ class ConversationArchive:
     def _flatten_threaded_spaces(self):
         """Fold pre-topic-removal ``telegram:<chat>:<thread>`` spaces into ``telegram:<chat>``.
 
-        Runs once. Home-chat topics (``topic:<id>``) are left untouched: their
-        text stays in the archive under the old key, neither shown nor merged,
-        so bringing topics back would find it intact.
+        Runs once. Home-chat topics are ``_merge_legacy_home_spaces``' job.
         """
         if self.db.execute("SELECT 1 FROM archive_meta WHERE key='flat_spaces'").fetchone():
             return
@@ -115,6 +129,44 @@ class ConversationArchive:
             if generation:
                 self.db.execute("INSERT OR REPLACE INTO context_generations VALUES (?,?)", (flat, generation))
         self.db.execute("INSERT INTO archive_meta VALUES ('flat_spaces','1')")
+
+    def _merge_legacy_home_spaces(self):
+        """Fold the home chat's old rooms (``topic:<id>``) and project web chats (``wiki/...``) into ``general``.
+
+        Runs once. A merged row takes the generation of the ``general`` row
+        before it in time (messages by ``created``, context records by insertion
+        order), so the merged timeline draws no reset the home chat never had,
+        and the automatic window — which restores only the current generation
+        — picks up merged exchanges from the current era like any other. The
+        seen mark becomes the newest of the merged marks, so the badge does not
+        open on replies already read in their room.
+        """
+        if self.db.execute("SELECT 1 FROM archive_meta WHERE key='merge_home_spaces'").fetchone():
+            return
+        tables = ("messages", "context_records", "context_generations", "pending_notes")
+        spaces = sorted({row[0] for table in tables for row in self.db.execute(f"SELECT DISTINCT space FROM {table}")
+                         if _LEGACY_HOME_SPACE.fullmatch(row[0])})
+        home = conversation_space(WEB_CHAT_ID)
+        if spaces:
+            marks = ",".join("?" * len(spaces))
+            eras = self.db.execute("SELECT created, generation FROM messages WHERE space=? ORDER BY created", (home,)).fetchall()
+            times = [row[0] for row in eras]
+            for row in self.db.execute(f"SELECT id, created FROM messages WHERE space IN ({marks})", spaces).fetchall():
+                self.db.execute("UPDATE messages SET space=?, generation=? WHERE id=?",
+                                (home, _era(eras, bisect.bisect_right(times, row[1])), row[0]))
+            eras = self.db.execute("SELECT id, generation FROM context_records WHERE space=? ORDER BY id", (home,)).fetchall()
+            ids = [row[0] for row in eras]
+            for row in self.db.execute(f"SELECT id FROM context_records WHERE space IN ({marks})", spaces).fetchall():
+                self.db.execute("UPDATE context_records SET space=?, generation=? WHERE id=?",
+                                (home, _era(eras, bisect.bisect_left(ids, row[0])), row[0]))
+            self.db.execute(f"UPDATE pending_notes SET space=? WHERE space IN ({marks})", (home, *spaces))
+            self.db.execute(f"DELETE FROM context_generations WHERE space IN ({marks})", spaces)
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='seen'").fetchone():
+                through = self.db.execute(f"SELECT max(through) FROM seen WHERE space IN ({marks},?)", (*spaces, home)).fetchone()[0]
+                if through is not None:
+                    self.db.execute("INSERT OR REPLACE INTO seen (space, through) VALUES (?,?)", (home, through))
+                self.db.execute(f"DELETE FROM seen WHERE space IN ({marks})", spaces)
+        self.db.execute("INSERT INTO archive_meta VALUES ('merge_home_spaces','1')")
 
     def generation(self, space):
         row = self.db.execute("SELECT generation FROM context_generations WHERE space=?", (space,)).fetchone()
