@@ -57,14 +57,14 @@ async def _wait_until(predicate, timeout: float = 2.0) -> None:
 
 def test_enqueue_message_persists_jsonl(state_dir: Path) -> None:
     q = _queue(state_dir)
-    q.enqueue_message(5, 7, "hello there")
+    q.enqueue_message(5, "hello there")
 
     lines = (state_dir / QUEUE_FILENAME).read_text().splitlines()
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["kind"] == "message"
     assert record["chat_id"] == 5
-    assert record["thread_id"] == 7
+    assert "thread_id" not in record
     assert record["text"] == "hello there"
     assert record["queued_at"]
 
@@ -88,6 +88,21 @@ def test_load_skips_malformed_lines(state_dir: Path) -> None:
     assert q.pending() == 1
 
 
+def test_load_ignores_legacy_thread_id(state_dir: Path) -> None:
+    """Records persisted before topics were removed carry a thread_id; the key
+    is ignored and the message still replays to its chat."""
+    (state_dir / QUEUE_FILENAME).write_text(
+        '{"kind": "message", "text": "old", "queued_at": "2026-08-17 10:00 local", '
+        '"chat_id": 5, "thread_id": 5}\n'
+    )
+    q = _queue(state_dir)
+    assert q.pending() == 1
+    (item,) = q._items
+    assert item.chat_id == 5
+    assert item.text == "old"
+    assert not hasattr(item, "thread_id")
+
+
 # ------------------------------------------------------------------
 # Drain behavior
 # ------------------------------------------------------------------
@@ -97,7 +112,7 @@ async def test_live_message_replays_hot_and_clears_file(state_dir: Path) -> None
     q = _queue(state_dir, replay_message_fn=replay)
     task = asyncio.create_task(q.run())
     try:
-        q.enqueue_message(5, None, "hello")
+        q.enqueue_message(5, "hello")
         await _wait_until(lambda: q.pending() == 0)
     finally:
         task.cancel()
@@ -105,14 +120,14 @@ async def test_live_message_replays_hot_and_clears_file(state_dir: Path) -> None
     replay.assert_awaited_once()
     kwargs = replay.await_args.kwargs
     assert kwargs["chat_id"] == 5
-    assert kwargs["thread_id"] is None
+    assert "thread_id" not in kwargs
     assert kwargs["text"] == "hello"
     assert kwargs["hot"] is True
     assert (state_dir / QUEUE_FILENAME).read_text() == ""
 
 
 async def test_reloaded_message_replays_cold(state_dir: Path) -> None:
-    _queue(state_dir).enqueue_message(5, 7, "from before the restart")
+    _queue(state_dir).enqueue_message(5, "from before the restart")
 
     replay = AsyncMock()
     q = _queue(state_dir, replay_message_fn=replay)
@@ -159,9 +174,9 @@ async def test_items_drain_in_fifo_order_across_kinds(state_dir: Path) -> None:
         notify_drop_fn=None,
         tz_name="UTC",
     )
-    q.enqueue_message(5, None, "first")
+    q.enqueue_message(5, "first")
     q.enqueue_job("second")
-    q.enqueue_message(5, None, "third")
+    q.enqueue_message(5, "third")
 
     task = asyncio.create_task(q.run())
     try:
@@ -179,7 +194,7 @@ async def test_outage_during_replay_keeps_item_and_retries(state_dir: Path) -> N
     q = _queue(state_dir, replay_message_fn=replay)
     task = asyncio.create_task(q.run())
     try:
-        q.enqueue_message(5, None, "hello")
+        q.enqueue_message(5, "hello")
         await _wait_until(lambda: q.pending() == 0)
     finally:
         task.cancel()
@@ -194,8 +209,8 @@ async def test_non_outage_replay_failure_drops_item_and_notifies(state_dir: Path
     q = _queue(state_dir, replay_message_fn=replay, notify_drop_fn=notify)
     task = asyncio.create_task(q.run())
     try:
-        q.enqueue_message(5, None, "poison")
-        q.enqueue_message(5, None, "fine")
+        q.enqueue_message(5, "poison")
+        q.enqueue_message(5, "fine")
         await _wait_until(lambda: q.pending() == 0)
     finally:
         task.cancel()
@@ -221,7 +236,7 @@ async def test_cancel_mid_replay_leaves_item_on_disk(state_dir: Path) -> None:
         notify_drop_fn=None,
         tz_name="UTC",
     )
-    q.enqueue_message(5, None, "in flight at shutdown")
+    q.enqueue_message(5, "in flight at shutdown")
     task = asyncio.create_task(q.run())
     await started.wait()
     task.cancel()
@@ -249,7 +264,7 @@ def test_enqueue_survives_persist_failure(
         retry_queue, "atomic_write_text", MagicMock(side_effect=OSError("disk full"))
     )
 
-    q.enqueue_message(5, None, "hello")
+    q.enqueue_message(5, "hello")
 
     assert q.pending() == 1
 
@@ -259,8 +274,8 @@ async def test_drain_survives_persist_failure(
 ) -> None:
     replay = AsyncMock()
     q = _queue(state_dir, replay_message_fn=replay)
-    q.enqueue_message(5, None, "first")
-    q.enqueue_message(5, None, "second")
+    q.enqueue_message(5, "first")
+    q.enqueue_message(5, "second")
     monkeypatch.setattr(
         retry_queue, "atomic_write_text", MagicMock(side_effect=OSError("disk full"))
     )

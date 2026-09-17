@@ -32,22 +32,22 @@ async def test_both_transports_restore_five_exchanges_and_search_old_text(setup)
     client = MagicMock(chat=AsyncMock(return_value=_make_text_response("Recorded")))
     with patch("assistant.copilot.get_client", return_value=client):
         for n in range(7):
-            await agent.run(123 if n % 2 else WEB_CHAT_ID, f"message-{n}", thread_id=10,
+            await agent.run(123 if n % 2 else WEB_CHAT_ID, f"message-{n}",
                             source="telegram" if n % 2 else "web")
         restored = Agent(vault, archive=archive, home_chat_fn=lambda: 123)
-        await restored.run(WEB_CHAT_ID, "followup", thread_id=10, source="web")
+        await restored.run(WEB_CHAT_ID, "followup", source="web")
     sent = str(client.chat.call_args.args[0])
     assert "message-0" not in sent and "message-1" not in sent
     for n in range(2, 7):
         assert f"message-{n}" in sent
-    history = restored._get_history(123, 10)
+    history = restored._get_history(123)
     assert "message-0" in history.retrieve("search_history", {"query": "message-0"})
     rows = archive.db.execute("SELECT * FROM messages WHERE role='user'").fetchall()
     assert len(rows) == 8
-    assert {r["space"] for r in rows} == {"topic:10"}
+    assert {r["space"] for r in rows} == {"general"}
     assert {r["source"] for r in rows} == {"telegram", "web"}
-    assert restored._get_history(123, 10) is restored._get_history(WEB_CHAT_ID, 10)
-    assert restored._get_history(999, 10) is not history
+    assert restored._get_history(123) is restored._get_history(WEB_CHAT_ID)
+    assert restored._get_history(999) is not history
 
 
 async def test_shared_lock_serializes_web_and_telegram_and_reset(setup):
@@ -87,7 +87,7 @@ async def test_reset_dismisses_pending_work_but_keeps_archived_text(setup):
             await agent.run(123, "secret-pending", message_id=mid)
         await agent.reset_conversation(WEB_CHAT_ID)
         restored = Agent(vault, archive=archive, home_chat_fn=lambda: 123)
-        assert await restored.retry_message(123, None, "secret-pending", "earlier", hot=False, message_id=mid) is None
+        assert await restored.retry_message(123, "secret-pending", "earlier", hot=False, message_id=mid) is None
     row = archive.get(mid)
     assert row["status"] == "dismissed" and row["text"] == "secret-pending"
 
@@ -103,8 +103,8 @@ async def test_outage_retry_commits_one_reply_and_completed_context(setup):
     with patch("assistant.copilot.get_client", return_value=client):
         with pytest.raises(CopilotUnavailableError):
             await agent.run(WEB_CHAT_ID, "read it", message_id=mid, source="web")
-        assert await agent.retry_message(123, None, "read it", "earlier", hot=True, message_id=mid) == "Done"
-        assert await agent.retry_message(123, None, "read it", "earlier", hot=True, message_id=mid) is None
+        assert await agent.retry_message(123, "read it", "earlier", hot=True, message_id=mid) == "Done"
+        assert await agent.retry_message(123, "read it", "earlier", hot=True, message_id=mid) is None
     assert "x" * 6000 in str(client.chat.call_args.args[0])
     assert archive.get(mid)["status"] == "done"
     assert archive.reply(mid) == "Done"
@@ -132,7 +132,7 @@ def test_atomic_completion_rolls_back_context_and_note_consumption(setup):
 
 async def test_notes_survive_restart_without_double_injection(setup):
     archive, vault, agent = setup
-    agent._queue_sent_note(123, None, "Medicine reminder")
+    agent._queue_sent_note(123, "Medicine reminder")
     restored = Agent(vault, archive=archive, home_chat_fn=lambda: 123)
     client = MagicMock(chat=AsyncMock(return_value=_make_text_response("Done")))
     with patch("assistant.copilot.get_client", return_value=client):
@@ -142,7 +142,7 @@ async def test_notes_survive_restart_without_double_injection(setup):
     assert "Medicine reminder" in str(Agent(vault, archive=archive)._get_history(WEB_CHAT_ID).messages())
 
 
-def test_legacy_web_context_migration_is_once_and_uses_same_space(tmp_path):
+def test_legacy_web_context_migration_is_once_and_stays_in_its_space(tmp_path):
     db = sqlite3.connect(tmp_path / "companion.sqlite3")
     db.executescript("""CREATE TABLE messages(id TEXT PRIMARY KEY, space TEXT, role TEXT, text TEXT,
         status TEXT, created REAL, reply_to TEXT, error TEXT DEFAULT '');
@@ -151,13 +151,70 @@ def test_legacy_web_context_migration_is_once_and_uses_same_space(tmp_path):
     db.close()
     archive = ConversationArchive(tmp_path)
     assert len(archive.load_context("wiki/projects/garden.md")) == 2
-    agent = Agent(VaultTools(tmp_path / "vault"), archive=archive)
-    agent.register_legacy_space(321, "wiki/projects/garden.md")
-    assert "Watered" in str(agent._get_history(WEB_CHAT_ID, 321).messages())
+    assert archive.load_context("general") == []
+    assert "Watered" not in str(Agent(VaultTools(tmp_path / "vault"), archive=archive)._get_history(WEB_CHAT_ID).messages())
     archive.close()
     archive = ConversationArchive(tmp_path)
     assert len(archive.load_context("wiki/projects/garden.md")) == 2
+    assert archive.get("old")["space"] == "wiki/projects/garden.md"
     archive.close()
+
+
+def _seed_threaded_archive(state_dir):
+    db = sqlite3.connect(state_dir / "companion.sqlite3")
+    db.executescript("""CREATE TABLE messages(id TEXT PRIMARY KEY, space TEXT, role TEXT, text TEXT,
+        status TEXT, created REAL, reply_to TEXT, error TEXT DEFAULT '');
+        CREATE TABLE context_records(id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT, exchange_id TEXT,
+        role TEXT, content TEXT, completed_at TEXT, generation INTEGER);
+        CREATE TABLE context_generations(space TEXT PRIMARY KEY, generation INTEGER);
+        CREATE TABLE pending_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT, content TEXT);
+        CREATE TABLE archive_meta(key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO archive_meta VALUES ('context_import','1');
+        INSERT INTO messages VALUES ('m0','telegram:123:0','user','thread zero','done',1,NULL,'');
+        INSERT INTO messages VALUES ('m7','telegram:123:7','user','thread seven','done',2,NULL,'');
+        INSERT INTO messages VALUES ('t5','topic:5','user','home topic','done',3,NULL,'');
+        INSERT INTO messages VALUES ('g','general','user','home','done',4,NULL,'');
+        INSERT INTO context_records(space,exchange_id,role,content,completed_at,generation)
+            VALUES ('telegram:123:0','m0','user','thread zero','1',2),
+                   ('telegram:123:7','m7','user','thread seven','2',5),
+                   ('topic:5','t5','user','home topic','3',0),
+                   ('general','g','user','home','4',1);
+        INSERT INTO context_generations VALUES ('telegram:123:0',2),('telegram:123:7',5),
+                                               ('topic:5',3),('general',1);
+        INSERT INTO pending_notes(space,content) VALUES ('telegram:123:0','note zero'),
+            ('telegram:123:7','note seven'),('topic:5','note topic'),('general','note home');""")
+    db.commit()
+    db.close()
+
+
+def test_threaded_telegram_spaces_are_flattened_once_into_their_chat(tmp_path):
+    _seed_threaded_archive(tmp_path)
+    archive = ConversationArchive(tmp_path)
+    try:
+        spaces = {row[0] for table in ("messages", "context_records", "context_generations", "pending_notes")
+                  for row in archive.db.execute(f"SELECT DISTINCT space FROM {table}")}
+        assert spaces == {"telegram:123", "topic:5", "general"}
+        assert {archive.get(i)["space"] for i in ("m0", "m7")} == {"telegram:123"}
+        assert [r["content"] for r in archive.load_context("telegram:123")] == ["thread zero", "thread seven"]
+        assert [n["content"] for n in archive.notes("telegram:123")] == ["note zero", "note seven"]
+        assert archive.generation("telegram:123") == 5
+        assert archive.generation("telegram:123:0") == archive.generation("telegram:123:7") == 0
+        assert archive.get("t5")["space"] == "topic:5" and archive.get("g")["space"] == "general"
+        assert [r["content"] for r in archive.load_context("topic:5")] == ["home topic"]
+        assert [n["content"] for n in archive.notes("topic:5")] == ["note topic"]
+        assert archive.generation("topic:5") == 3 and archive.generation("general") == 1
+        assert archive.db.execute("SELECT value FROM archive_meta WHERE key='flat_spaces'").fetchone()[0] == "1"
+        # Reopening must not migrate again: a threaded space added afterwards stays as written.
+        archive.db.execute("INSERT INTO context_generations VALUES ('telegram:123:9', 9)")
+        archive.db.commit()
+    finally:
+        archive.close()
+    archive = ConversationArchive(tmp_path)
+    try:
+        assert archive.generation("telegram:123:9") == 9
+        assert archive.generation("telegram:123") == 5
+    finally:
+        archive.close()
 
 
 def test_pre_upgrade_retry_entries_get_durable_identity(setup, tmp_path):
@@ -185,14 +242,15 @@ async def test_telegram_batch_is_archived_and_redelivery_cannot_regroup_complete
     one, two, three = message(1), message(2), message(3)
     client = MagicMock(chat=AsyncMock(return_value=_make_text_response("Received")))
     with patch("assistant.copilot.get_client", return_value=client):
-        await bot._answer_batch((123, 10), _PendingBatch(bot=MagicMock(send_chat_action=AsyncMock()),
+        await bot._answer_batch(123, _PendingBatch(bot=MagicMock(send_chat_action=AsyncMock()),
             items=[_BatchItem(one, "A voice transcript"), _BatchItem(two, "attachments/photo.jpg")]))
-        await bot._answer_batch((123, 10), _PendingBatch(bot=MagicMock(send_chat_action=AsyncMock()),
+        await bot._answer_batch(123, _PendingBatch(bot=MagicMock(send_chat_action=AsyncMock()),
             items=[_BatchItem(two, "attachments/photo.jpg"), _BatchItem(three, "New input")]))
     rows = archive.db.execute("SELECT * FROM messages WHERE role='user' ORDER BY created").fetchall()
     assert len(rows) == 2
-    assert rows[0]["source"] == "telegram" and rows[0]["space"] == "topic:10"
+    assert rows[0]["source"] == "telegram" and rows[0]["space"] == "general"
     assert json.loads(rows[0]["metadata"])["message_ids"] == [1, 2]
+    assert "thread_id" not in json.loads(rows[0]["metadata"])
     assert "attachments/photo.jpg" in rows[0]["text"]
     assert rows[1]["text"] == "New input"
     assert archive.get("reply:" + rows[0]["id"])["delivery"] == "delivered"
@@ -208,8 +266,8 @@ async def test_telegram_reply_delivery_failure_keeps_generated_reply_visible(set
                           reply_text=AsyncMock(side_effect=RuntimeError("Telegram offline")))
     client = MagicMock(chat=AsyncMock(return_value=_make_text_response("Written successfully")))
     with patch("assistant.copilot.get_client", return_value=client), pytest.raises(RuntimeError):
-        await bot._answer_batch((123, None), _PendingBatch(bot=MagicMock(send_chat_action=AsyncMock()),
-                                                        items=[_BatchItem(msg, "write a note")]))
+        await bot._answer_batch(123, _PendingBatch(bot=MagicMock(send_chat_action=AsyncMock()),
+                                                  items=[_BatchItem(msg, "write a note")]))
     assert archive.get("telegram:123:1")["status"] == "done"
     row = archive.get("reply:telegram:123:1")
     assert row["text"] == "Written successfully" and row["delivery"] == "failed"

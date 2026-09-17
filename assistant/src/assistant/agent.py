@@ -20,7 +20,7 @@ from .backup import VaultBackup
 from .conversations import WEB_CHAT_ID, ConversationArchive, conversation_space
 from .history import ConversationHistory, history_tool_schemas
 from .skills import SkillLibrary
-from .tools import VaultTools, slug_from_name
+from .tools import VaultTools
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +53,11 @@ _ERROR_RESULT_RX = re.compile(
 # finds its purpose already met; run_job then delivers nothing.
 _SILENT_SENTINEL = "[silent]"
 
-# A proactive sender: delivers text (optionally into a forum topic) and
-# returns the chat id it delivered to, or None when the message was dropped.
-# The chat id is how run_job learns the real conversation key when mirroring
-# a delivery into that conversation's history.
-SendMessageFn = Callable[[str, int | None], Coroutine[Any, Any, int | None]]
+# A proactive sender: delivers text to the home chat and returns the chat id
+# it delivered to, or None when the message was dropped. The chat id is how
+# run_job learns the real conversation key when mirroring a delivery into
+# that conversation's history.
+SendMessageFn = Callable[[str], Coroutine[Any, Any, int | None]]
 
 # Scheduled runs close with a JSON object matching this schema (the contract
 # in prompts/schedule.md). It also rides job-run requests as response_format:
@@ -136,41 +136,6 @@ def _parse_job_close(reply: str) -> dict[str, Any] | None:
             return {"silent": data["silent"], "message": message}
     return None
 
-_TOPIC_INDEX_FILE = "system/topics/index.md"
-_TOPIC_INDEX_HEADER = "| topic_id | slug | name |"
-_TOPIC_INDEX_SEP = "|----------|------|------|"
-_TOPIC_CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
-
-
-def _escape_topic_cell(value: str) -> str:
-    if "\r" in value or "\n" in value:
-        raise ValueError("topic index cells must be single-line")
-    return value.replace("|", "\\|")
-
-
-def _unescape_topic_cell(value: str) -> str:
-    return value.replace("\\|", "|")
-
-
-def _topic_row(topic_id: int, slug: str, name: str) -> str:
-    cells = (str(topic_id), slug, name)
-    return "| " + " | ".join(_escape_topic_cell(cell) for cell in cells) + " |"
-
-
-def _parse_topic_row(row: str) -> tuple[int, str, str] | None:
-    cols = [col.strip() for col in _TOPIC_CELL_SPLIT_RE.split(row.strip())]
-    if cols and not cols[0]:
-        cols.pop(0)
-    if cols and not cols[-1]:
-        cols.pop()
-    if len(cols) < 3:
-        return None
-    topic_id, slug, name = (_unescape_topic_cell(col) for col in cols[:3])
-    try:
-        return int(topic_id), slug, name
-    except ValueError:
-        return None
-
 # Tools that mutate the vault. Their dispatch holds the backup lock (a commit
 # must not snapshot a file mid-write) and their paths are attributed to the
 # run's backup commit.
@@ -182,7 +147,6 @@ _VAULT_MUTATING_TOOLS = frozenset({
     "move_file",
     "schedule",
     "cancel_scheduled",
-    "create_forum_topic",
 })
 
 
@@ -200,10 +164,6 @@ def _paths_touched(name: str, args: dict[str, Any]) -> set[str]:
         return {p for p in (args.get("path"), args.get("new_path")) if p}
     if name in ("schedule", "cancel_scheduled"):
         return {"system/schedule.md"}
-    if name == "create_forum_topic":
-        slug = slug_from_name(args.get("name") or "")
-        if slug:
-            return {f"system/topics/{slug}/AGENTS.md", _TOPIC_INDEX_FILE}
     return set()
 
 # Shared with fanout.py: workers expose the same research tool to their model.
@@ -262,7 +222,6 @@ class Agent:
         schedule_dispatcher: Callable[[str, dict[str, Any]], str] | None = None,
         schedule_schemas: list[dict[str, Any]] | None = None,
         send_message_fn: SendMessageFn | None = None,
-        create_forum_topic_fn: Callable[[str], Coroutine[Any, Any, dict[str, Any]]] | None = None,
         research_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         extract_fn: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         fan_out_fn: Callable[[str, list[str]], Coroutine[Any, Any, str]] | None = None,
@@ -279,78 +238,72 @@ class Agent:
         self._schedule_dispatcher = schedule_dispatcher
         self._schedule_schemas = schedule_schemas or []
         self._send_message_fn = send_message_fn
-        self._create_forum_topic_fn = create_forum_topic_fn
         self._research_fn = research_fn
         self._extract_fn = extract_fn
         self._fan_out_fn = fan_out_fn
         self._skills = skills
         self._backup = backup
-        self._histories: dict[tuple[int, int | None], ConversationHistory] = {}
+        self._histories: dict[int, ConversationHistory] = {}
         # Scheduled-run deliveries queued for mirroring into the target
         # conversation's history, keyed like _histories. Queued at send time,
         # drained by that conversation's next run — appending directly from
         # the job run could interleave into an in-flight run's tool sequence,
         # and waiting for the target's run lock inside a send_message dispatch
         # could outlive the tool timeout and bait the model into re-sending.
-        self._pending_notes: dict[tuple[int, int | None], deque[str]] = {}
-        # One lock per conversation: concurrent runs for the same
-        # (chat_id, thread_id) would interleave appends into one history and
-        # produce tool messages the API rejects. Different conversations
-        # (other topics, scheduled jobs on chat 0) run in parallel.
-        self._run_locks: dict[tuple[int, int | None], asyncio.Lock] = {}
-        self._topic_lock = asyncio.Lock()
+        self._pending_notes: dict[int, deque[str]] = {}
+        # One lock per conversation: concurrent runs for the same chat would
+        # interleave appends into one history and produce tool messages the
+        # API rejects. Different conversations (other chats, scheduled jobs
+        # on chat 0) run in parallel.
+        self._run_locks: dict[int, asyncio.Lock] = {}
         self._history_exchanges = history_exchanges
         self.archive = archive
         self._home_chat_fn = home_chat_fn
-        self._space_aliases: dict[tuple[int, int | None], str] = {}
         self._home_chat_aliases: set[int] = set()
         self._tz = ZoneInfo(tz_name)
 
-    def _get_history(self, chat_id: int, thread_id: int | None = None) -> ConversationHistory:
-        key = self.conversation_key(chat_id, thread_id)
+    def _get_history(self, chat_id: int) -> ConversationHistory:
+        key = self.conversation_key(chat_id)
         if key not in self._histories:
             self._histories[key] = ConversationHistory(
                 self._history_exchanges, archive=self.archive if chat_id != 0 else None,
-                space=self.conversation_space(*key),
+                space=self.conversation_space(key),
             )
         return self._histories[key]
 
-    def conversation_key(self, chat_id: int, thread_id: int | None = None) -> tuple[int, int | None]:
+    def conversation_key(self, chat_id: int) -> int:
+        """The canonical conversation: the pinned Telegram home chat is the web chat."""
         if self._home_chat_fn and (home := self._home_chat_fn()) is not None:
             self._home_chat_aliases.add(home)
         if chat_id != 0 and chat_id in self._home_chat_aliases:
-            chat_id = WEB_CHAT_ID
-        return chat_id, thread_id
+            return WEB_CHAT_ID
+        return chat_id
 
-    def conversation_space(self, chat_id: int, thread_id: int | None = None) -> str:
-        key = self.conversation_key(chat_id, thread_id)
-        return self._space_aliases.get(key, conversation_space(*key))
+    def conversation_space(self, chat_id: int) -> str:
+        return conversation_space(self.conversation_key(chat_id))
 
-    def register_legacy_space(self, thread_id: int, space: str) -> None:
-        self._space_aliases[(WEB_CHAT_ID, thread_id)] = space
-
-    async def reset_conversation(self, chat_id: int, thread_id: int | None = None):
-        key = self.conversation_key(chat_id, thread_id)
+    async def reset_conversation(self, chat_id: int):
+        key = self.conversation_key(chat_id)
         async with self._run_locks.setdefault(key, asyncio.Lock()):
             self._histories.pop(key, None)
             self._pending_notes.pop(key, None)
             if self.archive:
-                self.archive.reset(self.conversation_space(*key))
+                self.archive.reset(self.conversation_space(key))
 
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def _queue_sent_note(self, chat_id: int, thread_id: int | None, text: str) -> None:
+    def _queue_sent_note(self, chat_id: int, text: str) -> None:
         """Queue a scheduled-run delivery for the target conversation's history.
 
         The stamp is frozen now, like user-message stamps; the provenance
         prefix tells the model this is a message it already sent, not one to
         send again.
         """
-        key = self.conversation_key(chat_id, thread_id)
+        key = self.conversation_key(chat_id)
         note = f"[{self._local_stamp()}, sent from a scheduled run] {text}"
         if self.archive:
-            self.archive.queue_note(self.conversation_space(*key), note)
+            self.archive.queue_note(self.conversation_space(key), note)
         else:
             self._pending_notes.setdefault(key, deque()).append(note)
 
@@ -376,13 +329,13 @@ class Agent:
             blocks.append(f"--- {path} ---\n{content}")
         return "\n\n".join(blocks)
 
-    def clear_history(self, chat_id: int, thread_id: int | None = None) -> None:
-        """Forget one chat/topic's conversation; the next run starts fresh."""
-        key = self.conversation_key(chat_id, thread_id)
+    def clear_history(self, chat_id: int) -> None:
+        """Forget one chat's conversation; the next run starts fresh."""
+        key = self.conversation_key(chat_id)
         self._histories.pop(key, None)
         self._pending_notes.pop(key, None)
         if self.archive:
-            self.archive.reset(self.conversation_space(*key))
+            self.archive.reset(self.conversation_space(key))
 
     def _base_prompt(self) -> str:
         """Embedded capability prompt: ships with the code, sections gated by enabled features."""
@@ -395,14 +348,12 @@ class Agent:
             sections.append(_read_prompt("extract.md"))
         if self._fan_out_fn:
             sections.append(_read_prompt("fanout.md"))
-        if self._create_forum_topic_fn:
-            sections.append(_read_prompt("topics.md"))
         if self._skills:
             sections.append(_read_prompt("skills.md"))
         return "\n\n".join(sections)
 
-    def _load_system_prompt(self, topic_slug: str | None = None) -> str:
-        """Assemble: embedded capabilities → vault AGENTS.md → topic AGENTS.md → skills menu.
+    def _load_system_prompt(self) -> str:
+        """Assemble: embedded capabilities → vault AGENTS.md → skills menu.
 
         The embedded part documents what the bot can do and updates with the
         code; the vault parts carry user- and deployment-specific conventions
@@ -418,10 +369,6 @@ class Agent:
         vault_prompt = self._vault.read_file("AGENTS.md")
         if not vault_prompt.startswith("[file not found"):
             parts.append(vault_prompt)
-        if topic_slug:
-            topic_prompt = self._vault.read_file(f"system/topics/{topic_slug}/AGENTS.md")
-            if not topic_prompt.startswith("[file not found"):
-                parts.append(topic_prompt)
         # The menu is the one volatile part of the prompt, so it goes last:
         # a change invalidates only the tail of the provider's prompt cache.
         # It is built from triggers only, so refining a skill body changes nothing.
@@ -430,57 +377,6 @@ class Agent:
             if menu:
                 parts.append(menu)
         return "\n\n".join(parts)
-
-    def _resolve_topic_slug(self, thread_id: int) -> tuple[str | None, str | None]:
-        """Look up slug and name for a thread_id from system/topics/index.md.
-
-        Returns ``(slug, name)`` or ``(None, None)`` if not found.
-        """
-        text = self._vault.read_file(_TOPIC_INDEX_FILE)
-        if text.startswith("[file not found"):
-            return None, None
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("|") or stripped.startswith("| topic_id") or stripped.startswith("|---"):
-                continue
-            parsed = _parse_topic_row(stripped)
-            if parsed and parsed[0] == thread_id:
-                return parsed[1], parsed[2]
-        return None, None
-
-    def _register_topic(self, topic_id: int, slug: str, name: str) -> None:
-        """Add or update an entry in system/topics/index.md."""
-        text = self._vault.read_file(_TOPIC_INDEX_FILE)
-        if text.startswith("[file not found"):
-            # Create fresh index
-            lines = [
-                "# Topic Index\n",
-                _TOPIC_INDEX_HEADER,
-                _TOPIC_INDEX_SEP,
-                _topic_row(topic_id, slug, name),
-                "",
-            ]
-            self._vault.write_file(_TOPIC_INDEX_FILE, "\n".join(lines))
-            return
-
-        # Rebuild, skipping any existing row with same topic_id
-        new_rows: list[str] = []
-        found = False
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("|") and not stripped.startswith("| topic_id") and not stripped.startswith("|---"):
-                parsed = _parse_topic_row(stripped)
-                if parsed and parsed[0] == topic_id:
-                    found = True
-                    new_rows.append(_topic_row(topic_id, slug, name))
-                    continue
-            new_rows.append(line)
-
-        if not found:
-            # Find last data row and append after it
-            new_rows.append(_topic_row(topic_id, slug, name))
-
-        self._vault.write_file(_TOPIC_INDEX_FILE, "\n".join(new_rows) + "\n")
 
     def _all_tools(self) -> list[dict[str, Any]]:
         tools = list(self._vault.tool_schemas())
@@ -495,17 +391,12 @@ class Agent:
                     "name": "send_message",
                     "description": (
                         "Send a message to the user's Telegram chat. "
-                        "Use this when scheduled jobs need to deliver output. "
-                        "Optionally include message_thread_id to send to a specific forum topic."
+                        "Use this when scheduled jobs need to deliver output."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "text": {"type": "string"},
-                            "message_thread_id": {
-                                "type": "integer",
-                                "description": "Forum topic thread ID; omit for general chat.",
-                            },
                         },
                         "required": ["text"],
                     },
@@ -571,31 +462,6 @@ class Agent:
                     },
                 },
             })
-        if self._create_forum_topic_fn:
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "create_forum_topic",
-                    "description": (
-                        "Create a new forum topic (room) in the Telegram supergroup. "
-                        "Call this when the user asks to create a topic or room. "
-                        "Automatically registers the topic in the vault index and creates vault directories."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": (
-                                    "Single-line display name for the new topic, "
-                                    "e.g. 'Health & Fitness'."
-                                ),
-                            },
-                        },
-                        "required": ["name"],
-                    },
-                },
-            })
         return tools
 
     async def _dispatch_tool(
@@ -644,8 +510,7 @@ class Agent:
         # Send message (for scheduled runs)
         send_fn = send_message_fn or self._send_message_fn
         if name == "send_message" and send_fn:
-            thread_id: int | None = args.get("message_thread_id")
-            await send_fn(args["text"], thread_id)
+            await send_fn(args["text"])
             return "Message sent."
         # Web research (quarantined sub-agent)
         if name == "research" and self._research_fn:
@@ -656,42 +521,12 @@ class Agent:
         # Fan-out bulk processing (concurrent quarantined workers)
         if name == "fan_out" and self._fan_out_fn:
             return await self._fan_out_fn(args["instruction"], args.get("items") or [])
-        # Create forum topic
-        if name == "create_forum_topic" and self._create_forum_topic_fn:
-            topic_name: str = args["name"]
-            if "\r" in topic_name or "\n" in topic_name:
-                return "[tool error: topic name must be a single line]"
-            slug = slug_from_name(topic_name)
-            if not slug.strip("-"):
-                return "[tool error: topic name must contain ASCII letters or digits]"
-            async with self._topic_lock:
-                index = self._vault.read_file(_TOPIC_INDEX_FILE)
-                registered = any(
-                    row and row[1] == slug
-                    for row in (_parse_topic_row(line) for line in index.splitlines())
-                )
-                if registered or self._vault.abs_path(f"system/topics/{slug}").exists():
-                    return f"[tool error: topic slug {slug!r} already exists; choose another name]"
-                forum_topic = await self._create_forum_topic_fn(topic_name)
-                thread_id = forum_topic["message_thread_id"]
-                # A vault edit can land while Telegram is creating the topic.
-                # create_file refuses to overwrite it, unlike internal writes.
-                self._vault.create_file(
-                    f"system/topics/{slug}/AGENTS.md",
-                    f"# Topic: {topic_name}\n\n<!-- Add topic-specific instructions here -->\n",
-                )
-                self._register_topic(thread_id, slug, topic_name)
-            return (
-                f"Topic '{topic_name}' created successfully. "
-                f"thread_id={thread_id}, slug='{slug}'."
-            )
         return f"[unknown tool: {name}]"
 
     async def run(
         self,
         chat_id: int,
         user_message: str,
-        thread_id: int | None = None,
         extra_context: str | None = None,
         image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
@@ -707,10 +542,10 @@ class Agent:
         ``transient_context`` rides the user message during this run only;
         stored history keeps the bare message (same treatment as images).
 
-        Runs for the same ``(chat_id, thread_id)`` are serialized on a lock —
+        Runs for the same conversation are serialized on a lock —
         interleaved appends into one history would produce orphaned tool
         messages the API rejects. Runs for different conversations (other
-        topics, scheduled jobs) proceed in parallel; the lock queue is FIFO,
+        chats, scheduled jobs) proceed in parallel; the lock queue is FIFO,
         so same-conversation messages are handled in arrival order.
 
         ``on_research`` is awaited once, best-effort, the first time this run
@@ -718,29 +553,27 @@ class Agent:
         ``send_message_fn`` overrides the constructor-injected sender for this
         run only (used by ``run_job`` to observe deliveries).
         """
-        key = self.conversation_key(chat_id, thread_id)
-        chat_id, thread_id = key  # Freeze identity before lock waits or network calls.
+        chat_id = self.conversation_key(chat_id)  # Freeze identity before lock waits or network calls.
         if self.archive and chat_id != 0:
-            message_id = self.archive.insert(self.conversation_space(*key), "user", user_message, "queued",
+            message_id = self.archive.insert(self.conversation_space(chat_id), "user", user_message, "queued",
                                              message_id=message_id, source=source) if message_id is None else message_id
-        lock = self._run_locks.setdefault(key, asyncio.Lock())
+        lock = self._run_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
             if self.archive and message_id:
                 row = self.archive.get(message_id)
                 if row is None or row["status"] in ("dismissed", "deleted"):
                     return ""
-                if row["space"] != self.conversation_space(*key):
+                if row["space"] != self.conversation_space(chat_id):
                     raise ValueError("Message belongs to a different conversation")
                 if row["status"] == "done":
                     return self.archive.reply(message_id) or ""
                 self.archive.status(message_id, "running")
-                self._get_history(chat_id, thread_id).request_ids.add(message_id)
-                self._get_history(chat_id, thread_id).active_request_id = message_id
+                self._get_history(chat_id).request_ids.add(message_id)
+                self._get_history(chat_id).active_request_id = message_id
             try:
                 reply, touched = await self._run_locked(
                     chat_id,
                     user_message,
-                    thread_id=thread_id,
                     extra_context=extra_context,
                     image_data_urls=image_data_urls,
                     transient_context=transient_context,
@@ -767,7 +600,6 @@ class Agent:
         self,
         chat_id: int,
         user_message: str,
-        thread_id: int | None = None,
         extra_context: str | None = None,
         image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
@@ -789,14 +621,14 @@ class Agent:
         unwind touches only the unfinished work block.
         """
         t_start = time.monotonic()
-        history = self._get_history(chat_id, thread_id)
+        history = self._get_history(chat_id)
         history.begin_run()
         touched: set[str] = set()
 
         # Messages a scheduled run delivered to this conversation since its
         # last run enter history here, under its run lock, so the incoming
         # user message lands with the reminder it is replying to in context.
-        for note in self._pending_notes.pop(self.conversation_key(chat_id, thread_id), ()):
+        for note in self._pending_notes.pop(self.conversation_key(chat_id), ()):
             history.append({"role": "assistant", "content": note})
         if history.archive:
             for note in history.archive.notes(history.space):
@@ -804,12 +636,7 @@ class Agent:
                     history.append({"role": "assistant", "content": note["content"]})
                     history.note_ids.add(note["id"])
 
-        # Resolve topic slug for thread-specific prompt (if in a forum topic)
-        topic_slug: str | None = None
-        if thread_id is not None:
-            topic_slug, _ = self._resolve_topic_slug(thread_id)
-
-        system_prompt = self._load_system_prompt(topic_slug)
+        system_prompt = self._load_system_prompt()
         if extra_context:
             system_prompt = f"{system_prompt}\n\n{extra_context}"
 
@@ -883,7 +710,6 @@ class Agent:
                 response.get("model", ""),
                 usage_dict,
                 chat_id=chat_id,
-                thread_id=thread_id,
             )
             tool_calls_in_turn = extract_tool_calls(msg)
             tool_names = ",".join(tc["function"]["name"] for tc in tool_calls_in_turn)
@@ -972,7 +798,6 @@ class Agent:
     async def retry_message(
         self,
         chat_id: int,
-        thread_id: int | None,
         text: str,
         queued_at: str,
         hot: bool,
@@ -1003,19 +828,19 @@ class Agent:
         Raises CopilotUnavailableError while the outage lasts, so the retry
         queue keeps the item.
         """
-        chat_id, thread_id = self.conversation_key(chat_id, thread_id)
-        lock = self._run_locks.setdefault((chat_id, thread_id), asyncio.Lock())
+        chat_id = self.conversation_key(chat_id)
+        lock = self._run_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
             if self.archive and message_id:
                 row = self.archive.get(message_id)
                 if row is None or row["status"] in ("dismissed", "deleted", "done"):
                     return None
-                if row["space"] != self.conversation_space(chat_id, thread_id):
+                if row["space"] != self.conversation_space(chat_id):
                     raise ValueError("Retry belongs to a different conversation")
-                self._get_history(chat_id, thread_id).request_ids.add(message_id)
-                self._get_history(chat_id, thread_id).active_request_id = message_id
+                self._get_history(chat_id).request_ids.add(message_id)
+                self._get_history(chat_id).active_request_id = message_id
             if hot:
-                msgs = self._get_history(chat_id, thread_id).messages()
+                msgs = self._get_history(chat_id).messages()
                 if not msgs:
                     return None  # /clear deliberately supersedes queued work
                 last = msgs[-1]
@@ -1033,7 +858,7 @@ class Agent:
                 )
             try:
                 reply, touched = await self._run_locked(
-                    chat_id, note, thread_id=thread_id, unwind_on_unavailable=True,
+                    chat_id, note, unwind_on_unavailable=True,
                     send_message_fn=send_message_fn, extra_context=extra_context,
                     # A cold replay shows the pictures again; a hot one's turn
                     # already carried them.
@@ -1052,7 +877,7 @@ class Agent:
         return reply
 
     async def run_job(self, prompt: str) -> str:
-        """Run a scheduled-job prompt (chat_id 0, no thread).
+        """Run a scheduled-job prompt (chat_id 0).
 
         The prompt reaches the model tagged ``[scheduled run]``, and the run
         closes with a JSON object matching ``_JOB_CLOSE_SCHEMA`` (the contract
@@ -1070,18 +895,18 @@ class Agent:
         base_send = self._send_message_fn
         delivered = 0
 
-        async def counting_send(text: str, thread_id: int | None = None) -> int | None:
+        async def counting_send(text: str) -> int | None:
             nonlocal delivered
             target_chat = None
             if base_send:
-                target_chat = await base_send(text, thread_id)
+                target_chat = await base_send(text)
             delivered += 1
             # Mirror the delivery into the target conversation's history so a
             # user reply to it there arrives with context — this run is the
             # chat-0 job conversation, invisible to the one the message
             # landed in. A None chat id means the delivery was dropped.
             if target_chat is not None and self.archive is None:
-                self._queue_sent_note(target_chat, thread_id, text)
+                self._queue_sent_note(target_chat, text)
             return target_chat
 
         reply = await self.run(
@@ -1095,11 +920,11 @@ class Agent:
         if close is not None:
             if close["silent"] or delivered or not close["message"] or base_send is None:
                 return reply
-            await counting_send(close["message"], None)
+            await counting_send(close["message"])
             return reply
         if _SILENT_SENTINEL in reply.lower():
             return reply
         if not delivered and reply and base_send:
             logger.warning("Scheduled run closed without job-close JSON; delivering raw reply")
-            await counting_send(reply, None)
+            await counting_send(reply)
         return reply

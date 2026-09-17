@@ -7,6 +7,7 @@ automatic model context; unfinished tool protocol remains process-local.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -15,10 +16,16 @@ from pathlib import Path
 WEB_CHAT_ID = -(2**62)
 
 
-def conversation_space(chat_id: int, thread_id: int | None) -> str:
+def conversation_space(chat_id: int) -> str:
+    """The archive key of a conversation: the home chat (Telegram and web) is ``general``."""
     if chat_id == WEB_CHAT_ID:
-        return f"topic:{thread_id}" if thread_id is not None else "general"
-    return f"telegram:{chat_id}:{thread_id or 0}"
+        return "general"
+    return f"telegram:{chat_id}"
+
+
+# Spaces from before topics were removed (2026-09-17) carried a thread id:
+# ``telegram:<chat>:<thread>``. Threads of one chat fold into that chat.
+_THREADED_SPACE = re.compile(r"(telegram:-?\d+):\d+")
 
 
 class ConversationArchive:
@@ -65,6 +72,7 @@ class ConversationArchive:
         self.db.execute("UPDATE messages SET status='interrupted', error=? WHERE status IN ('queued','running')",
                         ("Service restarted. Work may have partially completed. Review before retrying.",))
         self._import_existing_web_context()
+        self._flatten_threaded_spaces()
         self.db.commit()
 
     def _import_existing_web_context(self):
@@ -83,6 +91,30 @@ class ConversationArchive:
                 self.db.execute("INSERT INTO context_records(space,exchange_id,role,content,completed_at,generation) VALUES (?,?,?,?,?,0)",
                                 (row["space"], user["id"], row["role"], row["text"], str(row["created"])))
         self.db.execute("INSERT INTO archive_meta VALUES ('context_import','1')")
+
+    def _flatten_threaded_spaces(self):
+        """Fold pre-topic-removal ``telegram:<chat>:<thread>`` spaces into ``telegram:<chat>``.
+
+        Runs once. Home-chat topics (``topic:<id>``) are left untouched: their
+        text stays in the archive under the old key, neither shown nor merged,
+        so bringing topics back would find it intact.
+        """
+        if self.db.execute("SELECT 1 FROM archive_meta WHERE key='flat_spaces'").fetchone():
+            return
+        spaces = {row[0] for table in ("messages", "context_records", "context_generations", "pending_notes")
+                  for row in self.db.execute(f"SELECT DISTINCT space FROM {table}")}
+        for space in sorted(spaces):
+            match = _THREADED_SPACE.fullmatch(space)
+            if match is None:
+                continue
+            flat = match[1]
+            for table in ("messages", "context_records", "pending_notes"):
+                self.db.execute(f"UPDATE {table} SET space=? WHERE space=?", (flat, space))
+            generation = max(self.generation(space), self.generation(flat))
+            self.db.execute("DELETE FROM context_generations WHERE space=?", (space,))
+            if generation:
+                self.db.execute("INSERT OR REPLACE INTO context_generations VALUES (?,?)", (flat, generation))
+        self.db.execute("INSERT INTO archive_meta VALUES ('flat_spaces','1')")
 
     def generation(self, space):
         row = self.db.execute("SELECT generation FROM context_generations WHERE space=?", (space,)).fetchone()

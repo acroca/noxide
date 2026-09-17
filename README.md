@@ -54,9 +54,9 @@ not a multi-tenant service. The optional PWA runs alongside Telegram, not instea
 | **Photos** | Sent to the vision model and filed in the vault, driven by your caption |
 | **Documents** | PDFs, scans and text files stored and read on demand — digital PDFs parsed locally, scans transcribed via vision |
 | **Bursts** | Messages that arrive within a second of each other — a WhatsApp share, a few quick lines — are handled as one turn with one reply |
-| **Rooms** | Telegram forum topics become separate rooms with their own history and prompt, handled in parallel, sharing one vault |
-| **Web companion** | Chat with a topic picker, pasted or attached images, voice notes, a raw read-only Now page, saved drafts and opt-in push; private-network access only |
-| **Conversation archive** | Shared home Telegram/PWA topic history in SQLite; five recent exchanges by default, older text retrieved on demand |
+| **One conversation** | No rooms or channels to pick: say what happened and the bot works out which project or area it concerns |
+| **Web companion** | Chat with pasted or attached images, voice notes, a raw read-only Now page, saved drafts and opt-in push; private-network access only |
+| **Conversation archive** | Shared home Telegram/PWA history in SQLite; five recent exchanges by default, older text retrieved on demand |
 | **Skills** | Stored procedures in markdown that the bot consults — and refines — as it works |
 | **Bulk fan-out** | One instruction over up to 50 items, processed in parallel by read-only worker sub-agents |
 | **Model switching** | `/model` picker, with the active model shown in the group title |
@@ -98,7 +98,7 @@ raw/journal/YYYY-MM-DD.md   ← append-only. What happened, never edited after t
 wiki/                        ← current state. Rewritten freely; the journal is the history.
   now.md                     ← today, upcoming, waiting — one read, no queries
   routines.md, projects/, areas/, people/
-system/                      ← the bot's own files: schedule, skills, topics, usage
+system/                      ← the bot's own files: schedule, skills, usage
 ```
 
 New information is journalled, filed on the one page that owns it, and
@@ -124,7 +124,7 @@ Most interactions are natural language; Telegram has three commands.
 |---------|--------------|
 | `/start` | A short hello listing what the bot can accept |
 | `/model` | Live Copilot model picker, with configured fallback/custom entries. The group title shows the active one. Resets to the resolved startup default on restart |
-| `/clear` | Resets automatic context and dismisses pending conversation work, retaining searchable archived text and vault notes. The home chat shares this reset with its PWA topic |
+| `/clear` | Resets automatic context and dismisses pending conversation work, retaining searchable archived text and vault notes. The home chat shares this reset with the web chat |
 
 ## Web research
 
@@ -166,18 +166,18 @@ other LLM frameworks.
 ## Design decisions & notes
 
 The optional [web companion](docs/deployment.md#web-companion-pwa) opens straight
-into Chat, with General and a switcher for your Telegram topics. A separate Now
+into Chat, the same conversation as your Telegram home chat. A separate Now
 tab shows `wiki/now.md` as read-only text. It shares the vault and assistant,
 keeps Telegram working, takes pasted or attached images and voice notes, and
 supports opt-in push notifications. No separate frontend deployment.
 
 Noxide is the project; `AGENT_NAME` / `[assistant] name` sets your instance's
-name. It appears in the app and model identity; push titles show the channel.
+name. It appears in the app, in model identity and as the push title.
 
 The PWA has no app password: keep it behind Tailscale Serve or another restricted
 private network. Anyone who can reach it can use the assistant and read its chats.
 
-- **Small context, durable history.** Home Telegram and web topics share a private SQLite archive. By default, the last five completed exchanges are restored after restart, without old tool traces; earlier text is searchable on demand. Reset context (`/clear`) keeps the archive and marks the cut with a divider in the web chat. Current knowledge still belongs in the vault. See [configuration](docs/configuration.md).
+- **Small context, durable history.** The home Telegram chat and the web chat share a private SQLite archive. By default, the last five completed exchanges are restored after restart, without old tool traces; earlier text is searchable on demand. Reset context (`/clear`) keeps the archive and marks the cut with a divider in the web chat. Current knowledge still belongs in the vault. See [configuration](docs/configuration.md).
 - **Allowlisted users.** `allowed_user_ids` lists the Telegram user ids that may talk to the bot; everyone else is silently ignored. Multiple ids are supported (a household sharing one assistant), but they all share one vault and one conversation per chat — this is not multi-tenancy.
 - **Graceful restarts.** SIGTERM starts a drain: the bot stops fetching, finishes the in-flight run plus everything already queued, waits for any mid-run scheduled job, and only then exits. This is not politeness — stopping the updater acks every fetched update to Telegram, so a container killed mid-drain loses those messages for good. A second signal abandons the drain. The budget is 270s, which is why the Compose service must set `stop_grace_period: 5m`.
 - **schedule.md as source of truth.** APScheduler uses an in-memory job store only. The markdown file is re-parsed on startup and every 60 seconds, so hand edits take effect within a minute. Rows that don't parse are logged, not silently dropped. On restart, one-off jobs overdue by less than 12 hours fire once; older ones are dropped.

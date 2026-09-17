@@ -17,7 +17,7 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True, "replies": {}, "generation": 0, "voice": False, "unread": 0}
+    state = {"revision": 1, "available": True, "authorized": True, "replies": [], "generation": 0, "voice": False, "unread": 0}
     seen, uploads, submissions = [], [], []
     release = asyncio.Event()
     release.set()
@@ -36,8 +36,6 @@ async def main():
                 return web.json_response({"path": f"attachments/2026-09-15-{len(uploads):06x}.png"})
             if request.path == "/api/attachment":
                 return web.Response(body=uploads[-1][1], content_type="image/png")
-            if request.path == "/api/topics":
-                return web.json_response({"topics": [{"id": "general", "name": "General"}, {"id": "topic:10", "name": "Work"}]})
             if request.path == "/api/messages" and request.method == "POST":
                 started.set()
                 await release.wait()
@@ -46,8 +44,11 @@ async def main():
             if request.path == "/api/seen":
                 seen.append(await request.json())
                 return web.json_response({"ok": True})
-            space = request.query.get("space", "general")
-            return web.json_response({"messages": state["replies"].get(space, []), "before": None,
+            if request.path == "/api/now":
+                return web.json_response({"content": "# Now\n\n## Today\n- [ ] A read-only page"})
+            if request.path != "/api/messages" or "space" in request.query:
+                raise web.HTTPNotFound()  # one chat: no topic routes, no space parameter
+            return web.json_response({"messages": state["replies"], "before": None,
                                       "generation": state["generation"], "unread": state["unread"]})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
@@ -83,7 +84,8 @@ async def main():
             page.on("pageerror", lambda error: errors.append(str(error)))
             url = f"http://127.0.0.1:{port}"
             await page.goto(url)
-            area = page.get_by_label("Message to General")
+            composer = f"Message to {agent_name}"
+            area = page.get_by_label(composer)
             await area.fill("Preserve this draft")
             await page.evaluate("async () => { await navigator.serviceWorker.ready; }")
             await page.wait_for_function("() => !!navigator.serviceWorker.controller")
@@ -108,17 +110,20 @@ async def main():
             # keyboard dismissed in the background fires no viewport event.
             await page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
             await expect(page.locator('.shell')).to_have_css('height', '844px')
+            # One chat: no topic picker, no channel links, just the title and Reset.
             assert await page.locator('select').count() == 0
-            await page.get_by_role('button', name='Change topic: General').click()
-            await expect(page.get_by_role('dialog', name='Choose a topic')).to_be_visible()
-            await page.locator('#topic-options').get_by_role('link', name='Work', exact=True).click()
-            await expect(page.get_by_label('Message to Work')).to_be_visible()
-            await expect(page.locator('#topic-picker')).not_to_be_visible()
-            await page.get_by_role('button', name='Change topic: Work').click()
-            await page.keyboard.press('Escape')
-            await expect(page.get_by_role('button', name='Change topic: Work')).to_be_focused()
-            await page.get_by_role('button', name='Change topic: Work').click()
-            await page.locator('#topic-options').get_by_role('link', name='General', exact=True).click()
+            assert await page.locator('#topic-links, #topic-picker, #chat-topic, .channel-picker').count() == 0
+            await expect(page.locator('h1.chat-title')).to_have_text('Chat')
+            await expect(page.locator('#breadcrumb')).to_have_text('Chat')
+            assert await page.title() == f'{agent_name} · Chat'
+            await expect(page.get_by_role('button', name='Reset context')).to_be_visible()
+            # The draft survives a trip to Now and back, and any chat sub-path opens the chat.
+            await page.goto(url + '/#now')
+            await expect(page.locator('#now-content')).to_be_visible()
+            await expect(page.locator('#breadcrumb')).to_have_text('Now')
+            await page.goto(url + '/#chat/anything')
+            await expect(area).to_have_value('Preserve this draft')
+            await page.goto(url + '/#chat')
             await expect(area).to_have_value('Preserve this draft')
 
             # No sign-in is needed; offline launches keep drafts.
@@ -147,7 +152,7 @@ async def main():
             # force a reload in the other while the user is typing there.
             other = await context.new_page()
             await other.goto(url + "/#chat")
-            await other.get_by_label("Message to General").fill("Other tab draft")
+            await other.get_by_label(composer).fill("Other tab draft")
             await area.fill("This tab draft")
             state["revision"] = 2
             await page.evaluate("async () => (await navigator.serviceWorker.getRegistration()).update()")
@@ -167,7 +172,7 @@ async def main():
             await page.locator("#reload-update").click()
             await expect(page.locator("#update-banner")).to_be_hidden()
             await expect(area).to_have_value("Saved before update")
-            await expect(other.get_by_label("Message to General")).to_have_value("Other tab draft")
+            await expect(other.get_by_label(composer)).to_have_value("Other tab draft")
             page.on("dialog", lambda dialog: dialog.accept())
             await page.get_by_role("button", name="Preferences", exact=True).click()
             await page.get_by_role("button", name="Clear local drafts", exact=True).click()
@@ -176,56 +181,60 @@ async def main():
             await expect(other.locator("#update-banner")).to_be_visible()
             await other.locator("#reload-update").click()
             await expect(other.locator("#update-banner")).to_be_hidden()
-            await expect(other.get_by_label("Message to General")).to_have_value("Other tab draft")
+            await expect(other.get_by_label(composer)).to_have_value("Other tab draft")
             assert await page.evaluate("() => document.documentElement.scrollWidth <= innerWidth")
 
             # A focused device showing the newest reply acknowledges it once;
-            # a device on another topic, or a hidden one, acknowledges nothing.
+            # a device on Now, or a hidden one, acknowledges nothing.
             assert seen == [], seen
             await other.close()
             reply = {"id": "r1", "space": "general", "role": "assistant", "text": "Done.", "status": "done",
                      "created": 1700000000.5, "source": "web", "delivery": "available", "generation": 0}
-            state["replies"]["general"] = [reply]
+            state["replies"] = [reply]
             await page.bring_to_front()
             await expect(page.locator(".message-assistant")).to_be_visible()
             await page.wait_for_function("() => document.querySelector('#chat-thread') && document.hasFocus()")
             await asyncio.sleep(3)
-            assert seen == [{"space": "general", "through": 1700000000.5}], seen
-            # Same device, other topic: General's newer reply is not acknowledged.
-            await page.goto(url + "/#chat/topic%3A10")
-            await expect(page.get_by_label("Message to Work")).to_be_visible()
-            state["replies"]["general"] = [reply, {**reply, "id": "r2", "created": 1700000001.5}]
+            assert seen == [{"through": 1700000000.5}], seen
+            # Same device on the Now page: the chat's newer reply is not acknowledged.
+            await page.goto(url + "/#now")
+            await expect(page.locator("#now-content")).to_be_visible()
+            state["replies"] = [reply, {**reply, "id": "r2", "created": 1700000001.5}]
             await asyncio.sleep(3)
-            assert seen == [{"space": "general", "through": 1700000000.5}], seen
-            # Back on General but unfocused (headless tabs cannot lose focus for real).
+            assert seen == [{"through": 1700000000.5}], seen
+            # Back on the chat but unfocused (headless tabs cannot lose focus for real).
             await page.goto(url + "/#chat")
             await page.evaluate("() => { document.hasFocus = () => false; }")
             await asyncio.sleep(3)
-            assert seen == [{"space": "general", "through": 1700000000.5}], seen
+            assert seen == [{"through": 1700000000.5}], seen
             await page.evaluate("() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); }")
             await asyncio.sleep(1)
-            assert seen == [{"space": "general", "through": 1700000000.5}, {"space": "general", "through": 1700000001.5}], seen
-            # A notification click: the worker names the channel and the page
-            # switches its own hash, keeping the General draft it never left.
+            assert seen == [{"through": 1700000000.5}, {"through": 1700000001.5}], seen
+            # A notification click: the worker asks for the chat and the page
+            # switches its own hash, keeping the draft it left on the composer.
             await page.evaluate("() => document.querySelector('#settings').close()")  # modal would trap focus
-            await page.get_by_label("Message to General").fill("half-written")
-            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_SPACE', space: 'topic:10'}}))")
-            await expect(page.get_by_label("Message to Work")).to_be_visible()
-            assert await page.evaluate("() => location.hash") == "#chat/topic%3A10"
-            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_SPACE', space: 'general'}}))")
-            await expect(page.get_by_label("Message to General")).to_have_value("half-written")
-            await page.get_by_label("Message to General").fill("")
+            await page.get_by_label(composer).fill("half-written")
+            await page.goto(url + "/#now")
+            await expect(page.locator("#now-content")).to_be_visible()
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_CHAT'}}))")
+            await expect(page.get_by_label(composer)).to_have_value("half-written")
+            assert await page.evaluate("() => location.hash") == "#chat"
+            # Already on the chat, the same message re-renders it without a hash change.
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_CHAT'}}))")
+            await expect(page.get_by_label(composer)).to_have_value("half-written")
+            assert await page.evaluate("() => location.hash") == "#chat"
+            await page.get_by_label(composer).fill("")
 
             # A message still being answered does not block the next one: it
             # queues behind it on the server, so Send stays enabled.
-            state["replies"]["general"].append({"id": "u9", "space": "general", "role": "user", "text": "First", "status": "queued",
-                                                "created": 1700000004.5, "source": "web", "generation": 1})
+            state["replies"].append({"id": "u9", "space": "general", "role": "user", "text": "First", "status": "queued",
+                                     "created": 1700000004.5, "source": "web", "generation": 1})
             await expect(page.locator(".message-status")).to_have_text("Queued…")
-            state["replies"]["general"][-1]["activity"] = "Searching the web…"
+            state["replies"][-1]["activity"] = "Searching the web…"
             await expect(page.locator(".message-status")).to_have_text("Searching the web…")
             await expect(page.get_by_role("button", name="Send message", exact=True)).to_be_enabled()
-            await expect(page.locator("#chat-status")).to_contain_text("Writing in General")
-            state["replies"]["general"].pop()
+            await expect(page.locator("#chat-status")).to_contain_text("Ready")
+            state["replies"].pop()
             await expect(page.locator(".message-status")).to_have_count(0)
 
             # The Home Screen badge follows the server's unread count.
@@ -237,9 +246,9 @@ async def main():
             # The composer starts one line tall and grows with the text.
             height = "() => document.querySelector('#chat-form textarea').offsetHeight"
             one_line = await page.evaluate(height)
-            await page.get_by_label("Message to General").fill("one\ntwo\nthree\nfour")
+            await page.get_by_label(composer).fill("one\ntwo\nthree\nfour")
             assert await page.evaluate(height) > one_line
-            await page.get_by_label("Message to General").fill("")
+            await page.get_by_label(composer).fill("")
             assert await page.evaluate(height) == one_line
 
             # Appearance: an explicit choice overrides the device scheme and
@@ -256,7 +265,7 @@ async def main():
             dark = await page.evaluate(background)
             assert dark != light, (dark, light)
             await page.reload()
-            await expect(page.get_by_label("Message to General")).to_be_visible()
+            await expect(page.get_by_label(composer)).to_be_visible()
             assert await page.evaluate(theme_attr) == "dark"
             assert await page.evaluate(background) == dark
             assert await page.evaluate("() => document.querySelector('meta[name=theme-color]').content") != "#eeeee7"
@@ -269,7 +278,7 @@ async def main():
             night = await browser.new_context(viewport={"width": 390, "height": 844}, color_scheme="dark")
             night_page = await night.new_page()
             await night_page.goto(url + "/#chat")
-            await expect(night_page.get_by_label("Message to General")).to_be_visible()
+            await expect(night_page.get_by_label(composer)).to_be_visible()
             assert await night_page.evaluate(theme_attr) is None
             assert await night_page.evaluate(background) == dark
             await night.close()
@@ -281,15 +290,15 @@ async def main():
             state["generation"] = 1
             await expect(page.locator(".context-divider")).to_have_count(1)
             assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "context-divider"
-            state["replies"]["general"].append({**reply, "id": "r3", "created": 1700000002.5, "generation": 1})
+            state["replies"].append({**reply, "id": "r3", "created": 1700000002.5, "generation": 1})
             await expect(page.locator(".message-assistant")).to_have_count(3)
             await expect(page.locator(".context-divider")).to_have_count(1)
             assert await page.evaluate("() => document.querySelector('.context-divider').nextElementSibling.textContent.includes('Done.')")
             assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "message message-assistant"
             # A message the assistant started, such as a reminder, answers no
-            # request, so it carries no channel chip; replies keep theirs.
+            # request, so it carries no source chip; replies keep theirs.
             assert await page.locator(".message-meta span").count() == 0
-            state["replies"]["general"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
+            state["replies"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
             await expect(page.locator(".message-meta span")).to_have_count(1)
             await expect(page.locator(".message-meta span")).to_have_text("Web")
             # Blurring the composer restores its inset and shrinks the thread;
@@ -299,31 +308,31 @@ async def main():
             # up an inset above the end, which is what the ResizeObserver fixes.
             await page.add_style_tag(content=":root{--navigation-safe-area:34px}")  # lost on the reloads above
             await page.evaluate("() => document.querySelector('#settings').close()")  # modal would trap focus
-            state["replies"]["general"].extend({**reply, "id": f"r{i}", "created": 1700000010 + i, "generation": 1, "text": "Filler line " * 12} for i in range(10, 40))
+            state["replies"].extend({**reply, "id": f"r{i}", "created": 1700000010 + i, "generation": 1, "text": "Filler line " * 12} for i in range(10, 40))
             await expect(page.locator(".message-assistant")).to_have_count(34)
             gap = "() => { const t = document.querySelector('#chat-thread'); return t.scrollHeight - t.scrollTop - t.clientHeight; }"
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollHeight > document.querySelector('#chat-thread').clientHeight * 2")
             await page.evaluate("() => { const t = document.querySelector('#chat-thread'); t.scrollTop = t.scrollHeight; }")
-            await page.get_by_label("Message to General").focus()
+            await page.get_by_label(composer).focus()
             await page.wait_for_function("() => document.querySelector('#chat-thread').scrollHeight - document.querySelector('#chat-thread').scrollTop - document.querySelector('#chat-thread').clientHeight < 1")
-            await page.get_by_label("Message to General").blur()
+            await page.get_by_label(composer).blur()
             await page.wait_for_function(f"() => ({gap})() < 1")
             await page.evaluate("() => { document.querySelector('#chat-thread').scrollTop = 0; }")
-            await page.get_by_label("Message to General").focus()
-            await page.get_by_label("Message to General").blur()
+            await page.get_by_label(composer).focus()
+            await page.get_by_label(composer).blur()
             await asyncio.sleep(0.5)
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 0
             # Growing the composer by several lines moves neither an end-anchored
             # thread nor one the reader scrolled up in.
-            await page.get_by_label("Message to General").fill("")
+            await page.get_by_label(composer).fill("")
             await page.evaluate("() => { const t = document.querySelector('#chat-thread'); t.scrollTop = t.scrollHeight; }")
-            await page.get_by_label("Message to General").fill("one\ntwo\nthree\nfour\nfive")
+            await page.get_by_label(composer).fill("one\ntwo\nthree\nfour\nfive")
             assert await page.evaluate(f"() => ({gap})()") < 1
-            await page.get_by_label("Message to General").fill("")
+            await page.get_by_label(composer).fill("")
             await page.evaluate("() => { document.querySelector('#chat-thread').scrollTop = 120; }")
-            await page.get_by_label("Message to General").fill("one\ntwo\nthree\nfour\nfive")
+            await page.get_by_label(composer).fill("one\ntwo\nthree\nfour\nfive")
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 120
-            await page.get_by_label("Message to General").fill("")
+            await page.get_by_label(composer).fill("")
             # Images: a pasted screenshot becomes a pending thumbnail, is
             # uploaded on send, and the stored path rides on the message.
             assert await page.locator("#record-voice").is_hidden()  # no transcriber configured
@@ -347,9 +356,10 @@ async def main():
             await expect(area).to_have_value("")
             assert len(uploads) == 1 and uploads[0][0] == "image/jpeg" and uploads[0][1][:3] == b"\xff\xd8\xff", uploads[0][0]
             assert submissions[-1]["text"] == "What is this?" and submissions[-1]["attachments"] == ["attachments/2026-09-15-000001.png"]
-            state["replies"]["general"].append({"id": "u9", "space": "general", "role": "user", "text": "What is this?", "status": "done",
-                                                "created": 1700000100, "source": "web", "generation": 1,
-                                                "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png"]})})
+            assert all("space" not in s for s in submissions), submissions
+            state["replies"].append({"id": "u9", "space": "general", "role": "user", "text": "What is this?", "status": "done",
+                                     "created": 1700000100, "source": "web", "generation": 1,
+                                     "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png"]})})
             await expect(page.locator(".message-user .message-images img")).to_have_count(1)
             assert await page.locator(".message-user .message-images a").get_attribute("href") == "/api/attachment?path=attachments%2F2026-09-15-000001.png"
             state["voice"] = True
@@ -359,7 +369,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, reset dividers, pasted images, voice button.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, notification click to chat, reset dividers, pasted images, voice button.")
     finally:
         release.set()
         await runner.cleanup()

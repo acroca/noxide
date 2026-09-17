@@ -6,7 +6,7 @@ import test from 'node:test';
 const worker = readFileSync(new URL('../src/assistant/pwa/sw.js', import.meta.url), 'utf8')
   .replace('"__AGENT_NAME__"', JSON.stringify('Juniper'));
 
-test('push displays the channel name and reply, retaining topic navigation', async () => {
+test('push displays the agent name and reply and sets the badge', async () => {
   const handlers = {};
   let notification, badge;
   vm.runInNewContext(worker, {
@@ -18,22 +18,24 @@ test('push displays the channel name and reply, retaining topic navigation', asy
   });
   let pending;
   handlers.push({
-    data: { json: () => ({ space: 'topic:10', body: 'Hello there! This is the test reminder', agent_name: 'Cedar', channel_name: 'Health', unread: 3 }) },
+    data: { json: () => ({ body: 'Hello there! This is the test reminder', agent_name: 'Cedar', unread: 3 }) },
     waitUntil: promise => { pending = promise; },
   });
   await pending;
-  assert.equal(notification.title, 'Health');
+  assert.equal(notification.title, 'Cedar');
   assert.equal(notification.body, 'Hello there! This is the test reminder');
-  assert.equal(notification.data.space, 'topic:10');
+  // One chat: the click needs no channel, so the notification carries no data.
+  assert.equal(notification.data, undefined);
   assert.equal(badge, 3);
   badge = undefined;
 
   // Previously queued pushes have no body; malformed pushes still display safely.
-  for (const data of [{ json: () => ({ space: 'general' }) }, { json: () => { throw Error('bad JSON'); } }]) {
+  for (const data of [{ json: () => ({}) }, { json: () => { throw Error('bad JSON'); } }]) {
     handlers.push({ data, waitUntil: promise => { pending = promise; } });
     await pending;
-    assert.equal(notification.title, 'General');
+    assert.equal(notification.title, 'Juniper');
     assert.equal(notification.body, 'You have a new update. Open Juniper to read it.');
+    assert.equal(notification.data, undefined);
     assert.equal(badge, undefined);
   }
 });
@@ -99,42 +101,37 @@ function fakeClient(url, {focus} = {}) {
   return client;
 }
 
-async function click(handlers, data) {
+async function click(handlers) {
   let pending, closed = 0;
-  handlers.notificationclick({notification: {data, close: () => { closed++; }}, waitUntil: promise => { pending = promise; }});
+  handlers.notificationclick({notification: {close: () => { closed++; }}, waitUntil: promise => { pending = promise; }});
   await pending;
   return closed;
 }
 
-test('notification click focuses the open app and tells it which channel to show', async () => {
+test('notification click focuses the open app and asks it for the chat', async () => {
   // The page switches its own hash: a full navigation would drop an open draft
   // and WindowClient.navigate() rejects for clients this worker does not control.
   const foreign = fakeClient('https://other.test/');
-  const app = fakeClient('https://nox.test/#chat');
+  const app = fakeClient('https://nox.test/#now');
   const {handlers, opened} = loadClickWorker([foreign, app]);
-  assert.equal(await click(handlers, {space: 'topic:10'}), 1);
+  assert.equal(await click(handlers), 1);
   assert.equal(app.focused, 1);
-  assert.deepEqual(app.messages, [{type: 'OPEN_SPACE', space: 'topic:10'}]);
+  assert.deepEqual(app.messages, [{type: 'OPEN_CHAT'}]);
   assert.equal(foreign.focused, 0);
   assert.deepEqual(foreign.messages, []);
   assert.deepEqual(opened, []);
 });
 
-test('notification click opens a window on the channel when the app is closed', async () => {
+test('notification click opens a window on the chat when the app is closed', async () => {
   const {handlers, opened} = loadClickWorker([]);
-  await click(handlers, {space: 'topic:10'});
-  assert.deepEqual(opened, ['https://nox.test/#chat/topic%3A10']);
+  assert.equal(await click(handlers), 1);
+  assert.deepEqual(opened, ['https://nox.test/#chat']);
 });
 
 test('notification click falls back to a new window when the open app cannot be focused', async () => {
   const app = fakeClient('https://nox.test/#chat', {focus: async () => { throw new TypeError('not allowed'); }});
   const {handlers, opened} = loadClickWorker([app]);
-  await click(handlers, {space: 'general'});
-  assert.deepEqual(opened, ['https://nox.test/#chat/general']);
-});
-
-test('notification click without channel data still opens General', async () => {
-  const {handlers, opened} = loadClickWorker([]);
-  await click(handlers, undefined);
-  assert.deepEqual(opened, ['https://nox.test/#chat/general']);
+  await click(handlers);
+  assert.deepEqual(app.messages, []);
+  assert.deepEqual(opened, ['https://nox.test/#chat']);
 });

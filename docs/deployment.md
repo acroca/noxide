@@ -120,22 +120,17 @@ Next: set up your vault — see [vault.md](vault.md#starting-a-vault).
 ### Web companion (PWA)
 
 The companion runs beside Telegram in the same Python process. Chat is the
-home screen and opens General by default. Its topic switcher reads
-`system/topics/index.md`, using the same topic names and instructions as your
-Telegram rooms. The pinned home chat and web topics share their conversation
-archive, model context (five completed exchanges by default) and per-topic run lock. Other Telegram
-chats remain isolated. Now is a read-only,
+home screen: one conversation, the same one as the pinned Telegram home chat,
+sharing its archive, model context (five completed exchanges by default) and
+run lock. Other Telegram chats remain isolated. Now is a read-only,
 plain-text display of `wiki/now.md`, preserving all sections and Markdown as
 written. Opening Now never calls the model. There are no dashboard cards,
 project navigation, or task/reminder buttons; make changes through chat.
-Saved conversations from the earlier project-based PWA appear under
-"Previous web chats" while their referenced project/area page remains available.
-They are not merged into other topics; a removed page can hide its old chat
-from the switcher without deleting the archived text.
+Conversations from the earlier project-based and topic-based web chats stay in
+the archive under their old keys; they are no longer listed and are not merged.
 
 On desktop, Enter sends and Shift+Enter inserts a newline. On touch-first mobile
-devices, Return inserts a newline and the adjacent send button submits. The
-topic picker is a button opening a list, not another native input field. Bottom
+devices, Return inserts a newline and the adjacent send button submits. Bottom
 safe-area padding is reduced while the composer is focused; iOS's own keyboard
 accessory toolbar is outside the PWA's control.
 
@@ -191,21 +186,17 @@ notifications explicitly. Push uses persisted device subscriptions and an
 automatically generated VAPID key; keep `state_dir/webpush.pem` backed up.
 The supported push hosts are Chrome/FCM, Firefox, Apple and Windows browser
 push services. Unsupported endpoints are rejected, and redirects are disabled.
-Notifications use the **channel name** (General or the topic name) as their title
-and include the reply or reminder text (up
-to 500 characters). Content can appear on your lock screen; control previews
+Notifications use the instance name as their title and include the reply or
+reminder text (up to 500 characters). Content can appear on your lock screen; control previews
 in your device notification settings. Ordinary Telegram replies still notify
 only through Telegram. A reply or reminder waits five seconds before any push
 goes out; if a focused device is showing that conversation scrolled to the end
-by then, no device is notified. Being open on another topic, unfocused, or
-scrolled up reading older messages does not count, and a device that starts
-showing the reply after the window still gets the push. Opening
-one goes to the corresponding conversation. Delivery depends on the OS,
-browser permissions and network; Telegram remains the primary reminder
-delivery channel in this first version, with successful agent-originated
-Telegram sends archived under their original topic key. Known topics show that
-delivery in the matching web chat. An unknown-topic push opens General as a
-fallback, but does not create an archived copy of the message in General.
+by then, no device is notified. Being on the Now tab, unfocused, or scrolled up
+reading older messages does not count, and a device that starts showing the
+reply after the window still gets the push. Opening one opens the chat.
+Delivery depends on the OS, browser permissions and network; Telegram remains
+the primary reminder delivery channel, and successful agent-originated Telegram
+sends are archived and shown in the web chat too.
 
 **Disconnects and restarts.** The shell is available offline, but API responses
 and vault pages are never put in the service-worker cache. Drafts stay in local

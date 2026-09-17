@@ -400,7 +400,6 @@ def test_capability_sections_track_wired_features(vault: VaultTools) -> None:
     assert "Time-based requests" not in bare
     assert "Proactive follow-up" not in bare
     assert "Web research" not in bare
-    assert "Multi-room topics" not in bare
 
     assert "Extracting attachment contents" not in bare
 
@@ -408,23 +407,12 @@ def test_capability_sections_track_wired_features(vault: VaultTools) -> None:
         vault_tools=vault,
         schedule_dispatcher=lambda name, args: "",
         research_fn=AsyncMock(),
-        create_forum_topic_fn=AsyncMock(),
         extract_fn=AsyncMock(),
     )._load_system_prompt()
     assert "Time-based requests" in full
     assert "Proactive follow-up" in full
     assert "Web research" in full
-    assert "Multi-room topics" in full
     assert "Extracting attachment contents" in full
-
-
-def test_topic_prompt_comes_after_vault_prompt(vault: VaultTools) -> None:
-    vault.write_file("AGENTS.md", "vault-level conventions marker")
-    vault.write_file("system/topics/finance/AGENTS.md", "finance-topic marker")
-
-    prompt = Agent(vault_tools=vault)._load_system_prompt(topic_slug="finance")
-
-    assert prompt.index("vault-level conventions marker") < prompt.index("finance-topic marker")
 
 
 # ------------------------------------------------------------------
@@ -456,18 +444,13 @@ def test_skills_rules_section_only_present_when_library_wired(
     assert "load_skill" in wired
 
 
-def test_skills_menu_comes_after_vault_and_topic_prompts(
-    vault: VaultTools, tmp_path: Path
-) -> None:
+def test_skills_menu_comes_after_vault_prompt(vault: VaultTools, tmp_path: Path) -> None:
     vault.write_file("AGENTS.md", "vault-level conventions marker")
-    vault.write_file("system/topics/finance/AGENTS.md", "finance-topic marker")
     _write_skill(tmp_path, "weekly-review", "asked for the weekly review.")
 
-    prompt = Agent(vault_tools=vault, skills=_library(tmp_path))._load_system_prompt(
-        topic_slug="finance"
-    )
+    prompt = Agent(vault_tools=vault, skills=_library(tmp_path))._load_system_prompt()
 
-    assert prompt.index("finance-topic marker") < prompt.index("## Available skills")
+    assert prompt.index("vault-level conventions marker") < prompt.index("## Available skills")
     assert prompt.rstrip().endswith("- `weekly-review` — asked for the weekly review.")
 
 
@@ -565,27 +548,27 @@ async def test_agent_clear_history_forgets_previous_messages(agent: Agent) -> No
 
 
 @pytest.mark.asyncio
-async def test_agent_clear_history_only_clears_given_thread(agent: Agent) -> None:
-    """clear_history for one forum topic leaves other topics' histories intact."""
+async def test_agent_clear_history_only_clears_given_chat(agent: Agent) -> None:
+    """clear_history for one chat leaves other chats' histories intact."""
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response("OK"))
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="Topic A message", thread_id=100)
-        await agent.run(chat_id=1, user_message="Topic B message", thread_id=200)
-        agent.clear_history(chat_id=1, thread_id=100)
-        await agent.run(chat_id=1, user_message="Another topic A", thread_id=100)
-        await agent.run(chat_id=1, user_message="Another topic B", thread_id=200)
+        await agent.run(chat_id=1, user_message="Chat A message")
+        await agent.run(chat_id=2, user_message="Chat B message")
+        agent.clear_history(chat_id=1)
+        await agent.run(chat_id=1, user_message="Another chat A")
+        await agent.run(chat_id=2, user_message="Another chat B")
 
-    # Topic A was cleared: its latest run must not contain the first A message
-    topic_a_messages = mock_client.chat.call_args_list[2][0][0]
-    a_contents = [m["content"] for m in topic_a_messages if m.get("role") == "user"]
-    assert not any("Topic A message" in c for c in a_contents)
+    # Chat A was cleared: its latest run must not contain the first A message
+    chat_a_messages = mock_client.chat.call_args_list[2][0][0]
+    a_contents = [m["content"] for m in chat_a_messages if m.get("role") == "user"]
+    assert not any("Chat A message" in c for c in a_contents)
 
-    # Topic B was untouched: its history survives
-    topic_b_messages = mock_client.chat.call_args_list[3][0][0]
-    b_contents = [m["content"] for m in topic_b_messages if m.get("role") == "user"]
-    assert any("Topic B message" in c for c in b_contents)
+    # Chat B was untouched: its history survives
+    chat_b_messages = mock_client.chat.call_args_list[3][0][0]
+    b_contents = [m["content"] for m in chat_b_messages if m.get("role") == "user"]
+    assert any("Chat B message" in c for c in b_contents)
 
 
 @pytest.mark.asyncio
@@ -783,233 +766,30 @@ async def test_agent_max_iterations(agent: Agent, vault: VaultTools) -> None:
 
 
 # ------------------------------------------------------------------
-# Forum topic support
+# send_message tool
 # ------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_agent_separate_histories_per_thread(vault: VaultTools) -> None:
-    """Messages in different forum topics keep separate histories."""
-    agent = Agent(vault_tools=vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(return_value=_make_text_response("OK"))
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="Topic A message", thread_id=100)
-        await agent.run(chat_id=1, user_message="Topic B message", thread_id=200)
-        await agent.run(chat_id=1, user_message="Another topic A", thread_id=100)
-
-    # Last call was thread_id=100; its history should NOT contain Topic B message
-    last_call_messages = mock_client.chat.call_args_list[2][0][0]
-    user_messages = [m for m in last_call_messages if m.get("role") == "user"]
-    contents = [m["content"] for m in user_messages]
-    assert any("Topic A message" in c for c in contents)
-    assert not any("Topic B message" in c for c in contents)
-
-
-@pytest.mark.asyncio
-async def test_agent_loads_topic_specific_prompt(vault: VaultTools) -> None:
-    """When a topic slug resolves, topic AGENTS.md is appended to the system prompt."""
-    # Write a topic-specific AGENTS.md
-    vault.write_file("system/topics/finance/AGENTS.md", "## Finance topic instructions\n")
-    # Write an index entry mapping thread_id 42 → slug 'finance'
-    vault.write_file(
-        "system/topics/index.md",
-        "# Topic Index\n\n| topic_id | slug | name |\n|----------|------|------|\n| 42 | finance | Finance |\n",
-    )
-
-    agent = Agent(vault_tools=vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(return_value=_make_text_response("OK"))
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="Hello", thread_id=42)
-
-    # The system prompt passed to client.chat should include the topic-specific instructions
-    first_call_messages = mock_client.chat.call_args_list[0][0][0]
-    system_msgs = [m for m in first_call_messages if m.get("role") == "system"]
-    assert any("Finance topic instructions" in m["content"] for m in system_msgs)
-
-
-@pytest.mark.asyncio
-async def test_agent_no_topic_prompt_when_no_thread_id(vault: VaultTools) -> None:
-    """Without a thread_id, only the global AGENTS.md is used."""
-    vault.write_file("system/topics/finance/AGENTS.md", "## Finance topic instructions\n")
-    vault.write_file(
-        "system/topics/index.md",
-        "# Topic Index\n\n| topic_id | slug | name |\n|----------|------|------|\n| 42 | finance | Finance |\n",
-    )
-
-    agent = Agent(vault_tools=vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(return_value=_make_text_response("OK"))
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="Hello")  # no thread_id
-
-    first_call_messages = mock_client.chat.call_args_list[0][0][0]
-    system_msgs = [m for m in first_call_messages if m.get("role") == "system"]
-    assert not any("Finance topic instructions" in m["content"] for m in system_msgs)
-
-
-@pytest.mark.asyncio
-async def test_agent_register_topic_creates_index(vault: VaultTools) -> None:
-    """_register_topic creates a new index.md if it doesn't exist."""
-    agent = Agent(vault_tools=vault)
-    agent._register_topic(123, "health-fitness", "Health & Fitness")
-    index = vault.read_file("system/topics/index.md")
-    assert "123" in index
-    assert "health-fitness" in index
-    assert "Health & Fitness" in index
-
-
-@pytest.mark.asyncio
-async def test_agent_register_topic_appends_to_existing_index(vault: VaultTools) -> None:
-    """_register_topic appends a new row to an existing index.md."""
-    vault.write_file(
-        "system/topics/index.md",
-        "# Topic Index\n\n| topic_id | slug | name |\n|----------|------|------|\n| 1 | first | First |\n",
-    )
-    agent = Agent(vault_tools=vault)
-    agent._register_topic(2, "second", "Second")
-    index = vault.read_file("system/topics/index.md")
-    assert "| 1 | first | First |" in index
-    assert "second" in index
-
-
-def test_agent_register_topic_escapes_pipes_and_preserves_backslashes(
-    vault: VaultTools,
-) -> None:
-    agent = Agent(vault_tools=vault)
-    name = r"Plans | C:\notes"
-
-    agent._register_topic(123, "plans-notes", name)
-
-    index = vault.read_file("system/topics/index.md")
-    data_rows = [line for line in index.splitlines() if line.startswith("| 123")]
-    assert len(data_rows) == 1
-    assert agent._resolve_topic_slug(123) == ("plans-notes", name)
-
-
-def test_agent_register_topic_refuses_multiline_name(vault: VaultTools) -> None:
-    agent = Agent(vault_tools=vault)
-
-    with pytest.raises(ValueError, match="single-line"):
-        agent._register_topic(123, "plans", "Plans\n| 999 | injected | row")
-
-    assert vault.read_file("system/topics/index.md").startswith("[file not found")
-
-
-def test_resolve_topic_slug_preserves_legacy_backslashes(vault: VaultTools) -> None:
-    vault.write_file(
-        "system/topics/index.md",
-        "# Topic Index\n\n"
-        "| topic_id | slug | name |\n"
-        "|----------|------|------|\n"
-        r"| 123 | plans | Plans C:\notes |" + "\n",
-    )
-
-    assert Agent(vault_tools=vault)._resolve_topic_slug(123) == (
-        "plans",
-        r"Plans C:\notes",
-    )
-
-
-async def test_create_forum_topic_rejects_multiline_name_before_api_call(
-    vault: VaultTools,
-) -> None:
-    create_fn = AsyncMock()
-    agent = Agent(vault_tools=vault, create_forum_topic_fn=create_fn)
-
-    result = await agent._dispatch_tool(
-        "create_forum_topic", {"name": "Plans\n| 999 | injected | row"}
-    )
-
-    assert result == "[tool error: topic name must be a single line]"
-    create_fn.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_agent_create_forum_topic_tool(vault: VaultTools) -> None:
-    """create_forum_topic tool creates vault dirs and registers topic."""
-    create_fn_mock = AsyncMock(return_value={"message_thread_id": 999, "name": "Recipes"})
-    agent = Agent(
-        vault_tools=vault,
-        create_forum_topic_fn=create_fn_mock,
-    )
-
-    responses = [
-        _make_tool_call_response("create_forum_topic", {"name": "Recipes"}),
-        _make_text_response("Topic 'Recipes' created!"),
-    ]
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=responses)
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        reply = await agent.run(chat_id=1, user_message="Create a recipes topic")
-
-    create_fn_mock.assert_called_once_with("Recipes")
-    assert "created" in reply.lower()
-
-    # Vault should have system/topics/recipes/AGENTS.md
-    topic_agents = vault.read_file("system/topics/recipes/AGENTS.md")
-    assert "Recipes" in topic_agents
-
-    # Index should be updated
-    index = vault.read_file("system/topics/index.md")
-    assert "999" in index
-    assert "recipes" in index
-
-
-@pytest.mark.asyncio
-async def test_agent_send_message_with_thread_id(vault: VaultTools) -> None:
-    """send_message tool passes message_thread_id to the send_message_fn."""
-    captured: list[tuple[str, int | None]] = []
-
-    async def mock_send(text: str, tid: int | None = None) -> None:
-        captured.append((text, tid))
-
+async def test_agent_send_message_awaits_sender_with_text_only(vault: VaultTools) -> None:
+    """The send_message tool awaits the send_message_fn with the text alone;
+    the model gets no destination to pick."""
+    mock_send = AsyncMock(return_value=None)
     agent = Agent(vault_tools=vault, send_message_fn=mock_send)
+    schema = next(t for t in agent._all_tools() if t["function"]["name"] == "send_message")
+    assert list(schema["function"]["parameters"]["properties"]) == ["text"]
 
     responses = [
-        _make_tool_call_response("send_message", {"text": "Hello topic!", "message_thread_id": 42}),
+        _make_tool_call_response("send_message", {"text": "Hello there!"}),
         _make_text_response("Sent."),
     ]
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=responses)
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run(chat_id=1, user_message="Send hello to topic 42")
+        reply = await agent.run(chat_id=1, user_message="Send hello")
 
-    assert captured == [("Hello topic!", 42)]
-
-
-def test_resolve_topic_slug_found(vault: VaultTools) -> None:
-    vault.write_file(
-        "system/topics/index.md",
-        "# Topic Index\n\n| topic_id | slug | name |\n|----------|------|------|\n| 123 | health-fitness | Health & Fitness |\n",
-    )
-    agent = Agent(vault_tools=vault)
-    slug, name = agent._resolve_topic_slug(123)
-    assert slug == "health-fitness"
-    assert name == "Health & Fitness"
-
-
-def test_resolve_topic_slug_not_found(vault: VaultTools) -> None:
-    vault.write_file(
-        "system/topics/index.md",
-        "# Topic Index\n\n| topic_id | slug | name |\n|----------|------|------|\n| 123 | health-fitness | Health & Fitness |\n",
-    )
-    agent = Agent(vault_tools=vault)
-    slug, name = agent._resolve_topic_slug(999)
-    assert slug is None
-    assert name is None
-
-
-def test_resolve_topic_slug_no_index(vault: VaultTools) -> None:
-    agent = Agent(vault_tools=vault)
-    slug, name = agent._resolve_topic_slug(1)
-    assert slug is None
-    assert name is None
+    assert reply == "Sent."
+    mock_send.assert_awaited_once_with("Hello there!")
 
 
 # ------------------------------------------------------------------
@@ -1217,9 +997,9 @@ async def test_image_is_not_stored_in_history_for_later_runs(agent: Agent) -> No
 # Scheduled job runs (run_job)
 # ------------------------------------------------------------------
 
-def _job_agent(vault: VaultTools, captured: list[tuple[str, int | None]]) -> Agent:
-    async def mock_send(text: str, tid: int | None = None) -> None:
-        captured.append((text, tid))
+def _job_agent(vault: VaultTools, captured: list[str]) -> Agent:
+    async def mock_send(text: str) -> None:
+        captured.append(text)
 
     return Agent(vault_tools=vault, send_message_fn=mock_send)
 
@@ -1228,7 +1008,7 @@ def _job_agent(vault: VaultTools, captured: list[tuple[str, int | None]]) -> Age
 async def test_run_job_drops_closing_text_after_send_message(vault: VaultTools) -> None:
     """The model delivers the reminder via send_message; its closing text
     ("mensaje enviado") must not become a second message."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     responses = [
@@ -1241,13 +1021,13 @@ async def test_run_job_drops_closing_text_after_send_message(vault: VaultTools) 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await agent.run_job("Remind the user to call the doctor")
 
-    assert captured == [("Reminder: call the doctor", None)]
+    assert captured == ["Reminder: call the doctor"]
 
 
 @pytest.mark.asyncio
 async def test_run_job_forwards_reply_when_model_sends_nothing(vault: VaultTools) -> None:
     """Safety net: a job that never calls send_message still delivers its reply."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1256,21 +1036,21 @@ async def test_run_job_forwards_reply_when_model_sends_nothing(vault: VaultTools
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await agent.run_job("Remind the user to call the doctor")
 
-    assert captured == [("Reminder: call the doctor", None)]
+    assert captured == ["Reminder: call the doctor"]
 
 
 @pytest.mark.asyncio
 async def test_run_job_forwards_reply_when_send_message_fails(vault: VaultTools) -> None:
     """A failed send_message doesn't count as delivered — the safety net fires."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     attempts = 0
 
-    async def flaky_send(text: str, tid: int | None = None) -> None:
+    async def flaky_send(text: str) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("telegram down")
-        captured.append((text, tid))
+        captured.append(text)
 
     agent = Agent(vault_tools=vault, send_message_fn=flaky_send)
 
@@ -1284,14 +1064,14 @@ async def test_run_job_forwards_reply_when_send_message_fails(vault: VaultTools)
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await agent.run_job("Remind the user to call the doctor")
 
-    assert captured == [("Could not deliver.", None)]
+    assert captured == ["Could not deliver."]
 
 
 @pytest.mark.asyncio
 async def test_run_job_stays_silent_on_silent_sentinel(vault: VaultTools) -> None:
     """A reminder that finds its purpose already met (routine logged, task
     closed) replies '[silent]' and nothing reaches the user."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1308,7 +1088,7 @@ async def test_run_job_stays_silent_on_silent_sentinel(vault: VaultTools) -> Non
 @pytest.mark.asyncio
 async def test_run_job_sends_nothing_for_empty_reply(vault: VaultTools) -> None:
     """No send_message call and an empty final reply → no message at all."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1332,7 +1112,7 @@ _NOTE_RX = re.compile(
 def _mirror_agent(vault: VaultTools, deliver_to: int | None = 7) -> Agent:
     """Agent whose send fn reports delivering to chat ``deliver_to``."""
 
-    async def send(text: str, thread_id: int | None = None) -> int | None:
+    async def send(text: str) -> int | None:
         return deliver_to
 
     return Agent(vault_tools=vault, send_message_fn=send)
@@ -1375,29 +1155,27 @@ async def test_scheduled_send_is_mirrored_before_next_user_message(vault: VaultT
 
 
 @pytest.mark.asyncio
-async def test_mirrored_note_lands_only_in_target_thread(vault: VaultTools) -> None:
-    """A delivery into a forum topic is mirrored into that topic's
-    conversation, not the general one."""
-    agent = _mirror_agent(vault)
+async def test_mirrored_note_lands_only_in_target_chat(vault: VaultTools) -> None:
+    """A delivery is mirrored into the conversation of the chat it was
+    delivered to, not into any other chat."""
+    agent = _mirror_agent(vault, deliver_to=778)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=[
-        _make_tool_call_response(
-            "send_message", {"text": "Topic reminder", "message_thread_id": 42}
-        ),
+        _make_tool_call_response("send_message", {"text": "Chat reminder"}),
         _make_text_response('{"silent": false, "message": null}'),
-        _make_text_response("reply general"),
-        _make_text_response("reply topic"),
+        _make_text_response("reply other"),
+        _make_text_response("reply target"),
     ])
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind in the topic")
-        await agent.run(chat_id=7, user_message="Hi general")
-        general_messages = mock_client.chat.call_args[0][0]
-        await agent.run(chat_id=7, user_message="Hi topic", thread_id=42)
-        topic_messages = mock_client.chat.call_args[0][0]
+        await agent.run_job("Remind the user")
+        await agent.run(chat_id=777, user_message="Hi other")
+        other_messages = mock_client.chat.call_args[0][0]
+        await agent.run(chat_id=778, user_message="Hi target")
+        target_messages = mock_client.chat.call_args[0][0]
 
-    assert _mirror_notes(general_messages) == []
-    assert len(_mirror_notes(topic_messages)) == 1
+    assert _mirror_notes(other_messages) == []
+    assert len(_mirror_notes(target_messages)) == 1
 
 
 @pytest.mark.asyncio
@@ -1631,7 +1409,7 @@ def test_parse_job_close_rejects_wrong_types() -> None:
 
 @pytest.mark.asyncio
 async def test_run_job_json_close_silent_suppresses(vault: VaultTools) -> None:
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1648,7 +1426,7 @@ async def test_run_job_json_close_silent_suppresses(vault: VaultTools) -> None:
 @pytest.mark.asyncio
 async def test_run_job_json_close_delivers_message(vault: VaultTools) -> None:
     """The delivered text is the schema's message field, not the raw reply."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1659,7 +1437,7 @@ async def test_run_job_json_close_delivers_message(vault: VaultTools) -> None:
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await agent.run_job("Remind the user to take the pill")
 
-    assert captured == [("Toma la pastilla", None)]
+    assert captured == ["Toma la pastilla"]
 
 
 @pytest.mark.asyncio
@@ -1667,7 +1445,7 @@ async def test_run_job_json_close_message_dropped_after_send_message(
     vault: VaultTools,
 ) -> None:
     """A run that already delivered via send_message must not repeat itself."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     responses = [
@@ -1680,7 +1458,7 @@ async def test_run_job_json_close_message_dropped_after_send_message(
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await agent.run_job("Remind the user to take the pill")
 
-    assert captured == [("Toma la pastilla", None)]
+    assert captured == ["Toma la pastilla"]
 
 
 @pytest.mark.asyncio
@@ -1688,7 +1466,7 @@ async def test_run_job_sentinel_anywhere_suppresses(vault: VaultTools) -> None:
     """Legacy fallback: a misplaced [silent] still means stand down (the
     2026-07-29 bug: 'Ya está registrada (08:19). Reminder resuelto.\\n\\n[silent]'
     was delivered verbatim because only the prefix was checked)."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1707,7 +1485,7 @@ async def test_run_job_sentinel_anywhere_suppresses(vault: VaultTools) -> None:
 @pytest.mark.asyncio
 async def test_run_job_prefixes_scheduled_run_marker(vault: VaultTools) -> None:
     """The job prompt reaches the model tagged so the closing contract applies."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1726,7 +1504,7 @@ async def test_run_job_prefixes_scheduled_run_marker(vault: VaultTools) -> None:
 async def test_run_job_requests_job_close_response_format(vault: VaultTools) -> None:
     """Job runs ask the API for the schema; enforcement is a no-op today but
     activates by itself the day Copilot honors response_format."""
-    captured: list[tuple[str, int | None]] = []
+    captured: list[str] = []
     agent = _job_agent(vault, captured)
 
     mock_client = MagicMock()
@@ -1783,7 +1561,6 @@ async def test_run_records_usage_event(agent: Agent) -> None:
         "claude-sonnet-4.6",
         {"prompt_tokens": 10, "completion_tokens": 5},
         chat_id=42,
-        thread_id=None,
     )
 
 
@@ -1830,8 +1607,8 @@ async def test_agent_dispatches_load_skill(vault: VaultTools, tmp_path: Path) ->
 # ------------------------------------------------------------------
 
 async def test_same_conversation_runs_are_serialized(agent: Agent) -> None:
-    """Two runs for one (chat_id, thread_id) must never interleave: concurrent
-    appends into one history produce tool orderings the API rejects."""
+    """Two runs for one chat_id must never interleave: concurrent appends
+    into one history produce tool orderings the API rejects."""
     active = {"now": 0, "max": 0}
 
     async def chat(messages, tools, **kwargs):
@@ -1859,7 +1636,7 @@ async def test_same_conversation_runs_are_serialized(agent: Agent) -> None:
 
 
 async def test_different_conversations_run_in_parallel(agent: Agent) -> None:
-    """A long run in one topic must not block a message in another topic."""
+    """A long run in one chat must not block a message in another chat."""
     active = {"now": 0, "max": 0}
 
     async def chat(messages, tools, **kwargs):
@@ -1874,8 +1651,8 @@ async def test_different_conversations_run_in_parallel(agent: Agent) -> None:
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await asyncio.gather(
-            agent.run(chat_id=1, user_message="topic one", thread_id=11),
-            agent.run(chat_id=1, user_message="topic two", thread_id=22),
+            agent.run(chat_id=777, user_message="chat one"),
+            agent.run(chat_id=778, user_message="chat two"),
         )
 
     assert active["max"] == 2
@@ -2109,15 +1886,6 @@ async def test_turn_log_names_the_tools_called(
     assert any("read_file" in m for m in infos)
 
 
-def test_paths_touched_maps_forum_topic_writes() -> None:
-    from assistant.agent import _paths_touched
-
-    assert _paths_touched("create_forum_topic", {"name": "Health & Fitness"}) == {
-        "system/topics/health-fitness/AGENTS.md",
-        "system/topics/index.md",
-    }
-
-
 def test_paths_touched_maps_move_file_to_both_paths() -> None:
     """A move is a deletion at the source and an addition at the destination;
     the backup commit must stage both."""
@@ -2145,14 +1913,14 @@ def test_move_file_holds_the_backup_lock() -> None:
 async def test_retry_message_hot_resumes_pending_turn(agent: Agent) -> None:
     """The failed turn is still in history; replay appends only a resume note,
     never a second copy of the message (which could redo tool side effects)."""
-    history = agent._get_history(1, None)
+    history = agent._get_history(1)
     history.append({"role": "user", "content": "[2026-08-17 15:08 local] pastilla tomada"})
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response("Anotado."))
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await agent.retry_message(
-            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+            1, "pastilla tomada", "2026-08-17 15:08 local", hot=True
         )
 
     assert reply == "Anotado."
@@ -2166,7 +1934,7 @@ async def test_retry_message_hot_resumes_pending_turn(agent: Agent) -> None:
 async def test_retry_message_hot_resumes_after_tool_tail(agent: Agent) -> None:
     """A mid-run failure leaves history ending in tool results; the resume note
     lets the model continue instead of re-running the whole turn."""
-    history = agent._get_history(1, None)
+    history = agent._get_history(1)
     history.append({"role": "user", "content": "[2026-08-17 15:08 local] log my run"})
     history.append({
         "role": "assistant",
@@ -2183,7 +1951,7 @@ async def test_retry_message_hot_resumes_after_tool_tail(agent: Agent) -> None:
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await agent.retry_message(
-            1, None, "log my run", "2026-08-17 15:08 local", hot=True
+            1, "log my run", "2026-08-17 15:08 local", hot=True
         )
 
     assert reply == "Done."
@@ -2196,7 +1964,7 @@ async def test_retry_message_hot_resumes_after_tool_tail(agent: Agent) -> None:
 async def test_retry_message_hot_superseded_returns_none(agent: Agent) -> None:
     """A later successful run already answered this turn — replaying would
     double-process it."""
-    history = agent._get_history(1, None)
+    history = agent._get_history(1)
     history.append({"role": "user", "content": "[2026-08-17 15:08 local] pastilla tomada"})
     history.append({"role": "assistant", "content": "Anotado."})
     mock_client = MagicMock()
@@ -2204,7 +1972,7 @@ async def test_retry_message_hot_superseded_returns_none(agent: Agent) -> None:
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await agent.retry_message(
-            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+            1, "pastilla tomada", "2026-08-17 15:08 local", hot=True
         )
 
     assert reply is None
@@ -2219,7 +1987,7 @@ async def test_retry_message_hot_after_clear_returns_none(agent: Agent) -> None:
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await agent.retry_message(
-            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+            1, "pastilla tomada", "2026-08-17 15:08 local", hot=True
         )
 
     assert reply is None
@@ -2235,7 +2003,7 @@ async def test_retry_message_cold_replays_with_provenance(agent: Agent) -> None:
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await agent.retry_message(
-            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=False
+            1, "pastilla tomada", "2026-08-17 15:08 local", hot=False
         )
 
     assert reply == "Anotado."
@@ -2253,7 +2021,7 @@ async def test_retry_message_failed_attempts_leave_history_unchanged(agent: Agen
     accumulated notes evict the original failed turn from the deque."""
     from assistant.copilot import CopilotUnavailableError
 
-    history = agent._get_history(1, None)
+    history = agent._get_history(1)
     history.append({"role": "user", "content": "[2026-08-17 15:08 local] pastilla tomada"})
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=[
@@ -2266,11 +2034,11 @@ async def test_retry_message_failed_attempts_leave_history_unchanged(agent: Agen
         for _ in range(2):
             with pytest.raises(CopilotUnavailableError):
                 await agent.retry_message(
-                    1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+                    1, "pastilla tomada", "2026-08-17 15:08 local", hot=True
                 )
             assert len(history.messages()) == 1, "failed replay attempt left a note behind"
         reply = await agent.retry_message(
-            1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=True
+            1, "pastilla tomada", "2026-08-17 15:08 local", hot=True
         )
 
     assert reply == "Anotado."
@@ -2289,10 +2057,10 @@ async def test_retry_message_failed_cold_attempt_leaves_no_trace(agent: Agent) -
     with patch("assistant.copilot.get_client", return_value=mock_client):
         with pytest.raises(CopilotUnavailableError):
             await agent.retry_message(
-                1, None, "pastilla tomada", "2026-08-17 15:08 local", hot=False
+                1, "pastilla tomada", "2026-08-17 15:08 local", hot=False
             )
 
-    assert agent._get_history(1, None).messages() == []
+    assert agent._get_history(1).messages() == []
 
 
 @pytest.mark.parametrize("args", [None, [], 3, {"path": ["x.md"]}, {"path": {"bad": True}}])
@@ -2360,14 +2128,14 @@ async def test_hot_retries_keep_all_unanswered_messages_beyond_history_limit(vau
         before = agent._get_history(1).messages()
         for _ in range(3):
             with pytest.raises(CopilotUnavailableError):
-                await agent.retry_message(1, None, "pending-0", "earlier", hot=True)
+                await agent.retry_message(1, "pending-0", "earlier", hot=True)
             assert agent._get_history(1).messages() == before
         client.chat = AsyncMock(return_value=_make_text_response("handled all"))
-        assert await agent.retry_message(1, None, "pending-0", "earlier", hot=True) == "handled all"
+        assert await agent.retry_message(1, "pending-0", "earlier", hot=True) == "handled all"
         sent = client.chat.call_args.args[0]
         for n in range(6):
             assert any(f"pending-{n}" in str(m.get("content")) for m in sent)
-        assert await agent.retry_message(1, None, "pending-1", "earlier", hot=True) is None
+        assert await agent.retry_message(1, "pending-1", "earlier", hot=True) is None
 
 
 async def test_failed_retry_preserves_full_deque_and_partial_tool_output(vault: VaultTools) -> None:
@@ -2382,45 +2150,15 @@ async def test_failed_retry_preserves_full_deque_and_partial_tool_output(vault: 
     before = history.messages()
     with patch("assistant.copilot.get_client", return_value=client):
         with pytest.raises(CopilotUnavailableError):
-            await agent.retry_message(1, None, "old-0", "earlier", hot=True)
+            await agent.retry_message(1, "old-0", "earlier", hot=True)
         assert history.messages() == before
         history.append({"role": "assistant", "content": None, "tool_calls": [{"id": "c"}]})
         history.append({"role": "tool", "tool_call_id": "c", "content": "x" * 6000})
         with pytest.raises(CopilotUnavailableError):
-            await agent.retry_message(1, None, "old-0", "earlier", hot=True)
+            await agent.retry_message(1, "old-0", "earlier", hot=True)
         assert history.messages()[-1]["content"] == "x" * 6000
         agent.clear_history(1)
-        assert await agent.retry_message(1, None, "old-0", "earlier", hot=True) is None
-
-
-@pytest.mark.parametrize("existing", ["prompt", "index"])
-async def test_topic_slug_collision_refused_before_telegram(vault: VaultTools, existing: str) -> None:
-    create = AsyncMock()
-    agent = Agent(vault, create_forum_topic_fn=create)
-    if existing == "prompt":
-        vault.write_file("system/topics/health/AGENTS.md", "custom instructions")
-    else:
-        agent._register_topic(1, "health", "Health!")
-    result = await agent._dispatch_tool("create_forum_topic", {"name": "Health?"})
-    assert "already exists" in result
-    create.assert_not_awaited()
-    if existing == "prompt":
-        assert vault.read_file("system/topics/health/AGENTS.md") == "custom instructions"
-
-
-async def test_concurrent_topic_creation_cannot_share_slug(vault: VaultTools) -> None:
-    async def create(name):
-        await asyncio.sleep(0)
-        return {"message_thread_id": 1}
-
-    callback = AsyncMock(side_effect=create)
-    agent = Agent(vault, create_forum_topic_fn=callback)
-    results = await asyncio.gather(
-        agent._dispatch_tool("create_forum_topic", {"name": "Health!"}),
-        agent._dispatch_tool("create_forum_topic", {"name": "Health?"}),
-    )
-    callback.assert_awaited_once()
-    assert sum("already exists" in result for result in results) == 1
+        assert await agent.retry_message(1, "old-0", "earlier", hot=True) is None
 
 
 async def test_hot_retry_rechecks_superseding_after_waiting_for_run_lock(agent: Agent) -> None:
@@ -2442,7 +2180,7 @@ async def test_hot_retry_rechecks_superseding_after_waiting_for_run_lock(agent: 
         client.chat = AsyncMock(side_effect=reply)
         run = asyncio.create_task(agent.run(1, "followup"))
         await started.wait()
-        retry = asyncio.create_task(agent.retry_message(1, None, "pending", "earlier", hot=True))
+        retry = asyncio.create_task(agent.retry_message(1, "pending", "earlier", hot=True))
         await asyncio.sleep(0)
         finish.set()
         await run
@@ -2467,31 +2205,12 @@ async def test_partial_work_is_retained_across_outage_without_reexecution(vault:
     with patch("assistant.copilot.get_client", return_value=client):
         with pytest.raises(CopilotUnavailableError):
             await agent.run(1, "original task")
-        assert await agent.retry_message(1, None, "original task", "earlier", hot=True) == "done"
+        assert await agent.retry_message(1, "original task", "earlier", hot=True) == "done"
     recovery_messages = client.chat.call_args_list[3].args[0]
     assert any("original task" in str(m.get("content")) for m in recovery_messages)
     assert any("x" * 6000 in str(m.get("content")) for m in recovery_messages)
     assert vault.read_file("note.md") == "once twice"
     assert backup.commits[0][0] == {"note.md"}
-
-
-@pytest.mark.parametrize("name", ["???", "---"])
-async def test_topic_name_without_slug_is_rejected(vault: VaultTools, name: str) -> None:
-    create = AsyncMock()
-    agent = Agent(vault, create_forum_topic_fn=create)
-    assert "tool error" in await agent._dispatch_tool("create_forum_topic", {"name": name})
-    create.assert_not_awaited()
-
-
-async def test_topic_prompt_appearing_during_creation_is_not_overwritten(vault: VaultTools) -> None:
-    async def create(name):
-        vault.write_file("system/topics/health/AGENTS.md", "concurrent custom instructions")
-        return {"message_thread_id": 1}
-
-    agent = Agent(vault, create_forum_topic_fn=create)
-    await agent._dispatch_tool("create_forum_topic", {"name": "Health"})
-    assert vault.read_file("system/topics/health/AGENTS.md") == "concurrent custom instructions"
-    assert agent._resolve_topic_slug(1) == ("health", "Health")
 
 
 @pytest.mark.parametrize("error_kind", ["request", "http400"])
@@ -2527,7 +2246,7 @@ async def test_terminal_chat_error_preserves_failure_tail_and_allows_next_run_co
         assert history.messages()[-1]["role"] == "tool"
         assert "x" * 6000 in history.messages()[-1]["content"]
         if hot_retry:
-            reply = await agent.retry_message(1, None, "read both", "earlier", hot=True)
+            reply = await agent.retry_message(1, "read both", "earlier", hot=True)
         else:
             reply = await agent.run(1, "try again")
         assert reply == "recovered"  # not falsely superseded by the rejection
@@ -2569,7 +2288,7 @@ async def test_nonterminal_chat_end_preserves_unbounded_uncompacted_work(
         history = agent._get_history(1)
         assert len(history.messages()) == 5
         assert history._unfinished
-        assert await agent.retry_message(1, None, "original task", "earlier", hot=True) == "resumed"
+        assert await agent.retry_message(1, "original task", "earlier", hot=True) == "resumed"
     sent = client.chat.call_args.args[0]
     assert any("original task" in str(m.get("content")) for m in sent)
     outputs = [m["content"] for m in sent if m["role"] == "tool"]

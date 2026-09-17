@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from assistant.tools import VaultTools, _version_of, slug_from_name
+from assistant.tools import VaultTools, _version_of
 
 
 @pytest.fixture
@@ -308,41 +308,6 @@ def test_search_does_not_follow_symlink_outside_vault(
     (tmp_path / "linked.md").symlink_to(outside)
 
     assert vault.search("outside secret") == "[no matches]"
-
-
-# ------------------------------------------------------------------
-# slug_from_name
-# ------------------------------------------------------------------
-
-def test_slug_simple() -> None:
-    assert slug_from_name("Finance") == "finance"
-
-
-def test_slug_spaces_to_hyphens() -> None:
-    assert slug_from_name("Health Fitness") == "health-fitness"
-
-
-def test_slug_special_chars_removed() -> None:
-    assert slug_from_name("Health & Fitness") == "health-fitness"
-
-
-def test_slug_multiple_spaces() -> None:
-    assert slug_from_name("  Health   Fitness  ") == "health-fitness"
-
-
-def test_slug_numbers_preserved() -> None:
-    assert slug_from_name("Room 42") == "room-42"
-
-
-def test_slug_already_hyphenated() -> None:
-    assert slug_from_name("my-topic") == "my-topic"
-
-
-def test_slug_mixed() -> None:
-    result = slug_from_name("Q&A / Support")
-    assert result == "qa-support"
-    assert "&" not in result
-    assert "/" not in result
 
 
 # ------------------------------------------------------------------

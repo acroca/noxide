@@ -44,7 +44,7 @@ vault/
     areas/<slug>.md            ← ongoing life areas (health, family, hobbies…)
     people/<slug>.md           ← one page per recurring person
     archive/projects/<slug>.md ← finished or abandoned projects, out of the way
-  system/                      ← managed by the bot: schedule.md, topics/, skills/, usage.md
+  system/                      ← managed by the bot: schedule.md, skills/, usage.md
 ```
 
 ### Conventions
@@ -190,7 +190,7 @@ operation, not this automatic checkpointed startup path.
 ## Starting a vault
 
 `vault.template/` in the repo is a seed, not a working vault: an empty
-`AGENTS.md` skeleton and the topic index. Copy it to wherever you mounted
+`AGENTS.md` skeleton and an empty inbox. Copy it to wherever you mounted
 `/data/vault`:
 
 ```bash
@@ -274,25 +274,25 @@ excluded from the menu and logged.
 Ask the bot to write one and it will. It also refines a skill in place when
 following it reveals a missing step, which is the intended way they improve.
 
-## Rooms
+## One conversation, no rooms
 
-Turn the chat into a supergroup with Topics enabled and each forum topic
-becomes its own room: separate conversation history and an optional per-room
-prompt at `system/topics/<slug>/AGENTS.md`.
+There are no topics or channels to choose. You say what happened, as you
+would to a person, and the bot infers which project or area it concerns from
+the message, the recent conversation and the wiki index — asking one short
+question when a terse message could mean more than one open item. Standing
+directions for a subject (language, tone, what to record, whom to keep
+informed) live on that subject's page under `## Instructions`, where the bot
+reads them whenever the conversation touches it. Telegram forum topics used to
+be separate rooms with their own prompt; that was removed on 2026-09-17, and
+old room conversations stay in the archive under their old keys, neither shown
+nor merged.
 
-All rooms share **one** vault. The point is a single memory viewed from
-different angles, not parallel note trees. Journal entries from a room are
-prefixed with the slug (`- 09:30 [gaming] …`), and `system/topics/index.md` maps
-topic id ↔ slug ↔ name. Ask the bot to *"create a topic called Health"* and it
-makes the Telegram topic, the vault directories and the index entry in one go.
-
-Rooms run in parallel: a long-running request in one room does not hold up a
-message in another, while messages within one room stay strictly ordered.
-Writes to the shared vault are guarded against collisions — a full-file
-rewrite is accepted only if the file still matches what that conversation last
-read, and refused otherwise so the bot re-reads and redoes the change instead
-of overwriting someone else's. The same guard protects your own hand edits
-made while the bot is mid-conversation.
+Scheduled jobs still run in parallel with the conversation, and messages within
+the conversation stay strictly ordered. Writes to the vault are guarded against
+collisions — a full-file rewrite is accepted only if the file still matches what
+that run last read, and refused otherwise so the bot re-reads and redoes the
+change instead of overwriting someone else's. The same guard protects your own
+hand edits made while the bot is mid-conversation.
 
 ## Attachments
 

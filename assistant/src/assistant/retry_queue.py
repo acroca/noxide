@@ -40,7 +40,7 @@ QUEUE_FILENAME = "pending_runs.jsonl"
 _BACKOFF_INITIAL = 30.0
 _BACKOFF_MAX = 300.0
 
-# Replays a queued user message: (chat_id, thread_id, text, queued_at, hot).
+# Replays a queued user message: (chat_id, text, queued_at, hot).
 # Raises CopilotUnavailableError while the outage lasts.
 ReplayMessageFn = Callable[..., Awaitable[None]]
 # Replays a queued one-off job prompt (already carrying its catch-up prefix).
@@ -59,7 +59,6 @@ class PendingItem:
     text: str  # message text, or the job's raw prompt
     queued_at: str  # local stamp, e.g. "2026-08-17 15:08 local"
     chat_id: int | None = None
-    thread_id: int | None = None
     # In-memory only, never serialized: items reloaded from disk are cold.
     hot: bool = False
     message_id: str | None = None
@@ -68,7 +67,6 @@ class PendingItem:
         record = {"kind": self.kind, "text": self.text, "queued_at": self.queued_at}
         if self.kind == "message":
             record["chat_id"] = self.chat_id
-            record["thread_id"] = self.thread_id
             if self.message_id is not None:
                 record["message_id"] = self.message_id
         return json.dumps(record, ensure_ascii=False)
@@ -87,16 +85,14 @@ def _parse_item(line: str) -> PendingItem | None:
     if kind == "job":
         return PendingItem(kind="job", text=text, queued_at=queued_at)
     if kind == "message" and isinstance(record.get("chat_id"), int):
-        thread_id = record.get("thread_id")
-        if thread_id is None or isinstance(thread_id, int):
-            return PendingItem(
-                kind="message",
-                text=text,
-                queued_at=queued_at,
-                chat_id=record["chat_id"],
-                thread_id=thread_id,
-                message_id=record.get("message_id") if isinstance(record.get("message_id"), str) else None,
-            )
+        # Records from before topics were removed also carry a thread_id; it is ignored.
+        return PendingItem(
+            kind="message",
+            text=text,
+            queued_at=queued_at,
+            chat_id=record["chat_id"],
+            message_id=record.get("message_id") if isinstance(record.get("message_id"), str) else None,
+        )
     return None
 
 
@@ -128,7 +124,7 @@ class RetryQueue:
         migrated = deque()
         for item in self._items:
             if item.kind == "message" and item.message_id is None:
-                message_id = archive.insert(space_fn(item.chat_id, item.thread_id), "user", item.text,
+                message_id = archive.insert(space_fn(item.chat_id), "user", item.text,
                                             "unavailable", source="telegram")
                 item = replace(item, message_id=message_id)
             migrated.append(item)
@@ -138,22 +134,17 @@ class RetryQueue:
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def enqueue_message(self, chat_id: int, thread_id: int | None, text: str,
-                        message_id: str | None = None) -> None:
+    def enqueue_message(self, chat_id: int, text: str, message_id: str | None = None) -> None:
         item = PendingItem(
             kind="message",
             text=text,
             queued_at=self._local_stamp(),
             chat_id=chat_id,
-            thread_id=thread_id,
             hot=True,
             message_id=message_id,
         )
         self._append(item)
-        logger.info(
-            "Queued message for retry (chat_id=%d thread_id=%s, %d pending)",
-            chat_id, thread_id, len(self._items),
-        )
+        logger.info("Queued message for retry (chat_id=%d, %d pending)", chat_id, len(self._items))
 
     def enqueue_job(self, prompt: str) -> None:
         item = PendingItem(kind="job", text=prompt, queued_at=self._local_stamp(), hot=True)
@@ -199,7 +190,6 @@ class RetryQueue:
         if item.kind == "message":
             await self._replay_message_fn(
                 chat_id=item.chat_id,
-                thread_id=item.thread_id,
                 text=item.text,
                 queued_at=item.queued_at,
                 hot=item.hot,

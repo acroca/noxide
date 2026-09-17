@@ -123,22 +123,21 @@ async def _run(config_path: Path | None) -> None:
     from .retry_queue import PendingItem, RetryQueue
 
     async def replay_message(
-        chat_id: int, thread_id: int | None, text: str, queued_at: str, hot: bool,
-        message_id: str | None = None,
+        chat_id: int, text: str, queued_at: str, hot: bool, message_id: str | None = None,
     ) -> None:
         context_chat = chat_id
         if message_id and (record := archive.get(message_id)) is not None:
             from .conversations import WEB_CHAT_ID
 
-            if record["space"] == "general" or record["space"].startswith("topic:"):
+            if record["space"] == "general":
                 context_chat = WEB_CHAT_ID
-        reply = await agent.retry_message(context_chat, thread_id, text, queued_at, hot=hot,
+        reply = await agent.retry_message(context_chat, text, queued_at, hot=hot,
                                           **({"message_id": message_id} if message_id else {}))
         if reply is None:
             return  # superseded — correctly silent
         _require_completed(reply)
         try:
-            target = await bot.send_message(reply or "(no reply)", thread_id, chat_id=chat_id)
+            target = await bot.send_message(reply or "(no reply)", chat_id=chat_id)
             if message_id:
                 archive.delivery(message_id, "delivered" if target is not None else "failed")
         except Exception:
@@ -157,7 +156,6 @@ async def _run(config_path: Path | None) -> None:
             await bot.send_message(
                 f"Sorry — I couldn't process your message from {item.queued_at} "
                 f"even after Copilot came back: {exc}",
-                item.thread_id,
                 chat_id=item.chat_id,
             )
         else:
@@ -237,15 +235,15 @@ async def _run(config_path: Path | None) -> None:
 
     companion = None
 
-    async def send_message(text: str, thread_id: int | None = None) -> int | None:
-        target = await bot.send_message(text, thread_id)
+    async def send_message(text: str) -> int | None:
+        target = await bot.send_message(text)
         if target is not None:
-            archive.insert(agent.conversation_space(target, thread_id), "assistant", text, "done",
+            archive.insert(agent.conversation_space(target), "assistant", text, "done",
                            source="telegram", delivery="delivered")
-            agent._queue_sent_note(target, thread_id, text)
+            agent._queue_sent_note(target, text)
         if companion is not None and target is not None:
             try:
-                await companion.observe_delivery(text, thread_id)
+                await companion.observe_delivery(text)
             except Exception:
                 logging.getLogger(__name__).exception("Could not mirror delivery into web companion")
         return target
@@ -256,7 +254,6 @@ async def _run(config_path: Path | None) -> None:
         schedule_dispatcher=scheduler.dispatch,
         schedule_schemas=scheduler.tool_schemas(),
         send_message_fn=send_message,
-        create_forum_topic_fn=bot.create_forum_topic,
         research_fn=researcher.research if researcher else None,
         extract_fn=extractor.extract,
         fan_out_fn=fan_out.run,
@@ -273,7 +270,7 @@ async def _run(config_path: Path | None) -> None:
     if cfg.pwa_enabled:
         from .companion import Companion
 
-        companion = Companion(cfg, agent, vault, scheduler, archive=archive, transcriber=transcriber)
+        companion = Companion(cfg, agent, vault, archive=archive, transcriber=transcriber)
 
     usage_task = asyncio.create_task(tracker.run())
     lifecycle = Lifecycle()

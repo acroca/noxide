@@ -85,7 +85,7 @@ def _update(
     video: MagicMock | None = None,
     reply_to: MagicMock | None = None,
     quote: MagicMock | None = None,
-    thread_id: int | None = None,
+    chat_id: int = 777,
 ) -> tuple[MagicMock, MagicMock]:
     msg = MagicMock()
     msg.message_id = next(_message_ids)
@@ -96,8 +96,7 @@ def _update(
     msg.caption = caption
     msg.document = document
     msg.video = video
-    msg.chat_id = 777
-    msg.message_thread_id = thread_id
+    msg.chat_id = chat_id
     msg.migrate_to_chat_id = None
     msg.migrate_from_chat_id = None
     msg.reply_to_message = reply_to
@@ -132,7 +131,7 @@ async def test_text_message_runs_agent_and_replies() -> None:
 
     await _handle(bot, ctx, update)
 
-    agent.run.assert_awaited_once_with(777, "remind me tomorrow", thread_id=None, on_research=ANY)
+    agent.run.assert_awaited_once_with(777, "remind me tomorrow", on_research=ANY)
     assert _replies(update.message) == ["agent reply"]
 
 
@@ -162,7 +161,7 @@ async def test_burst_runs_agent_once_and_replies_to_the_last_message() -> None:
 
     agent.run.assert_awaited_once_with(
         777, telegram_bot._combine_batch(["first", "second", "third"]),
-        thread_id=None, on_research=ANY,
+        on_research=ANY,
     )
     assert _replies(third.message) == ["agent reply"]
     first.message.reply_text.assert_not_called()
@@ -190,7 +189,6 @@ async def test_burst_keeps_reply_context_with_its_own_message() -> None:
     bot, agent = _bot()
     quoted = MagicMock()
     quoted.text = "the plan"
-    quoted.forum_topic_created = None
     first, ctx = _update(text="first")
     second, _ = _update(text="second", reply_to=quoted, quote=None)
 
@@ -201,18 +199,18 @@ async def test_burst_keeps_reply_context_with_its_own_message() -> None:
     assert user_message.startswith("[2 messages sent together]\n\nfirst")
 
 
-async def test_messages_in_different_topics_do_not_batch() -> None:
+async def test_messages_in_different_chats_do_not_batch() -> None:
     bot, agent = _bot()
-    general, ctx = _update(text="general")
-    topic, _ = _update(text="topic", thread_id=5)
+    home, ctx = _update(text="home")
+    other, _ = _update(text="other", chat_id=778)
 
-    await _handle(bot, ctx, general, topic)
+    await _handle(bot, ctx, home, other)
 
     assert agent.run.await_count == 2
-    texts = sorted(c.args[1] for c in agent.run.await_args_list)
-    assert texts == ["general", "topic"]
-    assert _replies(general.message) == ["agent reply"]
-    assert _replies(topic.message) == ["agent reply"]
+    runs = sorted((c.args[0], c.args[1]) for c in agent.run.await_args_list)
+    assert runs == [(777, "home"), (778, "other")]
+    assert _replies(home.message) == ["agent reply"]
+    assert _replies(other.message) == ["agent reply"]
 
 
 async def test_messages_after_the_window_start_a_new_batch() -> None:
@@ -254,7 +252,7 @@ async def test_burst_outage_queues_the_combined_message_once() -> None:
 
     await _handle(bot, ctx, first, second)
 
-    queue_fn.assert_called_once_with(777, None, telegram_bot._combine_batch(["first", "second"]))
+    queue_fn.assert_called_once_with(777, telegram_bot._combine_batch(["first", "second"]))
     assert len(_replies(second.message)) == 1
     first.message.reply_text.assert_not_called()
 
@@ -262,7 +260,7 @@ async def test_burst_outage_queues_the_combined_message_once() -> None:
 async def test_handler_returns_once_joined_and_the_batch_counts_as_pending() -> None:
     """PTB holds a concurrency slot for the whole handler, so a handler that
     waited for its batch would cap a burst at eight messages and stall every
-    other topic; the pending batch is what the shutdown drain counts instead."""
+    other chat; the pending batch is what the shutdown drain counts instead."""
     bot, app = _lifecycle_bot()
     app.update_queue.qsize = MagicMock(return_value=0)
     update, ctx = _update(text="hello")
@@ -322,7 +320,7 @@ async def test_failed_media_preprocessing_leaves_the_batch() -> None:
 
     await _handle(bot, ctx, voice, text)
 
-    agent.run.assert_awaited_once_with(777, "hello", thread_id=None, on_research=ANY)
+    agent.run.assert_awaited_once_with(777, "hello", on_research=ANY)
     assert _replies(voice.message) == ["Couldn't transcribe that: garbled"]
 
 
@@ -418,7 +416,7 @@ async def test_outage_queues_message_and_tells_user() -> None:
 
     await _handle(bot, ctx, update)
 
-    queue_fn.assert_called_once_with(777, None, "pastilla tomada")
+    queue_fn.assert_called_once_with(777, "pastilla tomada")
     (reply,) = _replies(update.message)
     assert "queued" in reply
     assert "Copilot" in reply
@@ -441,15 +439,10 @@ async def test_outage_without_queue_keeps_generic_error_reply() -> None:
 # Replies (Telegram reply-to context)
 # ------------------------------------------------------------------
 
-def _reply_msg(
-    text: str | None = None,
-    caption: str | None = None,
-    forum_topic_created: MagicMock | None = None,
-) -> MagicMock:
+def _reply_msg(text: str | None = None, caption: str | None = None) -> MagicMock:
     reply = MagicMock()
     reply.text = text
     reply.caption = caption
-    reply.forum_topic_created = forum_topic_created
     return reply
 
 
@@ -495,7 +488,7 @@ async def test_reply_without_any_text_adds_no_context() -> None:
 
     await _handle(bot, ctx, update)
 
-    agent.run.assert_awaited_once_with(777, "what is this?", thread_id=None, on_research=ANY)
+    agent.run.assert_awaited_once_with(777, "what is this?", on_research=ANY)
 
 
 async def test_reply_quote_is_truncated() -> None:
@@ -506,21 +499,6 @@ async def test_reply_quote_is_truncated() -> None:
 
     sent = agent.run.call_args.args[1]
     assert sent == f'[replying to: "{"x" * 300}…"]\nsummarize'
-
-
-async def test_forum_topic_service_message_is_not_a_reply() -> None:
-    """In forum topics every plain message 'replies to' the topic-creation
-    service message — that must not be treated as a user reply."""
-    bot, agent = _bot()
-    reply = _reply_msg(text=None, forum_topic_created=MagicMock())
-    update, ctx = _update(text="plain topic message", reply_to=reply)
-    update.message.message_thread_id = 55
-
-    await _handle(bot, ctx, update)
-
-    agent.run.assert_awaited_once_with(
-        777, "plain topic message", thread_id=55, on_research=ANY
-    )
 
 
 async def test_reply_context_applies_to_photo_captions() -> None:
@@ -581,21 +559,8 @@ async def test_voice_message_is_transcribed_and_fed_to_agent() -> None:
     await _handle(bot, ctx, update)
 
     transcriber.transcribe.assert_awaited_once_with(b"OGGBYTES")
-    agent.run.assert_awaited_once_with(777, "buy milk tomorrow", thread_id=None, on_research=ANY)
+    agent.run.assert_awaited_once_with(777, "buy milk tomorrow", on_research=ANY)
     assert _replies(update.message) == ["agent reply"]
-
-
-async def test_voice_in_forum_topic_replies_into_topic() -> None:
-    transcriber = _transcriber("topic note")
-    bot, agent = _bot(transcriber)
-    update, ctx = _update(voice=_voice())
-    update.message.message_thread_id = 55
-
-    await _handle(bot, ctx, update)
-
-    agent.run.assert_awaited_once_with(777, "topic note", thread_id=55, on_research=ANY)
-    for call in update.message.reply_text.call_args_list:
-        assert call.kwargs["message_thread_id"] == 55
 
 
 async def test_voice_without_transcriber_replies_setup_hint() -> None:
@@ -684,7 +649,7 @@ async def test_photo_is_saved_and_fed_to_agent_with_vision() -> None:
     assert "attachments/2026-07-21-abc123.jpg" in call.args[1]
     expected_url = "data:image/jpeg;base64," + base64.b64encode(b"JPEGBYTES").decode()
     assert call.kwargs["image_data_urls"] == [expected_url]
-    assert call.kwargs["thread_id"] is None
+    assert "thread_id" not in call.kwargs
     assert _replies(update.message) == ["agent reply"]
 
 
@@ -969,31 +934,6 @@ async def test_document_without_save_fn_gets_fallback_reply() -> None:
     assert len(_replies(update.message)) == 1
 
 
-async def test_document_in_forum_topic_threads_replies() -> None:
-    save_fn = MagicMock(return_value="attachments/2026-07-22-abc123.pdf")
-    bot, agent = _bot(save_attachment_fn=save_fn)
-    update, ctx = _update(document=_file_attachment(), caption="wine invoice")
-    update.message.message_thread_id = 55
-
-    await _handle(bot, ctx, update)
-
-    assert agent.run.call_args.kwargs["thread_id"] == 55
-    for call in update.message.reply_text.call_args_list:
-        assert call.kwargs["message_thread_id"] == 55
-
-
-async def test_photo_in_forum_topic_threads_replies() -> None:
-    bot, agent = _bot(save_attachment_fn=_save_fn())
-    update, ctx = _update(photo=_photo_sizes(), caption="wine label")
-    update.message.message_thread_id = 55
-
-    await _handle(bot, ctx, update)
-
-    assert agent.run.call_args.kwargs["thread_id"] == 55
-    for call in update.message.reply_text.call_args_list:
-        assert call.kwargs["message_thread_id"] == 55
-
-
 # ------------------------------------------------------------------
 # Model selection
 # ------------------------------------------------------------------
@@ -1252,7 +1192,7 @@ async def test_pinned_chat_id_is_not_retargeted_by_later_messages(tmp_path: Path
     assert bot._chat_id == 555
     assert (tmp_path / "chat_id").read_text() == "555"
     agent.run.assert_awaited_once_with(
-        777, "hello from another chat", thread_id=None, on_research=ANY
+        777, "hello from another chat", on_research=ANY
     )
     assert _replies(update.message) == ["agent reply"]
 
@@ -1585,19 +1525,8 @@ async def test_clear_command_clears_current_history_and_confirms() -> None:
 
     await bot._clear_cmd(update, ctx)
 
-    agent.clear_history.assert_called_once_with(777, thread_id=None)
+    agent.clear_history.assert_called_once_with(777)
     assert "cleared" in _replies(update.message)[0].lower()
-
-
-async def test_clear_command_in_forum_topic_clears_only_that_topic() -> None:
-    bot, agent = _bot()
-    update, ctx = _update(text="/clear")
-    update.message.message_thread_id = 5
-
-    await bot._clear_cmd(update, ctx)
-
-    agent.clear_history.assert_called_once_with(777, thread_id=5)
-    assert update.message.reply_text.call_args.kwargs.get("message_thread_id") == 5
 
 
 async def test_clear_command_ignores_disallowed_user() -> None:
@@ -1632,8 +1561,8 @@ def test_build_registers_clear_command() -> None:
 # ------------------------------------------------------------------
 
 def test_build_enables_concurrent_updates() -> None:
-    """Updates run concurrently so one topic's long agent run does not block
-    another topic; per-conversation ordering is Agent.run's job."""
+    """Updates run concurrently so one chat's long agent run does not block
+    another chat; per-conversation ordering is Agent.run's job."""
     bot, _ = _bot()
 
     app = bot.build()

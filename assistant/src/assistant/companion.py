@@ -18,19 +18,16 @@ import math
 import re
 import sqlite3
 import time
-from datetime import datetime
 from importlib.resources import files
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from .agent import MAX_ITERATIONS_REPLY, Agent, _parse_topic_row
+from .agent import MAX_ITERATIONS_REPLY, Agent
 from .atomic import atomic_write_text
 from .config import Config
-from .conversations import WEB_CHAT_ID, ConversationArchive
+from .conversations import WEB_CHAT_ID, ConversationArchive, conversation_space
 from .copilot import CopilotUnavailableError
-from .schedule import Scheduler
 from .tools import VaultTools
 from .transcribe import Transcriber, TranscriptionError
 
@@ -39,12 +36,14 @@ logger = logging.getLogger(__name__)
 # Longer than the client's poll interval, so the device already showing the
 # conversation gets to acknowledge before phones buzz.
 PUSH_GRACE_SECONDS = 5
-# Newest messages a topic opens with; the same page feeds the 2.2s poll, so it
+# Newest messages the chat opens with; the same page feeds the 2.2s poll, so it
 # is kept small. Earlier pages load behind the timeline's manual link.
 MESSAGE_PAGE = 20
-# Web runs in flight across all spaces, queued ones included; each space still
-# runs one at a time behind the agent's conversation lock.
+# Web runs in flight, queued ones included; they still run one at a time
+# behind the agent's conversation lock.
 MAX_IN_FLIGHT = 16
+# The web chat is the home conversation, shared with the pinned Telegram chat.
+SPACE = conversation_space(WEB_CHAT_ID)
 # Uploads match Telegram's 20 MB download cap; bodies are read from the
 # stream in chunks, so the app-wide JSON body limit does not apply to them.
 UPLOAD_BYTES = 20 * 1024 * 1024
@@ -85,16 +84,16 @@ _MIMES = {".html": "text/html", ".js": "application/javascript", ".css": "text/c
           ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml"}
 _WEB_CONTEXT = (
     "This conversation is in the Noxide web companion, not Telegram. Reply directly here. "
-    "Web channels use the existing Telegram topic index and topic instructions, but have "
-    "shared archived conversation history. Durable knowledge still belongs in the vault. "
+    "It shares its archived conversation history with the Telegram home chat. "
+    "Durable knowledge still belongs in the vault. "
     "Recent completed exchanges are restored after restart; older messages are available via history tools."
 )
 
 
 class Companion:
-    def __init__(self, cfg: Config, agent: Agent, vault: VaultTools, scheduler: Scheduler,
+    def __init__(self, cfg: Config, agent: Agent, vault: VaultTools,
                  archive: ConversationArchive | None = None, transcriber: Transcriber | None = None):
-        self.cfg, self.agent, self.vault, self.scheduler = cfg, agent, vault, scheduler
+        self.cfg, self.agent, self.vault = cfg, agent, vault
         self.transcriber = transcriber
         self._owns_archive = archive is None
         self.archive = archive or ConversationArchive(cfg.state_dir)
@@ -153,10 +152,7 @@ class Companion:
 
         self.app = web.Application(middlewares=[self.security], client_max_size=64 * 1024)
         self.app.router.add_get("/api/session", self.session)
-        self.app.router.add_get("/api/topics", self.topics)
         self.app.router.add_get("/api/now", self.now)
-        self.app.router.add_get("/api/overview", self.overview)
-        self.app.router.add_get("/api/page", self.page)
         self.app.router.add_get("/api/messages", self.messages)
         self.app.router.add_post("/api/messages", self.submit)
         self.app.router.add_post("/api/retry", self.retry)
@@ -234,54 +230,6 @@ class Companion:
                                   "agent_name": self.cfg.agent_name,
                                   "voice": self.transcriber is not None})
 
-    def _space(self, value):
-        if value == "general":
-            return None
-        if isinstance(value, str) and re.fullmatch(r"topic:[1-9][0-9]*", value):
-            for topic in self._topics():
-                if topic["id"] == value:
-                    return int(value.split(":")[1])
-            raise web.HTTPNotFound(text="This topic is no longer in the Telegram topic index")
-        # Keep previously persisted project conversations accessible after the
-        # switch to Telegram topics; never silently merge their histories.
-        if not isinstance(value, str) or not re.fullmatch(r"wiki/(projects|areas)/[\w/-]+\.md", value):
-            raise web.HTTPBadRequest(text="Choose an existing project or General")
-        path = self.vault.abs_path(value)
-        if path != self.cfg.vault_path / value:
-            raise web.HTTPBadRequest(text="Project aliases are not supported")
-        if not path.is_file():
-            raise web.HTTPNotFound(text="This project no longer exists")
-        thread = int.from_bytes(hashlib.sha256(value.encode()).digest()[:7], "big")
-        self.agent.register_legacy_space(thread, value)
-        return thread
-
-    def _topics(self):
-        topics = [{"id": "general", "name": "General"}]
-        seen = set()
-        for line in self._page("system/topics/index.md").splitlines():
-            row = _parse_topic_row(line)
-            if row is None:
-                continue
-            thread_id, slug, name = row
-            if thread_id <= 0 or thread_id in seen or not re.fullmatch(r"[a-z0-9-]+", slug):
-                continue
-            seen.add(thread_id)
-            topics.append({"id": f"topic:{thread_id}", "name": name or slug})
-        return topics
-
-    async def topics(self, request):
-        topics = self._topics()
-        # Earlier PWA builds stored project chats. Offer only those with saved
-        # messages, so the UI change cannot strand existing conversations.
-        for row in self.db.execute("SELECT DISTINCT space FROM messages WHERE space LIKE 'wiki/%' AND status!='deleted'"):
-            try:
-                self._space(row["space"])
-            except (web.HTTPException, PermissionError):
-                continue
-            topics.append({"id": row["space"],
-                           "name": row["space"].rsplit("/", 1)[-1][:-3], "legacy": True})
-        return web.json_response({"topics": topics})
-
     async def now(self, request):
         return web.json_response({"content": self._page("wiki/now.md")})
 
@@ -291,44 +239,10 @@ class Companion:
             return ""
         return content
 
-    async def overview(self, request):
-        projects = []
-        for glob in ("wiki/projects/**/*.md", "wiki/areas/**/*.md"):
-            for path in self.vault.list_files(glob).splitlines():
-                if path.startswith("[") or path.endswith("/index.md"):
-                    continue
-                if len(projects) >= 200:
-                    break
-                try:
-                    self._space(path)
-                except (web.HTTPException, PermissionError):
-                    continue
-                content = self._page(path)
-                title = re.search(r"^# (.+)$", content, re.M)
-                status = re.search(r"\*\*Status:\*\*\s*(.+)", content)
-                projects.append({"path": path, "title": title[1] if title else path.rsplit("/", 1)[-1][:-3],
-                                 "status": status[1][:500] if status else "Open this space to see its current state.",
-                                 "tasks": len(re.findall(r"^\s*- \[ \] ", content, re.M))})
-        return web.json_response({
-            "date": datetime.now(ZoneInfo(self.cfg.timezone)).strftime("%A, %B %-d"),
-            "now": self._page("wiki/now.md"), "projects": projects,
-            "reminders": self.scheduler.entries_view(),
-            "project_limit": 200,
-        })
-
-    async def page(self, request):
-        path = request.query.get("path", "")
-        self._space(path)
-        if path == "general":
-            raise web.HTTPBadRequest(text="General has no project page")
-        return web.json_response({"path": path, "content": self._page(path)})
-
     async def messages(self, request):
-        space = request.query.get("space", "general")
-        self._space(space)
         before = float(request.query.get("before", "inf"))
         rows = self.db.execute("SELECT * FROM messages WHERE space=? AND status!='deleted' AND created<? ORDER BY created DESC LIMIT ?",
-                               (space, before, MESSAGE_PAGE + 1)).fetchall()
+                               (SPACE, before, MESSAGE_PAGE + 1)).fetchall()
         # The current generation lets the timeline draw a divider after a
         # reset that no message has followed yet.
         messages = [dict(r) for r in reversed(rows[:MESSAGE_PAGE])]
@@ -338,7 +252,7 @@ class Companion:
         return web.json_response({"messages": messages,
                                   "before": rows[MESSAGE_PAGE - 1]["created"] if len(rows) > MESSAGE_PAGE else None,
                                   "unread": self.unread_count(),
-                                  "generation": self.archive.generation(space)})
+                                  "generation": self.archive.generation(SPACE)})
 
     def _insert(self, space, role, text, status, *, message_id=None, reply_to=None, metadata=None):
         return self.archive.insert(space, role, text, status, message_id=message_id, reply_to=reply_to,
@@ -350,8 +264,7 @@ class Companion:
         data = await request.json()
         if not self.accepting:
             raise web.HTTPServiceUnavailable(text="Service restarting; your draft has not been sent")
-        space, text, message_id = data.get("space"), data.get("text"), data.get("id")
-        self._space(space)
+        text, message_id = data.get("text"), data.get("id")
         attachments = self._attachments(data.get("attachments", []))
         if not isinstance(text, str) or len(text) > 20000 or not (text.strip() or attachments):
             raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters or an image")
@@ -359,15 +272,15 @@ class Companion:
             raise web.HTTPBadRequest(text="A valid message ID is required")
         existing = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
         if existing:
-            if existing["space"] != space or existing["text"] != text:
+            if existing["space"] != SPACE or existing["text"] != text:
                 raise web.HTTPConflict(text="Message ID already used")
             return web.json_response({"id": message_id}, status=202)
         if len(self.tasks) >= MAX_IN_FLIGHT:
             raise web.HTTPTooManyRequests(text="Too many messages are in progress. Try again shortly.")
-        # Several messages may be pending in one space: each is its own run,
-        # serialized in arrival order by Agent.run's conversation lock, so a
-        # later reply sees the earlier exchange in its history.
-        self._insert(space, "user", text, "queued", message_id=message_id,
+        # Several messages may be pending: each is its own run, serialized in
+        # arrival order by Agent.run's conversation lock, so a later reply
+        # sees the earlier exchange in its history.
+        self._insert(SPACE, "user", text, "queued", message_id=message_id,
                      metadata={"attachments": attachments} if attachments else None)
         self._launch(message_id)
         return web.json_response({"id": message_id}, status=202)
@@ -408,19 +321,18 @@ class Companion:
 
     async def _process(self, message_id):
         row = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
-        # Stays 'queued' while waiting behind the space's earlier messages;
-        # Agent.run marks it 'running' once it holds the conversation lock.
+        # Stays 'queued' while waiting behind earlier messages; Agent.run
+        # marks it 'running' once it holds the conversation lock.
         self.db.execute("UPDATE messages SET error='' WHERE id=?", (message_id,))
         self.db.commit()
 
-        async def send(text, thread_id=None):
-            self._insert(row["space"], "assistant", text, "done", reply_to=message_id)
+        async def send(text):
+            self._insert(SPACE, "assistant", text, "done", reply_to=message_id)
             if getattr(self.agent, "archive", None) is self.archive:
-                self.agent._queue_sent_note(WEB_CHAT_ID, self._space(row["space"]), text)
+                self.agent._queue_sent_note(WEB_CHAT_ID, text)
             return WEB_CHAT_ID
 
         try:
-            thread = self._space(row["space"])
             archive_kwargs = {"message_id": message_id} if getattr(self.agent, "archive", None) is self.archive else {}
             text, image_data_urls = self._image_turn(row)
             if image_data_urls:
@@ -428,30 +340,29 @@ class Companion:
             if message_id in self.hot:
                 self.db.execute("UPDATE messages SET status='running' WHERE id=?", (message_id,))
                 self.db.commit()
-                reply = await self.agent.retry_message(WEB_CHAT_ID, thread, text,
+                reply = await self.agent.retry_message(WEB_CHAT_ID, text,
                                                        str(row["created"]), hot=True,
                                                        send_message_fn=send, extra_context=_WEB_CONTEXT, **archive_kwargs)
             else:
                 self.hot.add(message_id)
                 if row["error"]:
                     text = "[Explicit retry after interruption; earlier work may have partially completed. Re-read state before acting.] " + text
-                if row["space"].startswith("wiki/"):
-                    text = f"[Web space: {row['space']}. Read this owning page for relevant state.]\n{text}"
+
                 async def researching():
                     self.activity[message_id] = "Searching the web…"
 
                 reply = await self.agent.run(
-                    WEB_CHAT_ID, text, thread_id=thread, send_message_fn=send,
+                    WEB_CHAT_ID, text, send_message_fn=send,
                     extra_context=_WEB_CONTEXT, on_research=researching,
                     source="web", **archive_kwargs,
                 )
             if reply == MAX_ITERATIONS_REPLY:
                 raise RuntimeError("Iteration limit reached. Some work may have completed; retry to continue.")
             if reply and not archive_kwargs:
-                self._insert(row["space"], "assistant", reply, "done", reply_to=message_id)
+                self._insert(SPACE, "assistant", reply, "done", reply_to=message_id)
             self.db.execute("UPDATE messages SET status='done', error='' WHERE id=? AND status NOT IN ('deleted','dismissed')", (message_id,))
             self.hot.discard(message_id)
-            self.notify_push(row["space"], reply or "")
+            self.notify_push(reply or "")
         except CopilotUnavailableError:
             self.db.execute("UPDATE messages SET status='unavailable', error=? WHERE id=?",
                             ("Copilot is unavailable. Your message is saved; retry when ready.", message_id))
@@ -483,22 +394,18 @@ class Companion:
         return web.json_response({"ok": True})
 
     async def reset(self, request):
-        space = (await request.json()).get("space")
-        thread = self._space(space)
-        if self.db.execute("SELECT 1 FROM messages WHERE space=? AND status IN ('running','queued')", (space,)).fetchone():
+        if self.db.execute("SELECT 1 FROM messages WHERE space=? AND status IN ('running','queued')", (SPACE,)).fetchone():
             raise web.HTTPConflict(text="Wait for the current run to finish")
-        await self.agent.reset_conversation(WEB_CHAT_ID, thread)
-        self.hot.difference_update(row["id"] for row in self.db.execute("SELECT id FROM messages WHERE space=?", (space,)))
+        await self.agent.reset_conversation(WEB_CHAT_ID)
+        self.hot.difference_update(row["id"] for row in self.db.execute("SELECT id FROM messages WHERE space=?", (SPACE,)))
         return web.json_response({"ok": True})
 
-    async def observe_delivery(self, text, thread_id=None):
-        space = f"topic:{thread_id}" if thread_id is not None else "general"
-        if not any(topic["id"] == space for topic in self._topics()):
-            space, thread_id = "general", None
+    async def observe_delivery(self, text):
+        """A scheduled run delivered to the home chat: show it here and notify devices."""
         if getattr(self.agent, "archive", None) is not self.archive:
-            self._insert(space, "assistant", text, "done")
-            self.agent._queue_sent_note(WEB_CHAT_ID, thread_id, text)
-        self.notify_push(space, text)
+            self._insert(SPACE, "assistant", text, "done")
+            self.agent._queue_sent_note(WEB_CHAT_ID, text)
+        self.notify_push(text)
 
     async def subscribe(self, request):
         if not self.public_key:
@@ -534,7 +441,7 @@ class Companion:
     async def test_push(self, request):
         if not self.public_key:
             raise web.HTTPConflict(text="Push is not configured")
-        self.notify_push("general", "Hello there! This is the test reminder", grace=False)
+        self.notify_push("Hello there! This is the test reminder", grace=False)
         return web.json_response({"ok": True})
 
     async def _read_upload(self, request):
@@ -583,60 +490,53 @@ class Companion:
         return web.json_response({"text": text})
 
     async def mark_seen(self, request):
-        """A focused device displayed this space through the given timestamp."""
-        data = await request.json()
-        space, through = data.get("space"), data.get("through")
-        self._space(space)
+        """A focused device displayed the chat through the given timestamp."""
+        through = (await request.json()).get("through")
         if isinstance(through, bool) or not isinstance(through, (int, float)) or not math.isfinite(through):
             raise web.HTTPBadRequest(text="A message timestamp is required")
-        self.seen[space] = max(self.seen.get(space, 0.0), float(through))
+        self.seen[SPACE] = max(self.seen.get(SPACE, 0.0), float(through))
         self.db.execute("INSERT INTO seen (space, through) VALUES (?, ?) ON CONFLICT(space) DO UPDATE SET through=max(through, excluded.through)",
-                        (space, float(through)))
+                        (SPACE, float(through)))
         self.db.commit()
         return web.json_response({"ok": True})
 
     def unread_count(self):
-        """Replies newer than each listed space's seen mark: the app badge number."""
-        spaces = [topic["id"] for topic in self._topics()]
+        """Replies newer than the seen mark: the app badge number."""
         return self.db.execute(
-            f"SELECT count(*) FROM messages m WHERE m.role='assistant' AND m.status!='deleted'"
-            f" AND m.space IN ({','.join('?' * len(spaces))})"
-            " AND m.created > COALESCE((SELECT through FROM seen WHERE space=m.space), 0)",
-            spaces).fetchone()[0]
+            "SELECT count(*) FROM messages WHERE role='assistant' AND status!='deleted' AND space=?"
+            " AND created > COALESCE((SELECT through FROM seen WHERE space=?), 0)",
+            (SPACE, SPACE)).fetchone()[0]
 
-    def notify_push(self, space="general", text="", *, grace=True):
+    def notify_push(self, text="", *, grace=True):
         if not self.public_key or len(self.push_tasks) >= 8:
             return
         row = self.db.execute("SELECT max(created) FROM messages WHERE space=? AND role='assistant' AND status!='deleted'",
-                              (space,)).fetchone()
+                              (SPACE,)).fetchone()
         created = row[0] if row and row[0] is not None else time.time()
-        task = asyncio.create_task(self._push_unless_seen(space, text, created) if grace
-                                   else self._push(space, text))
+        task = asyncio.create_task(self._push_unless_seen(text, created) if grace
+                                   else self._push(text))
         self.push_tasks.add(task)
         task.add_done_callback(self.push_tasks.discard)
 
-    async def _push_unless_seen(self, space, text, created):
+    async def _push_unless_seen(self, text, created):
         # "Seen" means displayed on a focused device with the thread scrolled
         # to the end, not proof of reading; a device that acknowledges after
         # the window still gets the push, since it cannot be retracted.
         await asyncio.sleep(PUSH_GRACE_SECONDS)
-        if self.seen.get(space, 0.0) >= created:
-            logger.debug("Push skipped for %s: already displayed on a focused device", space)
+        if self.seen.get(SPACE, 0.0) >= created:
+            logger.debug("Push skipped: already displayed on a focused device")
             return
-        await self._push(space, text)
+        await self._push(text)
 
-    async def _push(self, space, text=""):
+    async def _push(self, text=""):
         from pywebpush import WebPushException, webpush
         from requests import Session
 
         # Leave room for encryption overhead under providers' 4 KB payload limit,
         # including text made entirely of four-byte Unicode characters.
         body = text[:500] + ("..." if len(text) > 500 else "")
-        channel = next((topic["name"] for topic in self._topics() if topic["id"] == space), "General")
-        if space.startswith("wiki/"):
-            channel = space.rsplit("/", 1)[-1].removesuffix(".md")
-        payload = json.dumps({"space": space, "body": body, "agent_name": self.cfg.agent_name,
-                              "channel_name": channel[:100], "unread": self.unread_count()}, ensure_ascii=False)
+        payload = json.dumps({"body": body, "agent_name": self.cfg.agent_name,
+                              "unread": self.unread_count()}, ensure_ascii=False)
 
         def deliver(subscription):
             with Session() as transport:

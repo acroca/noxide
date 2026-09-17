@@ -46,7 +46,6 @@ class UsageTracker:
         model: str,
         usage: dict[str, Any],
         chat_id: int | None = None,
-        thread_id: int | None = None,
     ) -> None:
         """Queue one usage event. Never touches disk, never raises to callers."""
         details = usage.get("prompt_tokens_details") or {}
@@ -55,7 +54,6 @@ class UsageTracker:
             "feature": feature,
             "model": model,
             "chat_id": chat_id,
-            "thread_id": thread_id,
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "cached_tokens": int(details.get("cached_tokens") or 0),
             "completion_tokens": int(usage.get("completion_tokens") or 0),
@@ -175,8 +173,7 @@ def record(
     model: str,
     usage: dict[str, Any],
     chat_id: int | None = None,
-    thread_id: int | None = None,
 ) -> None:
     """Record a usage event; no-op when tracking is not initialized (tests)."""
     if _tracker is not None:
-        _tracker.record(feature, model, usage, chat_id=chat_id, thread_id=thread_id)
+        _tracker.record(feature, model, usage, chat_id=chat_id)

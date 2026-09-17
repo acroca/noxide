@@ -15,7 +15,6 @@ from assistant.agent import Agent
 from assistant.companion import Companion
 from assistant.config import Config
 from assistant.conversations import ConversationArchive
-from assistant.schedule import Scheduler
 from assistant.tools import VaultTools
 
 
@@ -23,8 +22,6 @@ async def main():
     with tempfile.TemporaryDirectory(prefix="noxide-preview-") as directory:
         root = Path(directory)
         vault = VaultTools(root / "vault")
-        vault.write_file("system/topics/index.md", "# Topics\n\n| topic_id | slug | name |\n|---|---|---|\n| 10 | work | Work |\n| 20 | family | Family |\n| 30 | health | Health |\n")
-        vault.write_file("system/topics/work/AGENTS.md", "Focus on work in this topic.")
         vault.write_file("wiki/now.md", """# Now
 ## Today · Monday, September 14
 - [ ] Send the studio proposal (due 2026-09-14)
@@ -60,12 +57,9 @@ async def main():
 
         copilot._client = MagicMock(chat=AsyncMock(side_effect=chat))
         archive.insert("general", "user", "A message captured in Telegram.", "done", source="telegram")
-        scheduler = Scheduler(vault, AsyncMock(), tz_name="Europe/Madrid")
-        scheduler.schedule("2099-09-15T09:00:00", "Take the book along for tonight’s book club.", False)
-        scheduler.schedule("0 8 * * MON", "A gentle Monday check-in: what matters this week?", True)
         cfg = Config(state_dir=root, vault_path=root / "vault", pwa_origin="http://localhost:8080",
                      timezone="Europe/Madrid")
-        service = Companion(cfg, agent, vault, scheduler, archive=archive)
+        service = Companion(cfg, agent, vault, archive=archive)
         runner = web.AppRunner(service.app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", 8080).start()

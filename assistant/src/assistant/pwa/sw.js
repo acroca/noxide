@@ -19,28 +19,22 @@ self.addEventListener('fetch', event => {
   }));
 });
 self.addEventListener('push', event => {
-  let space = 'general';
   let name = AGENT_NAME;
-  let channel;
   let body;
   try {
     const data = event.data.json();
-    if (typeof data.space === 'string') space = data.space;
     if (typeof data.agent_name === 'string' && data.agent_name.trim()) name = data.agent_name;
-    if (typeof data.channel_name === 'string' && data.channel_name.trim()) channel = data.channel_name;
     if (typeof data.body === 'string' && data.body.trim()) body = data.body;
     // The app badge counts unread replies; the server sends the total with each push.
     if (Number.isInteger(data.unread) && data.unread >= 0) self.navigator?.setAppBadge?.(data.unread)?.catch?.(() => {});
   } catch {}
-  event.waitUntil(self.registration.showNotification(channel || (space === 'general' ? 'General' : name), {
-    body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png', tag: 'noxide-update', data: {space}
+  event.waitUntil(self.registration.showNotification(name, {
+    body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png', tag: 'noxide-update'
   }));
 });
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  const data = event.notification.data;
-  const space = typeof data?.space === 'string' && data.space ? data.space : 'general';
-  const target = new URL('/#chat/' + encodeURIComponent(space), self.location.origin);
+  const target = new URL('/#chat', self.location.origin);
   event.waitUntil(self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(async clients => {
     // The open app switches its own hash: a full navigation would drop an open
     // draft, and WindowClient.navigate() rejects for clients this worker does
@@ -48,7 +42,7 @@ self.addEventListener('notificationclick', event => {
     for (const client of clients) {
       if (new URL(client.url).origin !== self.location.origin) continue;
       try { await client.focus(); } catch { continue; }
-      client.postMessage({type: 'OPEN_SPACE', space});
+      client.postMessage({type: 'OPEN_CHAT'});
       return;
     }
     return self.clients.openWindow(target.href);

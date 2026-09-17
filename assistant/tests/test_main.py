@@ -7,7 +7,7 @@ import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -229,6 +229,10 @@ async def test_web_companion_starts_drains_and_mirrors_successful_sends(runtime,
     factory = MagicMock(return_value=service)
     monkeypatch.setattr(companion, "Companion", factory)
     await main._run(None)
+    factory.assert_called_once_with(
+        runtime.cfg, runtime.agent, ANY,
+        archive=agent.Agent.call_args.kwargs["archive"], transcriber=ANY,
+    )
     service.start.assert_awaited_once()
     service.drain.assert_awaited_once()
     service.close.assert_awaited_once()
@@ -236,10 +240,11 @@ async def test_web_companion_starts_drains_and_mirrors_successful_sends(runtime,
     sender = agent.Agent.call_args.kwargs["send_message_fn"]
     monkeypatch.setattr(agent.Agent.call_args.kwargs["archive"], "insert", MagicMock())
     runtime.bot.send_message.return_value = 123
-    assert await sender("A reminder", 10) == 123
-    service.observe_delivery.assert_awaited_once_with("A reminder", 10)
+    assert await sender("A reminder") == 123
+    runtime.bot.send_message.assert_awaited_once_with("A reminder")
+    service.observe_delivery.assert_awaited_once_with("A reminder")
     runtime.bot.send_message.return_value = None
-    assert await sender("Dropped", None) is None
+    assert await sender("Dropped") is None
     service.observe_delivery.assert_awaited_once()
 
 
@@ -482,18 +487,18 @@ async def test_retry_message_callback_outcomes(runtime, reply) -> None:
     await asyncio.wait_for(main._run(None), timeout=2)
     callback = runtime.queue_factory.call_args.kwargs["replay_message_fn"]
     runtime.agent.retry_message.return_value = reply
-    args = (123, 42, "original message", "2026-09-08 10:00 local", True)
+    args = (123, "original message", "2026-09-08 10:00 local", True)
 
     if reply == MAX_ITERATIONS_REPLY:
         with pytest.raises(RuntimeError, match="iteration limit"):
             await callback(*args)
     else:
         assert await callback(*args) is None
-    runtime.agent.retry_message.assert_awaited_once_with(*args[:4], hot=True)
+    runtime.agent.retry_message.assert_awaited_once_with(*args[:3], hot=True)
     if reply in (MAX_ITERATIONS_REPLY, None):
         runtime.bot.send_message.assert_not_awaited()
     else:
-        runtime.bot.send_message.assert_awaited_once_with(reply or "(no reply)", 42, chat_id=123)
+        runtime.bot.send_message.assert_awaited_once_with(reply or "(no reply)", chat_id=123)
 
 
 async def test_retry_message_delivery_failure_does_not_fail_completed_run(runtime) -> None:
@@ -502,8 +507,8 @@ async def test_retry_message_delivery_failure_does_not_fail_completed_run(runtim
     runtime.bot.send_message.side_effect = RuntimeError("Telegram unavailable")
     callback = runtime.queue_factory.call_args.kwargs["replay_message_fn"]
 
-    assert await callback(123, None, "original", "2026-09-08 10:00 local", False) is None
-    runtime.bot.send_message.assert_awaited_once_with("completed", None, chat_id=123)
+    assert await callback(123, "original", "2026-09-08 10:00 local", False) is None
+    runtime.bot.send_message.assert_awaited_once_with("completed", chat_id=123)
 
 
 @pytest.mark.parametrize("capped", [True, False])

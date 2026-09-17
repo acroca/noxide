@@ -42,7 +42,7 @@ def history_tool_schemas() -> list[dict[str, Any]]:
         tools.append({"type": "function", "function": {
             "name": name,
             "description": description + (
-                " Only this chat/topic's retained conversation archive. Returns text, IDs, timestamps "
+                " Only this conversation's retained archive. Returns text, IDs, timestamps "
                 "and pagination; no tool traces or images. Pages cap at 12k content characters; "
                 "list/search excerpts cap at 2k each. Read truncated text with message_id and "
                 "offset in get_history. Not a source of current vault state."

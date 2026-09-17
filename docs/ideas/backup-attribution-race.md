@@ -27,7 +27,7 @@ rejected for now:
 
 - **Read-set locking** ("if the bot read it, it may write it") degenerates to
   a global lock: nearly every run reads `wiki/now.md` and `AGENTS.md`. That
-  silently undoes parallel topic handling.
+  silently undoes parallel conversation handling (scheduled jobs beside the chat).
 - **Incremental acquisition deadlocks.** The model decides what to touch as
   it goes; two runs acquiring files in opposite orders deadlock, and fixing
   that needs lock ordering or timeouts — real complexity for a cosmetic bug.

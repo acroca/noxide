@@ -43,8 +43,8 @@ _MAX_MSG_LEN = 4000
 # Telegram's Bot API refuses file downloads above 20 MB anyway
 _MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 # Updates are handled concurrently up to this cap, so a long agent run in one
-# forum topic does not block messages arriving in another. Runs within one
-# conversation stay sequential — Agent.run serializes per (chat_id, thread_id).
+# chat does not block messages arriving in another. Runs within one
+# conversation stay sequential — Agent.run serializes per chat.
 _CONCURRENT_UPDATES = 8
 # Messages that reach one conversation within this many seconds of each other
 # are handled as a single agent run. A WhatsApp share of several messages
@@ -132,12 +132,10 @@ def _fmt_wait(seconds: int) -> str:
 def _reply_context(msg: Message) -> str | None:
     """Quoted-message context for a Telegram reply, or None when not a real reply.
 
-    In forum topics every plain message "replies to" the topic-creation
-    service message, so those are skipped. Prefers the partial quote when
-    the user quoted a specific passage.
+    Prefers the partial quote when the user quoted a specific passage.
     """
     reply = msg.reply_to_message
-    if reply is None or reply.forum_topic_created is not None:
+    if reply is None:
         return None
     quoted = (msg.quote.text if msg.quote else None) or reply.text or reply.caption
     if not quoted:
@@ -257,11 +255,11 @@ class TelegramBot:
         self._refresh_models_fn = refresh_models_fn
         self._queue_message_fn = queue_message_fn
         self.archive = archive
-        # Open batches per (chat_id, thread_id); a batch leaves the dict the
+        # Open batches per chat; a batch leaves the dict the
         # moment its run starts, so later arrivals open the next one. The task
         # set is the strong reference asyncio requires and what the shutdown
         # drain waits on — handlers return as soon as they have joined.
-        self._batches: dict[tuple[int, int | None], _PendingBatch] = {}
+        self._batches: dict[int, _PendingBatch] = {}
         self._batch_tasks: set[asyncio.Task[None]] = set()
         # No persistence: selection resets to the default on every restart
         self._current_alias = default_model
@@ -281,15 +279,9 @@ class TelegramBot:
             persisted_chat_id if persisted_chat_id is not None else default_chat_id
         )
 
-    async def send_message(
-        self,
-        text: str,
-        message_thread_id: int | None = None,
-        chat_id: int | None = None,
-    ) -> int | None:
+    async def send_message(self, text: str, chat_id: int | None = None) -> int | None:
         """Send a proactive message (e.g. from a scheduled job).
 
-        Pass ``message_thread_id`` to deliver the message into a specific forum topic.
         ``chat_id`` overrides the pinned home chat — retry-queue replays answer
         into the conversation the failed message came from.
         Returns the chat id the message was delivered to — the caller may need
@@ -303,31 +295,13 @@ class TelegramBot:
         if self._app is None:
             logger.warning("send_message called before bot started; dropping.")
             return None
-        kwargs: dict[str, Any] = {"chat_id": target_chat_id, "text": ""}
-        if message_thread_id is not None:
-            kwargs["message_thread_id"] = message_thread_id
         for chunk in _split_message(text):
-            await self._app.bot.send_message(**{**kwargs, "text": chunk})
+            await self._app.bot.send_message(chat_id=target_chat_id, text=chunk)
         return target_chat_id
 
     @property
     def home_chat_id(self) -> int | None:
         return self._chat_id
-
-    async def create_forum_topic(self, name: str) -> dict[str, Any]:
-        """Create a new forum topic in the group and return its data dict.
-
-        Returns a dict containing at least ``message_thread_id``.
-        """
-        if self._chat_id is None:
-            raise RuntimeError("create_forum_topic called but no chat_id set yet")
-        if self._app is None:
-            raise RuntimeError("create_forum_topic called before bot started")
-        forum_topic = await self._app.bot.create_forum_topic(
-            chat_id=self._chat_id,
-            name=name,
-        )
-        return {"message_thread_id": forum_topic.message_thread_id, "name": forum_topic.name}
 
     # ------------------------------------------------------------------
     # chat_id persistence (survives restarts so proactive sends keep working)
@@ -470,33 +444,28 @@ class TelegramBot:
         return label
 
     async def _clear_cmd(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/clear — forget the conversation history of the current chat/topic."""
+        """/clear — forget the conversation history of the current chat."""
         if not self._is_allowed(update):
             return
         msg = update.message
-        thread_id = msg.message_thread_id
         # A message and /clear within the window: answer the message first,
         # then forget — never run it against the history just emptied.
-        pending = self._batches.get((msg.chat_id, thread_id))
+        pending = self._batches.get(msg.chat_id)
         if pending is not None and pending.task is not None:
             await asyncio.shield(pending.task)
         if self.archive:
-            await self._agent.reset_conversation(msg.chat_id, thread_id)
+            await self._agent.reset_conversation(msg.chat_id)
         else:
-            self._agent.clear_history(msg.chat_id, thread_id=thread_id)
-        await msg.reply_text(
-            "Context cleared. The conversation archive and vault notes are untouched.",
-            message_thread_id=thread_id,
-        )
+            self._agent.clear_history(msg.chat_id)
+        await msg.reply_text("Context cleared. The conversation archive and vault notes are untouched.")
 
     async def _model_cmd(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/model — show an inline keyboard of model aliases to pick from."""
         if not self._is_allowed(update):
             return
         msg = update.message
-        thread_id = msg.message_thread_id
         if not self._models or self._set_model_fn is None:
-            await msg.reply_text("No models configured.", message_thread_id=thread_id)
+            await msg.reply_text("No models configured.")
             return
 
         if self._refresh_models_fn is not None:
@@ -523,7 +492,6 @@ class TelegramBot:
         ]
         await msg.reply_text(
             f"Current: {self._current_alias} → {self._models[self._current_alias].id}",
-            message_thread_id=thread_id,
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
@@ -568,22 +536,15 @@ class TelegramBot:
     ) -> None:
         msg = update.message
         self._remember_chat_id(msg.chat_id)
-
-        # Extract forum topic thread ID (None for general chat)
-        thread_id: int | None = msg.message_thread_id
-
-        key = (msg.chat_id, thread_id)
-        batch = self._open_batch(key, ctx.bot)
+        batch = self._open_batch(msg.chat_id, ctx.bot)
         batch.register()
         item: _BatchItem | None = None
         try:
-            item = await self._prepare_item(msg, ctx, thread_id)
+            item = await self._prepare_item(msg, ctx)
         finally:
             batch.settle(item)
 
-    async def _prepare_item(
-        self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, thread_id: int | None
-    ) -> _BatchItem | None:
+    async def _prepare_item(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE) -> _BatchItem | None:
         """Turn one Telegram message into the text the agent will see.
 
         None means the message was answered here (unsupported type, media
@@ -591,18 +552,16 @@ class TelegramBot:
         """
         audio = msg.voice or msg.audio
         if audio is not None:
-            item = await self._handle_audio(msg, ctx, audio, thread_id)
+            item = await self._handle_audio(msg, ctx, audio)
         elif msg.photo:
-            item = await self._handle_photo(msg, ctx, thread_id)
+            item = await self._handle_photo(msg, ctx)
         elif msg.document or msg.video:
-            item = await self._handle_file(msg, ctx, msg.document or msg.video, thread_id)
+            item = await self._handle_file(msg, ctx, msg.document or msg.video)
         elif msg.text:
             item = _BatchItem(msg, msg.text)
         else:
             # Other non-text messages (stickers, contacts, locations, …)
-            await msg.reply_text(
-                "text, voice, photos and files only for now", message_thread_id=thread_id
-            )
+            await msg.reply_text("text, voice, photos and files only for now")
             return None
         if item is None:
             return None
@@ -611,70 +570,51 @@ class TelegramBot:
             return replace(item, text=f"{reply_context}\n{item.text}")
         return item
 
-    async def _handle_audio(
-        self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, audio, thread_id: int | None
-    ) -> _BatchItem | None:
+    async def _handle_audio(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, audio) -> _BatchItem | None:
         """Transcribe a voice note or audio file into the agent's text."""
         if self._transcriber is None:
             await msg.reply_text(
                 "Voice messages aren't set up — set ELEVENLABS_API_KEY to an API key "
-                "from elevenlabs.io and restart the bot.",
-                message_thread_id=thread_id,
+                "from elevenlabs.io and restart the bot."
             )
             return None
         if audio.file_size and audio.file_size > _MAX_DOWNLOAD_BYTES:
-            await msg.reply_text(
-                "That audio is too large for me (20 MB max).", message_thread_id=thread_id
-            )
+            await msg.reply_text("That audio is too large for me (20 MB max).")
             return None
 
-        await ctx.bot.send_chat_action(
-            chat_id=msg.chat_id,
-            action=ChatAction.TYPING,
-            message_thread_id=thread_id,
-        )
+        await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
 
         try:
             tg_file = await audio.get_file()
             data = bytes(await tg_file.download_as_bytearray())
             transcript = await self._transcriber.transcribe(data)
         except TranscriptionError as e:
-            await msg.reply_text(f"Couldn't transcribe that: {e}", message_thread_id=thread_id)
+            await msg.reply_text(f"Couldn't transcribe that: {e}")
             return None
         except Exception:
             logger.exception("Audio handling failed for chat_id=%d", msg.chat_id)
-            await msg.reply_text("Couldn't process that audio, sorry.", message_thread_id=thread_id)
+            await msg.reply_text("Couldn't process that audio, sorry.")
             return None
 
         return _BatchItem(msg, transcript)
 
-    async def _handle_photo(
-        self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, thread_id: int | None
-    ) -> _BatchItem | None:
+    async def _handle_photo(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE) -> _BatchItem | None:
         """Save an incoming photo to the vault and show it to the agent as vision input.
 
         The caption drives intent: the agent may link the stored file from a
         note, answer a question about the image, or both.
         """
         if self._save_attachment_fn is None:
-            await msg.reply_text(
-                "Photos aren't enabled.", message_thread_id=thread_id
-            )
+            await msg.reply_text("Photos aren't enabled.")
             return None
 
         # Telegram sends multiple sizes, smallest first — use the largest
         photo = msg.photo[-1]
         if photo.file_size and photo.file_size > _MAX_DOWNLOAD_BYTES:
-            await msg.reply_text(
-                "That photo is too large for me (20 MB max).", message_thread_id=thread_id
-            )
+            await msg.reply_text("That photo is too large for me (20 MB max).")
             return None
 
-        await ctx.bot.send_chat_action(
-            chat_id=msg.chat_id,
-            action=ChatAction.TYPING,
-            message_thread_id=thread_id,
-        )
+        await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
 
         try:
             tg_file = await photo.get_file()
@@ -682,9 +622,7 @@ class TelegramBot:
             stored_path = self._save_attachment_fn(data, "jpg")
         except Exception:
             logger.exception("Photo handling failed for chat_id=%d", msg.chat_id)
-            await msg.reply_text(
-                "Couldn't process that photo, sorry.", message_thread_id=thread_id
-            )
+            await msg.reply_text("Couldn't process that photo, sorry.")
             return None
 
         caption = (msg.caption or "").strip() or "The user sent this image without a caption."
@@ -696,9 +634,7 @@ class TelegramBot:
         image_data_url = "data:image/jpeg;base64," + base64.b64encode(data).decode()
         return _BatchItem(msg, user_message, image_data_url)
 
-    async def _handle_file(
-        self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, attachment, thread_id: int | None
-    ) -> _BatchItem | None:
+    async def _handle_file(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, attachment) -> _BatchItem | None:
         """Save a document/video attachment to the vault and hand its path to the agent.
 
         The model never sees the bytes — only the caption, original name/type
@@ -706,21 +642,14 @@ class TelegramBot:
         """
         if self._save_attachment_fn is None:
             await msg.reply_text(
-                "File attachments aren't enabled.",
-                message_thread_id=thread_id,
+                "File attachments aren't enabled."
             )
             return None
         if attachment.file_size and attachment.file_size > _MAX_DOWNLOAD_BYTES:
-            await msg.reply_text(
-                "That file is too large for me (20 MB max).", message_thread_id=thread_id
-            )
+            await msg.reply_text("That file is too large for me (20 MB max).")
             return None
 
-        await ctx.bot.send_chat_action(
-            chat_id=msg.chat_id,
-            action=ChatAction.TYPING,
-            message_thread_id=thread_id,
-        )
+        await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
 
         file_name = getattr(attachment, "file_name", None)
         mime_type = getattr(attachment, "mime_type", None)
@@ -730,7 +659,7 @@ class TelegramBot:
             stored_path = self._save_attachment_fn(data, _attachment_ext(file_name, mime_type))
         except Exception:
             logger.exception("File handling failed for chat_id=%d", msg.chat_id)
-            await msg.reply_text("Couldn't process that file, sorry.", message_thread_id=thread_id)
+            await msg.reply_text("Couldn't process that file, sorry.")
             return None
 
         caption = (msg.caption or "").strip() or "The user sent this file without a caption."
@@ -745,7 +674,7 @@ class TelegramBot:
         )
         return _BatchItem(msg, user_message)
 
-    def _open_batch(self, key: tuple[int, int | None], bot: Any) -> _PendingBatch:
+    def _open_batch(self, key: int, bot: Any) -> _PendingBatch:
         batch = self._batches.get(key)
         if batch is None:
             batch = self._batches[key] = _PendingBatch(bot=bot)
@@ -754,14 +683,14 @@ class TelegramBot:
             batch.task.add_done_callback(self._batch_tasks.discard)
         return batch
 
-    async def _run_batch(self, key: tuple[int, int | None], batch: _PendingBatch) -> None:
+    async def _run_batch(self, key: int, batch: _PendingBatch) -> None:
         try:
             await self._wait_for_quiet(batch)
             self._batches.pop(key, None)
             if batch.items:
                 await self._answer_batch(key, batch)
         except Exception:
-            logger.exception("Batch handling failed for chat_id=%d thread_id=%s", *key)
+            logger.exception("Batch handling failed for chat_id=%d", key)
 
     async def _wait_for_quiet(self, batch: _PendingBatch) -> None:
         """Return once nobody is still preprocessing and the window has elapsed."""
@@ -780,8 +709,7 @@ class TelegramBot:
         while self._batch_tasks:
             await asyncio.wait(set(self._batch_tasks))
 
-    async def _answer_batch(self, key: tuple[int, int | None], batch: _PendingBatch) -> None:
-        chat_id, thread_id = key
+    async def _answer_batch(self, chat_id: int, batch: _PendingBatch) -> None:
         # Handlers join after their own preprocessing (transcription, download),
         # which finishes in any order; Telegram's message ids record the order
         # the user actually sent.
@@ -803,9 +731,9 @@ class TelegramBot:
         message_id = None
         if self.archive:
             message_id = f"telegram:{chat_id}:" + ",".join(str(item.msg.message_id) for item in items)
-            space = self._agent.conversation_space(chat_id, thread_id)
+            space = self._agent.conversation_space(chat_id)
             self.archive.insert(space, "user", text, "queued", message_id=message_id, source="telegram",
-                                metadata={"chat_id": chat_id, "thread_id": thread_id,
+                                metadata={"chat_id": chat_id,
                                           "message_ids": [item.msg.message_id for item in items],
                                           "items": [{"id": item.msg.message_id, "text": item.text,
                                                      "date": str(item.msg.date)} for item in items]})
@@ -817,19 +745,14 @@ class TelegramBot:
                 return
 
         try:
-            await batch.bot.send_chat_action(
-                chat_id=chat_id, action=ChatAction.TYPING, message_thread_id=thread_id
-            )
+            await batch.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception:
             logger.warning("Typing indicator failed for chat_id=%d", chat_id, exc_info=True)
 
         async def react_to_search() -> None:
             await msg.set_reaction(_SEARCH_REACTION)
 
-        agent_kwargs: dict[str, Any] = {
-            "thread_id": thread_id,
-            "on_research": react_to_search,
-        }
+        agent_kwargs: dict[str, Any] = {"on_research": react_to_search}
         if image_data_urls:
             agent_kwargs["image_data_urls"] = image_data_urls
         if message_id:
@@ -839,32 +762,28 @@ class TelegramBot:
             reply = await self._agent.run(chat_id, text, **agent_kwargs)
         except CopilotUnavailableError as e:
             if self._queue_message_fn is None:
-                logger.exception(
-                    "Copilot unavailable for chat_id=%d thread_id=%s", chat_id, thread_id
-                )
+                logger.exception("Copilot unavailable for chat_id=%d", chat_id)
                 reply = f"Sorry, something went wrong: {e}"
             else:
                 logger.warning(
-                    "Copilot unavailable (%s); queueing message for retry "
-                    "(chat_id=%d thread_id=%s)",
-                    e, chat_id, thread_id,
+                    "Copilot unavailable (%s); queueing message for retry (chat_id=%d)", e, chat_id,
                 )
                 if message_id:
-                    self._queue_message_fn(chat_id, thread_id, text, message_id=message_id)
+                    self._queue_message_fn(chat_id, text, message_id=message_id)
                 else:
-                    self._queue_message_fn(chat_id, thread_id, text)
+                    self._queue_message_fn(chat_id, text)
                 reply = (
                     "GitHub Copilot looks down right now — I've queued your "
                     "message and will answer as soon as it's back."
                 )
         except Exception as e:
-            logger.exception("Agent error for chat_id=%d thread_id=%s", chat_id, thread_id)
+            logger.exception("Agent error for chat_id=%d", chat_id)
             reply = f"Sorry, something went wrong: {e}"
 
         receipts = []
         try:
             for chunk in _split_message(reply or "(no reply)"):
-                sent = await msg.reply_text(chunk, message_thread_id=thread_id)
+                sent = await msg.reply_text(chunk)
                 if sent is not None:
                     receipts.append(sent.message_id)
         except Exception:

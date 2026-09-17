@@ -152,12 +152,12 @@ def test_only_text_is_archived_and_tool_heavy_work_is_one_exchange():
     assert "medication" in history.retrieve("search_history", {"query": "medication"})
 
 
-@pytest.mark.parametrize("chat_id,thread_id", [(1, None), (1, 100), (1, 200), (2, 100), (0, None)])
-async def test_real_loop_scopes_history_tools_and_clear(tmp_path, chat_id, thread_id):
+@pytest.mark.parametrize("chat_id", [1, 2, 3, 0])
+async def test_real_loop_scopes_history_tools_and_clear(tmp_path, chat_id):
     agent = Agent(VaultTools(tmp_path))
-    keys = [(1, None), (1, 100), (1, 200), (2, 100), (0, None)]
+    keys = [1, 2, 3, 0]
     for key in keys:
-        complete(agent._get_history(*key), f"unique {key}")
+        complete(agent._get_history(key), f"unique {key}")
     client = MagicMock()
     client.chat = AsyncMock(side_effect=[
         _make_tool_call_response("search_history", {"query": "unique"}),
@@ -165,18 +165,18 @@ async def test_real_loop_scopes_history_tools_and_clear(tmp_path, chat_id, threa
         _make_text_response("found"),
     ])
     with patch("assistant.copilot.get_client", return_value=client):
-        await agent.run(chat_id, "look back", thread_id=thread_id)
+        await agent.run(chat_id, "look back")
     tools = client.chat.call_args.args[1]
     assert {"get_history", "search_history"} <= {t["function"]["name"] for t in tools}
     outputs = [m["content"] for m in client.chat.call_args.args[0] if m["role"] == "tool"]
     assert len(outputs) == 2
     for output in outputs:
-        assert f"unique {(chat_id, thread_id)}" in output
+        assert f"unique {chat_id}" in output
         for key in keys:
-            if key != (chat_id, thread_id):
+            if key != chat_id:
                 assert f"unique {key}" not in output
-    agent.clear_history(chat_id, thread_id)
-    assert json.loads(agent._get_history(chat_id, thread_id).retrieve("get_history", {}))["messages"] == []
+    agent.clear_history(chat_id)
+    assert json.loads(agent._get_history(chat_id).retrieve("get_history", {}))["messages"] == []
     assert "no conversation history" in await agent._dispatch_tool("get_history", {})
 
 
@@ -202,9 +202,9 @@ async def test_older_context_window_is_frozen_while_outage_work_survives(tmp_pat
         assert "completed 0" not in str(first)
         before = history.messages()
         with pytest.raises(CopilotUnavailableError):
-            await agent.retry_message(1, None, "original task", "earlier", hot=True)
+            await agent.retry_message(1, "original task", "earlier", hot=True)
         assert history.messages() == before
-        await agent.retry_message(1, None, "original task", "earlier", hot=True)
+        await agent.retry_message(1, "original task", "earlier", hot=True)
     sent = client.chat.call_args.args[0]
     assert "original task" in str(sent)
     assert any(m["role"] == "tool" and "completed 0" in m["content"] for m in sent)
@@ -217,13 +217,13 @@ async def test_empty_success_reply_still_supersedes_hot_retry(tmp_path):
     client.chat = AsyncMock(return_value=_make_text_response(""))
     with patch("assistant.copilot.get_client", return_value=client):
         await agent.run(1, "question")
-        assert await agent.retry_message(1, None, "question", "earlier", hot=True) is None
+        assert await agent.retry_message(1, "question", "earlier", hot=True) is None
 
 
 async def test_pending_reminder_notes_are_not_limited_by_automatic_window(tmp_path):
     agent = Agent(VaultTools(tmp_path))
     for n in range(12):
-        agent._queue_sent_note(1, None, f"reminder {n}")
+        agent._queue_sent_note(1, f"reminder {n}")
     client = MagicMock()
     client.chat = AsyncMock(return_value=_make_text_response("noted"))
     with patch("assistant.copilot.get_client", return_value=client):

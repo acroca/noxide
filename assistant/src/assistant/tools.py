@@ -55,22 +55,6 @@ def _strip_leaked_version_token(content: str) -> str:
     return _LEAKED_VERSION_RX.sub("", content)
 
 
-def slug_from_name(name: str) -> str:
-    """Derive a topic slug from its display name.
-
-    Rules: lowercase, spaces replaced with hyphens, non-alphanumeric
-    characters (except hyphens) removed, runs of hyphens collapsed.
-
-    Example: ``"Health & Fitness"`` → ``"health-fitness"``
-    """
-    slug = name.lower()
-    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
-    slug = slug.strip()
-    slug = re.sub(r"\s+", "-", slug)
-    slug = re.sub(r"-+", "-", slug)
-    return slug
-
-
 class VaultTools:
     """File-system tools operating within a vault directory."""
 
@@ -535,7 +519,7 @@ class VaultTools:
 
         ``read_file`` results gain the ``[version: ...]`` token here rather
         than in the method, so internal callers (system prompt assembly,
-        topic index parsing) keep seeing the file's bare content.
+        schedule parsing) keep seeing the file's bare content.
         """
         if name == "read_file":
             content = self.read_file_full(args["path"])

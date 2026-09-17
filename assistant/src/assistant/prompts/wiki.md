@@ -17,7 +17,7 @@ vault/
     areas/<slug>.md            ← ongoing life areas (health, family, hobbies…)
     people/<slug>.md           ← one page per recurring person
     archive/projects/<slug>.md ← finished or abandoned projects, out of the way
-  system/                      ← managed by the bot (schedule.md, topics/, skills/)
+  system/                      ← managed by the bot (schedule.md, skills/)
 ```
 
 The formats below are canonical in English, but a vault may localize any user-visible text — column headers, section titles, task markers, status labels. The vault's `AGENTS.md` declares the localized terms; always match what the existing files use, and never rename headings or markers back to the English defaults.
@@ -67,7 +67,7 @@ Where a weekday genuinely is required (the `now.md` header, and its **Upcoming**
   - Waiting on someone/something: append `(waiting: X)`.
   - When a page accumulates ~15 done tasks, move the oldest into an `## Archive` section at the bottom.
 - **Dated events** (an appointment, a trip, a school calendar) live on the page that owns them as `- YYYY-MM-DD — description` bullets — `YYYY-MM-DD HH:MM` with a time, `YYYY-MM-DD → YYYY-MM-DD` for a range. Every one within the next 14 days is mirrored into `now.md` (see **Upcoming** below), and `check_vault` enumerates the gaps.
-- Optional sections, added when they earn their place: `## Decisions` (date + decision + reasoning), `## History` (date + notable event), `## Open questions`.
+- Optional sections, added when they earn their place: `## Decisions` (date + decision + reasoning), `## History` (date + notable event), `## Open questions`, `## Instructions` (standing directions for that subject — language, tone, what to record, whom to keep informed — which apply whenever the conversation touches the subject, not only when the page is edited).
 - **People pages** are created on recurrence, not first mention. They hold: a relationship line, current threads (pointers to project/area pages — never restated status), the most recent ~10 notable interactions, and stated facts only. Never invent relationship or notes content.
 
 ### `wiki/routines.md`
@@ -109,7 +109,7 @@ An ingest is not finished when the fact is filed — it is finished when no page
 
 Surgical, not partial. Keep each write small — `edit_file` line patches, never a wholesale rewrite of `now.md` or `index.md` — but small writes are not a license to skip steps 3 and 4. The nightly compile is a safety net for what ingest could not know, not a reason to leave behind a line you know is wrong: the user reads `now.md` throughout the day, so a routine that still shows as pending hours after they reported doing it is the failure this step exists to prevent. A read of `now.md` that turns up nothing to fix is a correct ingest, not wasted effort.
 
-When one destination is clearly the best fit, file there without asking — corrections are cheap. Ask (one short question) only when filing it wrong would actually matter.
+Nothing outside the message says which project or area it concerns: infer it from the message, the recent conversation and the wiki index. When one destination is clearly the best fit, file there without asking — corrections are cheap. Ask (one short question) only when filing it wrong would actually matter, and always when a short message ("done", "moved it to Friday") could refer to more than one open item.
 
 ### Query
 

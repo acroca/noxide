@@ -18,15 +18,16 @@ function icon(name) {
 $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 let session, poll, installPrompt, toastTimer, version = 0;
 let agentName = $('meta[name="agent-name"]').content;
-let topics = [], currentTopic = 'general';
 let serverUnavailable = false, booting = false, pendingMutations = 0;
 let waitingWorker = null, reloadRequested = false, workerChanged = false;
 let hadController = Boolean(navigator.serviceWorker?.controller);
 let ackVisible = () => {};
-const draftKey = topic => `noxide-draft:${topic}`;
+// Draft keys keep the shape from when the chat had topics, so drafts saved
+// before the switch to one chat are still found.
+const DRAFT_KEY = 'noxide-draft:general', SUBMISSION_KEY = 'noxide-submission:general';
 const THEME_KEY = 'noxide-theme';
-// The app badge on the Home Screen icon: unread replies across topics, as the
-// server counts them from each space's seen mark. Unsupported browsers ignore it.
+// The app badge on the Home Screen icon: unread replies, as the server counts
+// them from the chat's seen mark. Unsupported browsers ignore it.
 function showBadge(count) {
   try {
     const done = count > 0 ? navigator.setAppBadge?.(count) : navigator.clearAppBadge?.();
@@ -34,9 +35,6 @@ function showBadge(count) {
   } catch {}
 }
 function themePreference() { try { return localStorage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; } }
-const submissionKey = topic => `noxide-submission:${topic}`;
-const chatURL = topic => '#chat/' + encodeURIComponent(topic);
-const topicName = topic => topics.find(t => t.id === topic)?.name || 'General';
 function toast(text) {
   $('#toast').textContent = text;
   $('#toast').hidden = false;
@@ -159,42 +157,30 @@ function markdown(text) {
 function dateLabel(seconds) {
   return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: session?.timezone }).format(new Date(seconds * 1000));
 }
-function draft(topic) {
-  try { return localStorage.getItem(draftKey(topic)) || ''; } catch { return ''; }
+function draft() {
+  try { return localStorage.getItem(DRAFT_KEY) || ''; } catch { return ''; }
 }
-function renderChat(topic, pageVersion) {
-  currentTopic = topic;
-  const name = topicName(topic);
+function renderChat(pageVersion) {
+  const name = agentName;
   $('#main').className = 'chat-main';
   $('#main').innerHTML = `
     <section class="chat-panel" aria-label="Chat">
       <header class="chat-header">
-        <div class="channel-picker"><span class="topic-label">Topic</span>
-          <button id="chat-topic" type="button" aria-label="Change topic: ${escape(name)}" aria-haspopup="dialog" aria-controls="topic-picker">${escape(name)} <span aria-hidden="true">▾</span></button>
-        </div>
+        <h1 class="chat-title">Chat</h1>
         <div><button id="reset-chat" class="quiet" type="button">Reset context</button></div>
       </header>
       <button id="older-messages" class="quiet older" hidden>Load earlier messages</button>
-      <div id="chat-thread" class="chat-thread" role="log" aria-label="${escape(name)} messages"><div class="loading">Loading messages…</div></div>
+      <div id="chat-thread" class="chat-thread" role="log" aria-label="Messages"><div class="loading">Loading messages…</div></div>
       <form id="chat-form" class="chat-composer">
         <div id="composer-images" class="composer-images" hidden></div>
         <button id="attach-image" class="tool-button" type="button" aria-label="Attach image">${icon('image')}</button>
         <input id="image-input" type="file" accept="image/*" multiple hidden>
-        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft(topic))}</textarea>
+        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft())}</textarea>
         <button id="record-voice" class="tool-button" type="button" aria-label="Record voice message" hidden>${icon('mic')}</button>
         <button class="send-button" type="submit" aria-label="Send message">${icon('send')}</button>
       </form>
-      <p id="chat-status" class="chat-status" role="status">Writing in ${escape(name)} <button id="discard-recording" class="quiet danger" type="button" hidden>Discard recording</button></p>
+      <p id="chat-status" class="chat-status" role="status">Ready <button id="discard-recording" class="quiet danger" type="button" hidden>Discard recording</button></p>
     </section>`;
-  $('#chat-topic').addEventListener('click', () => {
-    const picker = $('#topic-picker');
-    $('#topic-options').innerHTML = topics.filter(t => !t.legacy).map(t =>
-      `<a href="${chatURL(t.id)}" ${t.id === topic ? 'aria-current="page"' : ''}>${escape(t.name)}</a>`
-    ).join('') + (topics.some(t => t.legacy) ? '<h3>Previous web chats</h3>' + topics.filter(t => t.legacy).map(t =>
-      `<a href="${chatURL(t.id)}" ${t.id === topic ? 'aria-current="page"' : ''}>${escape(t.name)}</a>`
-    ).join('') : '');
-    picker.showModal();
-  });
   const active = () => version === pageVersion && Boolean($('#chat-thread'));
   let signature = '', cursor = null, older = [], sending = false, loaded = false;
   let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
@@ -210,15 +196,15 @@ function renderChat(topic, pageVersion) {
   };
   fit();
   function markSeen() {
-    // Tell the server this device is showing the newest reply: focused, on this
-    // topic, scrolled to the end. Other devices then skip the push for it.
+    // Tell the server this device is showing the newest reply: focused, on the
+    // chat, scrolled to the end. Other devices then skip the push for it.
     // Merely being open, or reading older messages, acknowledges nothing.
     if (!active() || document.hidden || !document.hasFocus() || !atEnd($('#chat-thread'))) return;
     const newest = Math.max(0, ...latest.filter(m => m.role === 'assistant').map(m => m.created));
     if (newest <= acked) return;
     const previous = acked;
     acked = newest;
-    api('seen', { space: topic, through: newest }, undefined, true).catch(() => { if (acked === newest) acked = previous; });
+    api('seen', { through: newest }, undefined, true).catch(() => { if (acked === newest) acked = previous; });
   }
   ackVisible = markSeen;
   // Closing the keyboard restores the bottom nav's home-indicator inset, which
@@ -234,7 +220,7 @@ function renderChat(topic, pageVersion) {
     $('#attach-image').disabled = sending || images.length >= MAX_IMAGES;
     $('#discard-recording').hidden = !recorder;
     $('#chat-status').firstChild.textContent = (!navigator.onLine ? 'Offline. Your draft stays on this device.'
-      : activity ? activity : `Writing in ${name}`) + ' ';
+      : activity ? activity : 'Ready') + ' ';
   }
   function setActivity(text) { activity = text; updateComposer(); }
   function renderImages() {
@@ -329,7 +315,7 @@ function renderChat(topic, pageVersion) {
   $('#record-voice').addEventListener('click', () => { if (recorder) stopRecording(); else startRecording().catch(e => toast(e.message)); });
   $('#discard-recording').addEventListener('click', () => stopRecording(true));
   async function loadMessages(loadOlder = false) {
-    const data = await api('messages?space=' + encodeURIComponent(topic) + (loadOlder ? `&before=${cursor}` : ''));
+    const data = await api('messages' + (loadOlder ? `?before=${cursor}` : ''));
     if (!active()) return;
     if (loadOlder) { older = [...data.messages, ...older]; cursor = data.before; await loadMessages(); return; }
     if (!older.length) cursor = data.before;
@@ -366,13 +352,13 @@ function renderChat(topic, pageVersion) {
   }
   $('#older-messages').addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
   $('#reset-chat').addEventListener('click', async () => {
-    if (!confirm(`Start fresh in ${name}? The shared Telegram/web context will reset. Saved messages remain visible and can still be retrieved through history tools.`)) return;
-    try { await api('reset', {space: topic}); if (active()) await route(); toast('Context reset. Saved conversation kept.'); }
+    if (!confirm('Start fresh? The shared Telegram/web context will reset. Saved messages remain visible and can still be retrieved through history tools.')) return;
+    try { await api('reset', {}); if (active()) await route(); toast('Context reset. Saved conversation kept.'); }
     catch (e) { toast(e.message); }
   });
   area.addEventListener('input', () => {
     fit();
-    try { localStorage.setItem(draftKey(topic), area.value); } catch { toast('This browser cannot save drafts. Keep this tab open.'); }
+    try { localStorage.setItem(DRAFT_KEY, area.value); } catch { toast('This browser cannot save drafts. Keep this tab open.'); }
   });
   area.addEventListener('keydown', event => {
     // Touch-first devices keep the keyboard's Return key for newlines.
@@ -398,13 +384,13 @@ function renderChat(topic, pageVersion) {
       setActivity('');
       const attachments = images.map(image => image.path);
       let pending;
-      try { pending = JSON.parse(localStorage.getItem(submissionKey(topic))); } catch {}
+      try { pending = JSON.parse(localStorage.getItem(SUBMISSION_KEY)); } catch {}
       if (pending?.text !== text || JSON.stringify(pending?.attachments || []) !== JSON.stringify(attachments)) pending = { id: crypto.randomUUID(), text, attachments };
-      localStorage.setItem(submissionKey(topic), JSON.stringify(pending));
-      await api('messages', { id: pending.id, space: topic, text, attachments });
+      localStorage.setItem(SUBMISSION_KEY, JSON.stringify(pending));
+      await api('messages', { id: pending.id, text, attachments });
       // Do not erase a new draft typed while the request was in flight.
-      if (draft(topic).trim() === text) localStorage.removeItem(draftKey(topic));
-      localStorage.removeItem(submissionKey(topic));
+      if (draft().trim() === text) localStorage.removeItem(DRAFT_KEY);
+      localStorage.removeItem(SUBMISSION_KEY);
       if (area.value.trim() === text) { area.value = ''; fit(); }
       clearImages();
       await loadMessages();
@@ -418,17 +404,10 @@ async function route() {
   if (!session) return;
   clearInterval(poll);
   const pageVersion = ++version;
-  const [requested, ...parts] = location.hash.slice(1).split('/');
+  const [requested] = location.hash.slice(1).split('/');
   const view = requested === 'now' || requested === 'today' ? 'now' : 'chat';
-  let topic;
-  try { topic = requested === 'chat' ? decodeURIComponent(parts.join('/')) || 'general' : 'general'; }
-  catch { topic = 'general'; }
   $$('[data-nav]').forEach(a => { a.classList.toggle('active', a.dataset.nav === view); a.setAttribute('aria-current', a.dataset.nav === view ? 'page' : 'false'); });
   try {
-    const data = await api('topics');
-    if (pageVersion !== version) return;
-    topics = data.topics;
-    $('#topic-links').innerHTML = topics.filter(t => !t.legacy).map(t => `<a href="${chatURL(t.id)}" ${view === 'chat' && topic === t.id ? 'class="active" aria-current="page"' : ''}><span aria-hidden="true">#</span>${escape(t.name)}</a>`).join('');
     if (view === 'now') {
       $('#breadcrumb').textContent = 'Now'; document.title = `${agentName} · Now`;
       $('#main').className = 'now-main';
@@ -436,9 +415,8 @@ async function route() {
       const page = await api('now');
       if (pageVersion === version) $('#now-content').textContent = page.content || 'wiki/now.md is empty or has not been created yet.';
     } else {
-      if (!topics.some(t => t.id === topic)) { toast('That topic is no longer available. Showing General.'); topic = 'general'; history.replaceState(null, '', '#chat'); }
-      $('#breadcrumb').textContent = 'Chat / ' + topicName(topic); document.title = agentName + ' · ' + topicName(topic);
-      renderChat(topic, pageVersion);
+      $('#breadcrumb').textContent = 'Chat'; document.title = agentName + ' · Chat';
+      renderChat(pageVersion);
     }
   } catch (e) {
     // Keep any open composer/draft visible when the server disappears.
@@ -466,10 +444,6 @@ async function boot() {
 }
 $('#retry-connection').addEventListener('click', boot);
 $('#refresh').addEventListener('click', route);
-$('#close-topics').addEventListener('click', () => $('#topic-picker').close());
-$('#topic-options').addEventListener('click', event => {
-  if (event.target.closest('a')) $('#topic-picker').close();
-});
 window.addEventListener('hashchange', route);
 // iOS keeps the page full height under the keyboard and scrolls the window to
 // reveal the field, taking the header with it. Size the shell to the visual
@@ -562,7 +536,7 @@ function updateBanner() {
 }
 function saveOpenDraft() {
   const area = $('#chat-form textarea');
-  if (area) localStorage.setItem(draftKey(currentTopic), area.value);
+  if (area) localStorage.setItem(DRAFT_KEY, area.value);
 }
 $('#reload-update').addEventListener('click', () => {
   if (pendingMutations || reloadRequested) return;
@@ -580,10 +554,9 @@ $('#reload-update').addEventListener('click', () => {
 });
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', event => {
-    // A notification click: the worker focuses this window and names the channel.
-    if (event.data?.type !== 'OPEN_SPACE' || typeof event.data.space !== 'string') return;
-    const target = chatURL(event.data.space);
-    if (location.hash === target) route(); else location.hash = target;
+    // A notification click: the worker focuses this window and asks for the chat.
+    if (event.data?.type !== 'OPEN_CHAT') return;
+    if (location.hash === '#chat') route(); else location.hash = '#chat';
   });
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     // Initial installation takes control too; it is not an app update.
