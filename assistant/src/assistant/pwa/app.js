@@ -486,6 +486,13 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fitShell);
   viewport.addEventListener('scroll', fitShell);
+  // A keyboard dismissed while the app is in the background fires no viewport
+  // event, so the shrunken shell used to stick on return; recheck when the app
+  // comes back, when focus leaves the field, and on a slow timer while visible.
+  for (const [target, name] of [[window, 'resize'], [window, 'focus'], [window, 'pageshow'], [document, 'visibilitychange'], [document, 'focusout']]) {
+    target.addEventListener(name, fitShell);
+  }
+  setInterval(() => { if (!document.hidden) fitShell(); }, 2000);
 }
 window.addEventListener('focus', () => ackVisible());
 document.addEventListener('visibilitychange', () => ackVisible());

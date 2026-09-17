@@ -104,7 +104,9 @@ async def main():
             # The shell follows a shrunken visual viewport (a software keyboard).
             await page.evaluate("() => document.documentElement.style.setProperty('--shell-height', '500px')")
             await expect(page.locator('.shell')).to_have_css('height', '500px')
-            await page.evaluate("() => document.documentElement.style.removeProperty('--shell-height')")
+            # ...and is recomputed when the app comes back to the foreground, since a
+            # keyboard dismissed in the background fires no viewport event.
+            await page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
             await expect(page.locator('.shell')).to_have_css('height', '844px')
             assert await page.locator('select').count() == 0
             await page.get_by_role('button', name='Change topic: General').click()
