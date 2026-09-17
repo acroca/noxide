@@ -8,22 +8,25 @@ const worker = readFileSync(new URL('../src/assistant/pwa/sw.js', import.meta.ur
 
 test('push displays the channel name and reply, retaining topic navigation', async () => {
   const handlers = {};
-  let notification;
+  let notification, badge;
   vm.runInNewContext(worker, {
     self: {
       addEventListener: (name, handler) => { handlers[name] = handler; },
       registration: { showNotification: async (title, options) => { notification = { title, ...options }; } },
+      navigator: { setAppBadge: async count => { badge = count; } },
     },
   });
   let pending;
   handlers.push({
-    data: { json: () => ({ space: 'topic:10', body: 'Hello there! This is the test reminder', agent_name: 'Cedar', channel_name: 'Health' }) },
+    data: { json: () => ({ space: 'topic:10', body: 'Hello there! This is the test reminder', agent_name: 'Cedar', channel_name: 'Health', unread: 3 }) },
     waitUntil: promise => { pending = promise; },
   });
   await pending;
   assert.equal(notification.title, 'Health');
   assert.equal(notification.body, 'Hello there! This is the test reminder');
   assert.equal(notification.data.space, 'topic:10');
+  assert.equal(badge, 3);
+  badge = undefined;
 
   // Previously queued pushes have no body; malformed pushes still display safely.
   for (const data of [{ json: () => ({ space: 'general' }) }, { json: () => { throw Error('bad JSON'); } }]) {
@@ -31,6 +34,7 @@ test('push displays the channel name and reply, retaining topic navigation', asy
     await pending;
     assert.equal(notification.title, 'General');
     assert.equal(notification.body, 'You have a new update. Open Juniper to read it.');
+    assert.equal(badge, undefined);
   }
 });
 

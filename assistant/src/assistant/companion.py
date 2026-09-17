@@ -109,13 +109,20 @@ class Companion:
             );
             CREATE INDEX IF NOT EXISTS message_space ON messages(space, created);
             CREATE TABLE IF NOT EXISTS subscriptions (endpoint TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS seen (space TEXT PRIMARY KEY, through REAL NOT NULL);
+            -- Replies from before a space had any seen mark start out read, so
+            -- the unread badge never opens on the whole history.
+            INSERT OR IGNORE INTO seen (space, through)
+                SELECT space, max(created) FROM messages WHERE role='assistant' AND status!='deleted' GROUP BY space;
         """)
         self.db.commit()
         self.tasks: dict[str, asyncio.Task] = {}
         self.push_tasks: set[asyncio.Task] = set()
         # Newest message timestamp a focused device reported displaying, per
-        # space. In-memory only: it only matters within the push grace window.
-        self.seen: dict[str, float] = {}
+        # space: skips the push for a reply already on screen, and everything
+        # newer is the unread count behind the app badge. Persisted, since the
+        # badge must survive a restart.
+        self.seen: dict[str, float] = {row["space"]: row["through"] for row in self.db.execute("SELECT space, through FROM seen")}
         self.hot: set[str] = set()
         self.accepting = True
         self.runner: web.AppRunner | None = None
@@ -323,6 +330,7 @@ class Companion:
         # reset that no message has followed yet.
         return web.json_response({"messages": [dict(r) for r in reversed(rows[:MESSAGE_PAGE])],
                                   "before": rows[MESSAGE_PAGE - 1]["created"] if len(rows) > MESSAGE_PAGE else None,
+                                  "unread": self.unread_count(),
                                   "generation": self.archive.generation(space)})
 
     def _insert(self, space, role, text, status, *, message_id=None, reply_to=None, metadata=None):
@@ -571,7 +579,19 @@ class Companion:
         if isinstance(through, bool) or not isinstance(through, (int, float)) or not math.isfinite(through):
             raise web.HTTPBadRequest(text="A message timestamp is required")
         self.seen[space] = max(self.seen.get(space, 0.0), float(through))
+        self.db.execute("INSERT INTO seen (space, through) VALUES (?, ?) ON CONFLICT(space) DO UPDATE SET through=max(through, excluded.through)",
+                        (space, float(through)))
+        self.db.commit()
         return web.json_response({"ok": True})
+
+    def unread_count(self):
+        """Replies newer than each listed space's seen mark: the app badge number."""
+        spaces = [topic["id"] for topic in self._topics()]
+        return self.db.execute(
+            f"SELECT count(*) FROM messages m WHERE m.role='assistant' AND m.status!='deleted'"
+            f" AND m.space IN ({','.join('?' * len(spaces))})"
+            " AND m.created > COALESCE((SELECT through FROM seen WHERE space=m.space), 0)",
+            spaces).fetchone()[0]
 
     def notify_push(self, space="general", text="", *, grace=True):
         if not self.public_key or len(self.push_tasks) >= 8:
@@ -605,7 +625,7 @@ class Companion:
         if space.startswith("wiki/"):
             channel = space.rsplit("/", 1)[-1].removesuffix(".md")
         payload = json.dumps({"space": space, "body": body, "agent_name": self.cfg.agent_name,
-                              "channel_name": channel[:100]}, ensure_ascii=False)
+                              "channel_name": channel[:100], "unread": self.unread_count()}, ensure_ascii=False)
 
         def deliver(subscription):
             with Session() as transport:

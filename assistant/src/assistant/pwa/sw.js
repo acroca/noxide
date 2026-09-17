@@ -29,6 +29,8 @@ self.addEventListener('push', event => {
     if (typeof data.agent_name === 'string' && data.agent_name.trim()) name = data.agent_name;
     if (typeof data.channel_name === 'string' && data.channel_name.trim()) channel = data.channel_name;
     if (typeof data.body === 'string' && data.body.trim()) body = data.body;
+    // The app badge counts unread replies; the server sends the total with each push.
+    if (Number.isInteger(data.unread) && data.unread >= 0) self.navigator?.setAppBadge?.(data.unread)?.catch?.(() => {});
   } catch {}
   event.waitUntil(self.registration.showNotification(channel || (space === 'general' ? 'General' : name), {
     body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png', tag: 'noxide-update', data: {space}

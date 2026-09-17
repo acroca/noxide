@@ -25,6 +25,14 @@ let hadController = Boolean(navigator.serviceWorker?.controller);
 let ackVisible = () => {};
 const draftKey = topic => `noxide-draft:${topic}`;
 const THEME_KEY = 'noxide-theme';
+// The app badge on the Home Screen icon: unread replies across topics, as the
+// server counts them from each space's seen mark. Unsupported browsers ignore it.
+function showBadge(count) {
+  try {
+    const done = count > 0 ? navigator.setAppBadge?.(count) : navigator.clearAppBadge?.();
+    done?.catch?.(() => {});
+  } catch {}
+}
 function themePreference() { try { return localStorage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; } }
 const submissionKey = topic => `noxide-submission:${topic}`;
 const chatURL = topic => '#chat/' + encodeURIComponent(topic);
@@ -321,6 +329,7 @@ function renderChat(topic, pageVersion) {
     if (loadOlder) { older = [...data.messages, ...older]; cursor = data.before; await loadMessages(); return; }
     if (!older.length) cursor = data.before;
     $('#older-messages').hidden = cursor === null;
+    if (Number.isInteger(data.unread)) showBadge(data.unread);
     const nextSignature = JSON.stringify([data.messages, older, data.generation]);
     loaded = true;
     latest = data.messages;

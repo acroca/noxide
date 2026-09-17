@@ -214,7 +214,7 @@ async def test_push_keys_persist_and_endpoints_are_restricted(companion):
     with patch("pywebpush.webpush") as send:
         await service._push("general", "Hello there! This is the test reminder")
         assert json.loads(send.call_args.kwargs["data"]) == {
-            "space": "general", "body": "Hello there! This is the test reminder", "agent_name": service.cfg.agent_name, "channel_name": "General"}
+            "space": "general", "body": "Hello there! This is the test reminder", "agent_name": service.cfg.agent_name, "channel_name": "General", "unread": 0}
         assert send.call_args.kwargs["requests_session"].max_redirects == 0
     assert (await client.delete("/api/push", json={"endpoint": endpoint})).status == 200
     assert service.db.execute("SELECT count(*) FROM subscriptions").fetchone()[0] == 0
@@ -238,7 +238,7 @@ async def test_push_preview_is_bounded_and_preserves_unicode(companion):
         await service._push("topic:10", "\U0001f331" * 2000)
     payload = send.call_args.kwargs["data"]
     assert len(payload.encode("utf-8")) < 3000
-    assert json.loads(payload) == {"space": "topic:10", "body": "\U0001f331" * 500 + "...", "agent_name": service.cfg.agent_name, "channel_name": "Health"}
+    assert json.loads(payload) == {"space": "topic:10", "body": "\U0001f331" * 500 + "...", "agent_name": service.cfg.agent_name, "channel_name": "Health", "unread": 0}
 
 
 async def test_agent_name_in_shell_manifest_session_and_worker(companion):
@@ -310,6 +310,31 @@ async def test_push_waits_a_grace_period_and_skips_replies_seen_on_a_focused_dev
         assert (await client.post("/api/push/test", json={})).status == 200
         await asyncio.gather(*service.push_tasks)
         push.assert_called_once_with("general", "Hello there! This is the test reminder")
+
+
+async def test_unread_count_follows_seen_marks_and_survives_restart(companion):
+    service, client = companion
+    first = service._insert("general", "assistant", "One", "done")
+    service._insert("general", "assistant", "Two", "done")
+    service._insert("topic:99", "assistant", "Unlisted topic", "done")  # not in the index: never counted
+    assert (await (await client.get("/api/messages")).json())["unread"] == 2
+    # A companion started over existing replies with no seen marks treats
+    # them as read rather than badging the whole history.
+    fresh = Companion(service.cfg, service.agent, service.vault, service.scheduler, archive=service.archive)
+    assert fresh.unread_count() == 0 and service.unread_count() == 0
+    through = service.db.execute("SELECT created FROM messages WHERE id=?", (first,)).fetchone()["created"]
+    assert (await client.post("/api/seen", json={"space": "general", "through": through})).status == 200
+    assert service.unread_count() == 0  # the baseline mark is newer and stays
+    service._insert("general", "assistant", "Three", "done")
+    assert (await (await client.get("/api/messages")).json())["unread"] == 1
+    restarted = Companion(service.cfg, service.agent, service.vault, service.scheduler, archive=service.archive)
+    assert restarted.seen["general"] == fresh.seen["general"] and restarted.unread_count() == 1
+    service.public_key = "configured"
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/test",
+                                       "keys": {"p256dh": "a" * 87, "auth": "b" * 22}})
+    with patch("pywebpush.webpush") as send:
+        await service._push("general", "Three")
+    assert json.loads(send.call_args.kwargs["data"])["unread"] == 1
 
 
 async def test_seen_marker_only_advances_and_rejects_bad_input(companion):

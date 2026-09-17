@@ -17,7 +17,7 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True, "replies": {}, "generation": 0, "voice": False}
+    state = {"revision": 1, "available": True, "authorized": True, "replies": {}, "generation": 0, "voice": False, "unread": 0}
     seen, uploads, submissions = [], [], []
     release = asyncio.Event()
     release.set()
@@ -48,7 +48,7 @@ async def main():
                 return web.json_response({"ok": True})
             space = request.query.get("space", "general")
             return web.json_response({"messages": state["replies"].get(space, []), "before": None,
-                                      "generation": state["generation"]})
+                                      "generation": state["generation"], "unread": state["unread"]})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
             name = "icon.svg"
@@ -74,6 +74,10 @@ async def main():
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             context = await browser.new_context(viewport={"width": 390, "height": 844})
+            # Record App Badging calls; headless Chromium accepts them silently.
+            await context.add_init_script("""window.__badges = [];
+                navigator.setAppBadge = async n => { window.__badges.push(n); };
+                navigator.clearAppBadge = async () => { window.__badges.push('clear'); };""")
             page = await context.new_page()
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -216,6 +220,12 @@ async def main():
             await expect(page.locator("#chat-status")).to_contain_text("Writing in General")
             state["replies"]["general"].pop()
             await expect(page.locator(".message-status")).to_have_count(0)
+
+            # The Home Screen badge follows the server's unread count.
+            state["unread"] = 2
+            await page.wait_for_function("() => window.__badges.at(-1) === 2")
+            state["unread"] = 0
+            await page.wait_for_function("() => window.__badges.at(-1) === 'clear'")
 
             # The composer starts one line tall and grows with the text.
             height = "() => document.querySelector('#chat-form textarea').offsetHeight"
