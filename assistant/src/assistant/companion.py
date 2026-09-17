@@ -42,6 +42,9 @@ PUSH_GRACE_SECONDS = 5
 # Newest messages a topic opens with; the same page feeds the 2.2s poll, so it
 # is kept small. Earlier pages load behind the timeline's manual link.
 MESSAGE_PAGE = 20
+# Web runs in flight across all spaces, queued ones included; each space still
+# runs one at a time behind the agent's conversation lock.
+MAX_IN_FLIGHT = 16
 # Uploads match Telegram's 20 MB download cap; bodies are read from the
 # stream in chunks, so the app-wide JSON body limit does not apply to them.
 UPLOAD_BYTES = 20 * 1024 * 1024
@@ -344,11 +347,11 @@ class Companion:
             if existing["space"] != space or existing["text"] != text:
                 raise web.HTTPConflict(text="Message ID already used")
             return web.json_response({"id": message_id}, status=202)
-        if len(self.tasks) >= 4:
-            raise web.HTTPTooManyRequests(text="Four messages are already in progress. Try again shortly.")
-        if self.db.execute("SELECT 1 FROM messages WHERE space=? AND source='web' AND role='user' AND status NOT IN ('done','dismissed','deleted')",
-                           (space,)).fetchone():
-            raise web.HTTPConflict(text="Finish or clear the pending message in this space first")
+        if len(self.tasks) >= MAX_IN_FLIGHT:
+            raise web.HTTPTooManyRequests(text="Too many messages are in progress. Try again shortly.")
+        # Several messages may be pending in one space: each is its own run,
+        # serialized in arrival order by Agent.run's conversation lock, so a
+        # later reply sees the earlier exchange in its history.
         self._insert(space, "user", text, "queued", message_id=message_id,
                      metadata={"attachments": attachments} if attachments else None)
         self._launch(message_id)
@@ -390,7 +393,9 @@ class Companion:
 
     async def _process(self, message_id):
         row = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
-        self.db.execute("UPDATE messages SET status='running', error='' WHERE id=?", (message_id,))
+        # Stays 'queued' while waiting behind the space's earlier messages;
+        # Agent.run marks it 'running' once it holds the conversation lock.
+        self.db.execute("UPDATE messages SET error='' WHERE id=?", (message_id,))
         self.db.commit()
 
         async def send(text, thread_id=None):
@@ -406,6 +411,8 @@ class Companion:
             if image_data_urls:
                 archive_kwargs["image_data_urls"] = image_data_urls
             if message_id in self.hot:
+                self.db.execute("UPDATE messages SET status='running' WHERE id=?", (message_id,))
+                self.db.commit()
                 reply = await self.agent.retry_message(WEB_CHAT_ID, thread, text,
                                                        str(row["created"]), hot=True,
                                                        send_message_fn=send, extra_context=_WEB_CONTEXT, **archive_kwargs)
@@ -447,7 +454,7 @@ class Companion:
         row = self.db.execute("SELECT * FROM messages WHERE id=? AND role='user'", (message_id,)).fetchone()
         if not row or row["source"] != "web":
             raise web.HTTPNotFound(text="Message not found")
-        if not self.accepting or len(self.tasks) >= 4:
+        if not self.accepting or len(self.tasks) >= MAX_IN_FLIGHT:
             raise web.HTTPServiceUnavailable(text="Service busy; try shortly")
         if row["status"] not in ("failed", "unavailable", "interrupted"):
             raise web.HTTPConflict(text="This message is not awaiting retry")

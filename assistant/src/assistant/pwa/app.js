@@ -188,7 +188,7 @@ function renderChat(topic, pageVersion) {
     picker.showModal();
   });
   const active = () => version === pageVersion && Boolean($('#chat-thread'));
-  let signature = '', cursor = null, older = [], busy = false, sending = false, loaded = false;
+  let signature = '', cursor = null, older = [], sending = false, loaded = false;
   let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
   const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
   // One line tall, growing with the text up to the stylesheet's cap; the thread's
@@ -217,12 +217,11 @@ function renderChat(topic, pageVersion) {
   new ResizeObserver(() => { if (stickToEnd) thread.scrollTop = thread.scrollHeight; }).observe(thread);
   function updateComposer() {
     if (!active()) return;
-    button.disabled = !loaded || busy || sending || !navigator.onLine || Boolean(recorder);
+    button.disabled = !loaded || sending || !navigator.onLine || Boolean(recorder);
     $('#attach-image').disabled = sending || images.length >= MAX_IMAGES;
     $('#discard-recording').hidden = !recorder;
     $('#chat-status').firstChild.textContent = (!navigator.onLine ? 'Offline. Your draft stays on this device.'
-      : activity ? activity
-      : busy ? 'Finish or clear the pending message before sending another.' : `Writing in ${name}`) + ' ';
+      : activity ? activity : `Writing in ${name}`) + ' ';
   }
   function setActivity(text) { activity = text; updateComposer(); }
   function renderImages() {
@@ -324,7 +323,6 @@ function renderChat(topic, pageVersion) {
     $('#older-messages').hidden = cursor === null;
     const nextSignature = JSON.stringify([data.messages, older, data.generation]);
     loaded = true;
-    busy = data.messages.some(m => m.role === 'user' && m.source !== 'telegram' && !['done', 'dismissed'].includes(m.status));
     latest = data.messages;
     updateComposer();
     if (nextSignature === signature) { markSeen(); return; }
@@ -372,7 +370,7 @@ function renderChat(topic, pageVersion) {
   });
   $('#chat-form').addEventListener('submit', async event => {
     event.preventDefault();
-    if (sending || busy || !loaded || recorder) return;
+    if (sending || !loaded || recorder) return;
     const text = area.value.trim(); if (!text && !images.length) return;
     if (!navigator.onLine) { toast('You’re offline. Your draft has not been sent.'); return; }
     sending = true; updateComposer();

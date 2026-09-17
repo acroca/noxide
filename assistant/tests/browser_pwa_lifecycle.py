@@ -207,6 +207,16 @@ async def main():
             await expect(page.get_by_label("Message to General")).to_have_value("half-written")
             await page.get_by_label("Message to General").fill("")
 
+            # A message still being answered does not block the next one: it
+            # queues behind it on the server, so Send stays enabled.
+            state["replies"]["general"].append({"id": "u9", "space": "general", "role": "user", "text": "First", "status": "queued",
+                                                "created": 1700000004.5, "source": "web", "generation": 1})
+            await expect(page.locator(".message-status")).to_have_text("Queued…")
+            await expect(page.get_by_role("button", name="Send message", exact=True)).to_be_enabled()
+            await expect(page.locator("#chat-status")).to_contain_text("Writing in General")
+            state["replies"]["general"].pop()
+            await expect(page.locator(".message-status")).to_have_count(0)
+
             # The composer starts one line tall and grows with the text.
             height = "() => document.querySelector('#chat-form textarea').offsetHeight"
             one_line = await page.evaluate(height)

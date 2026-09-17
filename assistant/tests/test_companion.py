@@ -103,7 +103,7 @@ async def test_overview_reads_vault_and_schedules_without_llm(companion):
     assert "Growing nicely" in data["content"]
 
 
-async def test_submit_idempotency_pending_guard_and_project_context(companion):
+async def test_submit_idempotency_queueing_and_project_context(companion):
     service, client = companion
     service.vault.write_file("wiki/projects/garden.md", "# Garden")
     release = asyncio.Event()
@@ -119,19 +119,28 @@ async def test_submit_idempotency_pending_guard_and_project_context(companion):
         assert (await client.post("/api/messages", json=data)).status == 202
         assert (await client.post("/api/messages", json=data)).status == 202
         assert (await client.post("/api/messages", json={**data, "text": "different"})).status == 409
-        assert (await client.post("/api/messages", json={**data, "id": "b" * 32})).status == 409
+        # A second message queues behind the first instead of being refused;
+        # Agent.run's conversation lock answers them in order.
+        assert (await client.post("/api/messages", json={**data, "id": "b" * 32, "text": "And fed them"})).status == 202
+        timeline = await (await client.get("/api/messages?space=" + data["space"])).json()
+        assert [(m["text"], m["status"]) for m in timeline["messages"]] == [("Watered the plants", "queued"), ("And fed them", "queued")]
         assert (await client.post("/api/reset", json={"space": data["space"]})).status == 409
     finally:
         release.set()
     await settle(service)
-    service.agent.run.assert_awaited_once()
-    call = service.agent.run.call_args
+    assert [c.args[1].split("]")[-1].strip() for c in service.agent.run.call_args_list] == ["Watered the plants", "And fed them"]
+    # The mock agent has no conversation lock, so its runs interleave here;
+    # ordering is Agent.run's job. Each message still gets its own replies.
+    timeline = await (await client.get("/api/messages?space=" + data["space"])).json()
+    assert all(m["status"] == "done" for m in timeline["messages"])
+    replies = [m["reply_to"] for m in timeline["messages"] if m["role"] == "assistant"]
+    assert sorted(replies) == sorted(["a" * 32] * 2 + ["b" * 32] * 2)
+    call = service.agent.run.call_args_list[0]
     assert call.args[0] == WEB_CHAT_ID
     assert "wiki/projects/garden.md" in call.args[1]
     assert call.kwargs["thread_id"] == service._space(data["space"])
     rows = (await (await client.get("/api/messages", params={"space": data["space"]})).json())["messages"]
-    assert [r["text"] for r in rows] == [data["text"], "An intermediate update", "Finished"]
-    assert all(r["status"] == "done" for r in rows)
+    assert sorted(r["text"] for r in rows) == sorted([data["text"], "And fed them"] + ["An intermediate update", "Finished"] * 2)
     assert (await (await client.get("/api/messages")).json())["messages"] == []
 
 
