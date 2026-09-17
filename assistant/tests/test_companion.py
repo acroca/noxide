@@ -187,6 +187,27 @@ async def test_messages_open_on_a_small_page_with_older_ones_behind_a_cursor(com
     assert [m["text"] for m in older["messages"]] == ["m0"] and older["before"] is None
 
 
+async def test_web_search_shows_on_the_running_message(companion):
+    service, client = companion
+    release = asyncio.Event()
+
+    async def run(*args, **kwargs):
+        await kwargs["on_research"]()
+        await release.wait()
+        return "Found it."
+
+    service.agent.run.side_effect = run
+    data = {"id": "c" * 32, "space": "general", "text": "What is the capital of Bhutan?"}
+    assert (await client.post("/api/messages", json=data)).status == 202
+    await asyncio.sleep(0)
+    timeline = await (await client.get("/api/messages")).json()
+    assert timeline["messages"][0]["activity"] == "Searching the web…"
+    release.set()
+    await settle(service)
+    timeline = await (await client.get("/api/messages")).json()
+    assert "activity" not in timeline["messages"][0] and service.activity == {}
+
+
 async def test_reset_marks_a_new_generation_the_timeline_can_draw(companion):
     service, client = companion
     service._insert("general", "user", "before", "done")

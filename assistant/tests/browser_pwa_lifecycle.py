@@ -219,6 +219,8 @@ async def main():
             state["replies"]["general"].append({"id": "u9", "space": "general", "role": "user", "text": "First", "status": "queued",
                                                 "created": 1700000004.5, "source": "web", "generation": 1})
             await expect(page.locator(".message-status")).to_have_text("Queued…")
+            state["replies"]["general"][-1]["activity"] = "Searching the web…"
+            await expect(page.locator(".message-status")).to_have_text("Searching the web…")
             await expect(page.get_by_role("button", name="Send message", exact=True)).to_be_enabled()
             await expect(page.locator("#chat-status")).to_contain_text("Writing in General")
             state["replies"]["general"].pop()

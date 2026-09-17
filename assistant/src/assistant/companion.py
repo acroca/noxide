@@ -124,6 +124,9 @@ class Companion:
         # badge must survive a restart.
         self.seen: dict[str, float] = {row["space"]: row["through"] for row in self.db.execute("SELECT space, through FROM seen")}
         self.hot: set[str] = set()
+        # What a running message is doing right now, shown on its status line;
+        # in memory only, since a restart marks the message interrupted anyway.
+        self.activity: dict[str, str] = {}
         self.accepting = True
         self.runner: web.AppRunner | None = None
         self.push_key = cfg.state_dir / "webpush.pem"
@@ -328,7 +331,11 @@ class Companion:
                                (space, before, MESSAGE_PAGE + 1)).fetchall()
         # The current generation lets the timeline draw a divider after a
         # reset that no message has followed yet.
-        return web.json_response({"messages": [dict(r) for r in reversed(rows[:MESSAGE_PAGE])],
+        messages = [dict(r) for r in reversed(rows[:MESSAGE_PAGE])]
+        for message in messages:
+            if message["id"] in self.activity:
+                message["activity"] = self.activity[message["id"]]
+        return web.json_response({"messages": messages,
                                   "before": rows[MESSAGE_PAGE - 1]["created"] if len(rows) > MESSAGE_PAGE else None,
                                   "unread": self.unread_count(),
                                   "generation": self.archive.generation(space)})
@@ -430,9 +437,12 @@ class Companion:
                     text = "[Explicit retry after interruption; earlier work may have partially completed. Re-read state before acting.] " + text
                 if row["space"].startswith("wiki/"):
                     text = f"[Web space: {row['space']}. Read this owning page for relevant state.]\n{text}"
+                async def researching():
+                    self.activity[message_id] = "Searching the web…"
+
                 reply = await self.agent.run(
                     WEB_CHAT_ID, text, thread_id=thread, send_message_fn=send,
-                    extra_context=_WEB_CONTEXT,
+                    extra_context=_WEB_CONTEXT, on_research=researching,
                     source="web", **archive_kwargs,
                 )
             if reply == MAX_ITERATIONS_REPLY:
@@ -454,6 +464,7 @@ class Companion:
             self.db.execute("UPDATE messages SET status='failed', error=? WHERE id=?",
                             ("The run could not finish. Work may have partially completed; review before retrying.", message_id))
         finally:
+            self.activity.pop(message_id, None)
             self.db.commit()
 
     async def retry(self, request):
