@@ -89,20 +89,23 @@ async def main():
             await page.wait_for_function("() => !!navigator.serviceWorker.controller")
             await expect(page.locator("#update-banner")).to_be_hidden()
 
-            # Simulate the phone's home-indicator inset without a software
-            # keyboard: the nav carries it; composer focus hides the nav
-            # altogether so nothing of ours sits between input and keyboard.
+            # On the phone the navigation lives in the header, so the composer
+            # is the bottom edge: it carries the home-indicator inset, dropped
+            # while the field has focus and the keyboard sits below the shell.
+            await expect(page.locator('.topbar-nav a.active')).to_have_text('Chat')
+            assert await page.evaluate("() => document.querySelector('.topbar-nav').getBoundingClientRect().top < 54")
             await page.add_style_tag(content=":root{--navigation-safe-area:34px}")
             await area.blur()
-            await expect(page.locator('.mobile-nav')).to_have_css('padding-bottom', '40px')
-            await expect(page.locator('.mobile-nav')).to_have_css('height', '85px')
+            await expect(page.locator('.chat-status')).to_have_css('padding-bottom', '43px')
             await area.focus()
-            await page.set_viewport_size({"width": 390, "height": 544})
-            await expect(page.locator('.mobile-nav')).to_be_hidden()
-            await page.set_viewport_size({"width": 390, "height": 844})
+            await expect(page.locator('.chat-status')).to_have_css('padding-bottom', '9px')
             await area.blur()
-            await expect(page.locator('.mobile-nav')).to_be_visible()
-            await expect(page.locator('.mobile-nav')).to_have_css('height', '85px')
+            await expect(page.locator('.chat-status')).to_have_css('padding-bottom', '43px')
+            # The shell follows a shrunken visual viewport (a software keyboard).
+            await page.evaluate("() => document.documentElement.style.setProperty('--shell-height', '500px')")
+            await expect(page.locator('.shell')).to_have_css('height', '500px')
+            await page.evaluate("() => document.documentElement.style.removeProperty('--shell-height')")
+            await expect(page.locator('.shell')).to_have_css('height', '844px')
             assert await page.locator('select').count() == 0
             await page.get_by_role('button', name='Change topic: General').click()
             await expect(page.get_by_role('dialog', name='Choose a topic')).to_be_visible()
@@ -285,7 +288,7 @@ async def main():
             state["replies"]["general"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
             await expect(page.locator(".message-meta span")).to_have_count(1)
             await expect(page.locator(".message-meta span")).to_have_text("Web")
-            # Blurring the composer brings the nav back and shrinks the thread;
+            # Blurring the composer restores its inset and shrinks the thread;
             # the thread stays anchored to its end, unless the reader scrolled up.
             # Chromium re-anchors a shrinking scroller by itself, so this cannot
             # fail here without the fix; WebKit (iOS) leaves the offset and ends
@@ -306,6 +309,17 @@ async def main():
             await page.get_by_label("Message to General").blur()
             await asyncio.sleep(0.5)
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 0
+            # Growing the composer by several lines moves neither an end-anchored
+            # thread nor one the reader scrolled up in.
+            await page.get_by_label("Message to General").fill("")
+            await page.evaluate("() => { const t = document.querySelector('#chat-thread'); t.scrollTop = t.scrollHeight; }")
+            await page.get_by_label("Message to General").fill("one\ntwo\nthree\nfour\nfive")
+            assert await page.evaluate(f"() => ({gap})()") < 1
+            await page.get_by_label("Message to General").fill("")
+            await page.evaluate("() => { document.querySelector('#chat-thread').scrollTop = 120; }")
+            await page.get_by_label("Message to General").fill("one\ntwo\nthree\nfour\nfive")
+            assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 120
+            await page.get_by_label("Message to General").fill("")
             # Images: a pasted screenshot becomes a pending thumbnail, is
             # uploaded on send, and the stored path rides on the message.
             assert await page.locator("#record-voice").is_hidden()  # no transcriber configured

@@ -199,11 +199,16 @@ function renderChat(topic, pageVersion) {
   let signature = '', cursor = null, older = [], sending = false, loaded = false;
   let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
   const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
-  // One line tall, growing with the text up to the stylesheet's cap; the thread's
-  // ResizeObserver keeps it anchored to its end as the composer takes room.
-  const fit = () => { area.style.height = 'auto'; area.style.height = area.scrollHeight + 'px'; };
-  fit();
   const atEnd = thread => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+  // One line tall, growing with the text up to the stylesheet's cap. Measuring
+  // means shrinking to one line first, which lets the thread grow and clamps
+  // its scroll position; put the thread back where it was in the same step.
+  const fit = () => {
+    const thread = $('#chat-thread'), wasAtEnd = thread && atEnd(thread), top = thread?.scrollTop;
+    area.style.height = 'auto'; area.style.height = area.scrollHeight + 'px';
+    if (thread) thread.scrollTop = wasAtEnd ? thread.scrollHeight : top;
+  };
+  fit();
   function markSeen() {
     // Tell the server this device is showing the newest reply: focused, on this
     // topic, scrolled to the end. Other devices then skip the push for it.
@@ -466,6 +471,22 @@ $('#topic-options').addEventListener('click', event => {
   if (event.target.closest('a')) $('#topic-picker').close();
 });
 window.addEventListener('hashchange', route);
+// iOS keeps the page full height under the keyboard and scrolls the window to
+// reveal the field, taking the header with it. Size the shell to the visual
+// viewport instead and hold the window at the top, so the header stays and the
+// composer sits right above the keyboard. Pinch zoom also shrinks the visual
+// viewport, so only an unscaled shrink counts.
+if (window.visualViewport) {
+  const viewport = window.visualViewport;
+  const fitShell = () => {
+    const short = Math.abs(viewport.scale - 1) < 0.01 && viewport.height < window.innerHeight - 1;
+    if (short) document.documentElement.style.setProperty('--shell-height', `${Math.round(viewport.height)}px`);
+    else document.documentElement.style.removeProperty('--shell-height');
+    if (short && (window.scrollY || viewport.offsetTop)) window.scrollTo(0, 0);
+  };
+  viewport.addEventListener('resize', fitShell);
+  viewport.addEventListener('scroll', fitShell);
+}
 window.addEventListener('focus', () => ackVisible());
 document.addEventListener('visibilitychange', () => ackVisible());
 function connectivity() {
