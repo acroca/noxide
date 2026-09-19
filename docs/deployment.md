@@ -197,6 +197,15 @@ Delivery depends on the OS, browser permissions and network; Telegram remains
 the primary reminder delivery channel, and successful agent-originated Telegram
 sends are archived and shown in the web chat too.
 
+**Restart notices.** The bot tells Telegram when it is restarting and when it
+is back. The web app can hear the same: under Notifications, "Tell this device
+when … restarts" turns restart notices on for that device only, since a bot
+restarted on every deploy would otherwise notify every phone. A start that
+follows an app update says so, and opening the app then offers the reload. A
+restart that had to drop queued messages, or a reminder dropped after a Copilot
+outage, notifies every registered device regardless. Restart notices keep their
+own notification slot, never replace an unread reply and never change the badge.
+
 **Disconnects and restarts.** The shell is available offline, but API responses
 and vault pages are never put in the service-worker cache. Drafts stay in local
 storage on that device, and are never submitted automatically. Preferences has

@@ -159,10 +159,13 @@ async def _run(config_path: Path | None) -> None:
                 chat_id=item.chat_id,
             )
         else:
-            await bot.notify_lifecycle(
+            dropped = (
                 f"A reminder queued during a Copilot outage failed and was "
                 f"dropped: {item.text[:200]}"
             )
+            await bot.notify_lifecycle(dropped)
+            if companion is not None:
+                companion.notify_lifecycle(dropped, important=True)
 
     async def run_job(prompt: str) -> None:
         _require_completed(await agent.run_job(prompt))
@@ -289,6 +292,7 @@ async def _run(config_path: Path | None) -> None:
         if not lifecycle.stop.is_set():
             if companion is not None:
                 await companion.start()
+                companion.notify_lifecycle(companion.startup_message())
             # Even overdue date jobs must wait for Telegram readiness, not
             # just recurring catch-up: a failed delivery consumes a one-off.
             scheduler.start()

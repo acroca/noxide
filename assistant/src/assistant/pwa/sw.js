@@ -22,16 +22,21 @@ self.addEventListener('push', event => {
   let name = AGENT_NAME;
   let body;
   let thread = null;
+  let lifecycle = false;
   try {
     const data = event.data.json();
     if (typeof data.agent_name === 'string' && data.agent_name.trim()) name = data.agent_name;
     if (typeof data.body === 'string' && data.body.trim()) body = data.body;
     if (typeof data.thread === 'string' && data.thread) thread = data.thread;
+    // A restart notice (opt-in per device) keeps its own tag so it never
+    // replaces an unread reply on the lock screen, and leaves the badge alone.
+    lifecycle = data.kind === 'lifecycle';
     // The app badge counts unread replies; the server sends the total with each push.
-    if (Number.isInteger(data.unread) && data.unread >= 0) self.navigator?.setAppBadge?.(data.unread)?.catch?.(() => {});
+    if (!lifecycle && Number.isInteger(data.unread) && data.unread >= 0) self.navigator?.setAppBadge?.(data.unread)?.catch?.(() => {});
   } catch {}
   event.waitUntil(self.registration.showNotification(name, {
-    body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png', tag: 'noxide-update', data: {thread}
+    body: body || `You have a new update. Open ${name} to read it.`, icon: '/icon-192.png', badge: '/icon-192.png',
+    tag: lifecycle ? 'noxide-lifecycle' : 'noxide-update', data: {thread}
   }));
 });
 self.addEventListener('notificationclick', event => {

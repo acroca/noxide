@@ -190,3 +190,46 @@ async def test_drain_failure_does_not_block_close() -> None:
     await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event())
 
     bot.close.assert_awaited_once()
+
+
+async def test_shutdown_pushes_the_notice_to_the_web_companion() -> None:
+    companion = MagicMock()
+    companion.notify_lifecycle = MagicMock(return_value=None)
+    companion.drain = AsyncMock()
+
+    await graceful_shutdown(bot=_bot(pending=1), scheduler=_scheduler(), force=asyncio.Event(), companion=companion)
+
+    companion.notify_lifecycle.assert_called_once()
+    text, kwargs = companion.notify_lifecycle.call_args.args[0], companion.notify_lifecycle.call_args.kwargs
+    assert text.startswith("Restarting") and "1" in text and kwargs == {"important": False}
+
+
+async def test_dropped_messages_push_to_every_device_and_are_waited_for() -> None:
+    """The important push runs after the drain was given up, so nothing else awaits it."""
+    delivered = asyncio.Event()
+
+    async def push() -> None:
+        await asyncio.sleep(0.01)
+        delivered.set()
+
+    companion = MagicMock()
+    companion.notify_lifecycle = MagicMock(side_effect=lambda text, important: asyncio.create_task(push()) if important else None)
+    companion.drain = AsyncMock(side_effect=_never_finishes)
+    bot = _bot(pending=2)
+    bot.drain = AsyncMock(side_effect=_never_finishes)
+
+    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event(), budget=0.05, companion=companion)
+
+    assert delivered.is_set()
+    assert companion.notify_lifecycle.call_args_list[-1].kwargs == {"important": True}
+
+
+async def test_companion_push_failure_does_not_block_shutdown() -> None:
+    companion = MagicMock()
+    companion.notify_lifecycle = MagicMock(side_effect=RuntimeError("no key"))
+    companion.drain = AsyncMock()
+    bot = _bot()
+
+    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event(), companion=companion)
+
+    bot.close.assert_awaited_once()

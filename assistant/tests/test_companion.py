@@ -630,3 +630,49 @@ async def test_transcribe_endpoint_needs_a_transcriber_and_reports_failures(comp
     response = await client.post("/api/transcribe", data=b"audio", headers={"Content-Type": "audio/mp4"})
     assert response.status == 502 and "credits" in (await response.json())["error"]
     assert (await client.post("/api/transcribe", data=b"", headers={"Content-Type": "audio/mp4"})).status == 400
+
+
+async def test_restart_notices_are_opt_in_per_device_and_important_ones_reach_all(companion):
+    service, client = companion
+    service.public_key = "configured"
+    keys = {"p256dh": "a" * 87, "auth": "b" * 22}
+    phone = "https://fcm.googleapis.com/fcm/send/phone"
+    desk = "https://updates.push.services.mozilla.com/wpush/v2/desk"
+    assert (await client.post("/api/push", json={"endpoint": phone, "keys": keys})).status == 200
+    reply = await client.post("/api/push", json={"endpoint": desk, "keys": keys, "lifecycle": True})
+    assert reply.status == 200 and (await reply.json())["lifecycle"] is True
+    assert (await client.post("/api/push", json={"endpoint": desk, "keys": keys, "lifecycle": "yes"})).status == 400
+    # Re-registering without a word about restart notices keeps the choice.
+    assert (await client.post("/api/push", json={"endpoint": desk, "keys": keys})).status == 200
+    assert await (await client.get("/api/push", params={"endpoint": desk})).json() == {"registered": True, "lifecycle": True}
+    assert await (await client.get("/api/push", params={"endpoint": phone})).json() == {"registered": True, "lifecycle": False}
+    assert await (await client.get("/api/push", params={"endpoint": "https://fcm.googleapis.com/x"})).json() == {
+        "registered": False, "lifecycle": False}
+    with patch("pywebpush.webpush") as send:
+        await service.notify_lifecycle("Restarting...")
+        assert [call.kwargs["subscription_info"]["endpoint"] for call in send.call_args_list] == [desk]
+        # No thread, no unread count: the worker keeps the badge and the reply tag alone.
+        assert json.loads(send.call_args.kwargs["data"]) == {
+            "body": "Restarting...", "agent_name": service.cfg.agent_name, "kind": "lifecycle"}
+        send.reset_mock()
+        await service.notify_lifecycle("Restart cut short — 2 queued message(s) were dropped", important=True)
+        assert sorted(call.kwargs["subscription_info"]["endpoint"] for call in send.call_args_list) == sorted([phone, desk])
+    # Nothing is archived: lifecycle text must not become assistant rows the model sees.
+    assert service.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+    service.public_key = ""
+    assert service.notify_lifecycle("Started") is None
+
+
+async def test_startup_message_names_an_app_update_once(companion):
+    from assistant.companion import STARTED, STARTED_WITH_UPDATE, shell_revision
+
+    service, _ = companion
+    marker = service.cfg.state_dir / "shell_revision"
+    # A first start establishes the baseline rather than announcing an update.
+    assert service.startup_message() == STARTED
+    assert marker.read_text().strip() == shell_revision(service.cfg.agent_name)
+    assert service.startup_message() == STARTED
+    marker.write_text("000000000000\n")
+    assert service.startup_message() == STARTED_WITH_UPDATE
+    assert marker.read_text().strip() == shell_revision(service.cfg.agent_name)
+    assert service.startup_message() == STARTED

@@ -630,8 +630,22 @@ async function openSettings() {
     const subscription = await registration.pushManager.getSubscription();
     $('#push-toggle').textContent = subscription ? 'Disable notifications' : 'Enable notifications';
     $('#push-test').hidden = !subscription;
+    $('#lifecycle-option').hidden = !subscription;
+    if (subscription) {
+      try { $('#lifecycle-toggle').checked = Boolean((await api(`push?endpoint=${encodeURIComponent(subscription.endpoint)}`)).lifecycle); }
+      catch { $('#lifecycle-toggle').checked = false; }
+    }
   }
 }
+$('#lifecycle-toggle').addEventListener('change', async () => {
+  const box = $('#lifecycle-toggle'); box.disabled = true;
+  try {
+    const subscription = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    if (!subscription) throw new Error('Enable notifications on this device first.');
+    await api('push', { ...subscription.toJSON(), lifecycle: box.checked });
+    toast(box.checked ? 'This device will hear about restarts.' : 'Restart notices are off on this device.');
+  } catch (e) { box.checked = !box.checked; toast(e.message); } finally { box.disabled = false; }
+});
 $('#settings-button').addEventListener('click', () => openSettings().catch(e => toast(e.message)));
 $$('input[name="theme"]').forEach(input => input.addEventListener('change', () => {
   const choice = input.value;

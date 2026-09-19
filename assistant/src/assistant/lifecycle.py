@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # instead of being killed mid-sentence. See the README for the value a
 # deployment has to configure.
 DRAIN_BUDGET = 270.0
+# How long an important lifecycle push may hold the exit after a failed drain.
+_IMPORTANT_PUSH_WAIT = 15.0
 
 _SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
@@ -71,12 +73,27 @@ class Lifecycle:
             await self.stop.wait()
 
 
-async def _notify(bot: TelegramBot | Any, text: str) -> None:
-    """Lifecycle chatter must never be able to wedge the exit."""
+async def _notify(
+    bot: TelegramBot | Any, text: str, companion: Any = None, *, important: bool = False
+) -> None:
+    """Lifecycle chatter must never be able to wedge the exit.
+
+    The web companion pushes the same text to devices that asked for restart
+    notices; an important one (work dropped) goes to every device and is
+    waited for briefly, since the drain it follows has already been given up.
+    """
     try:
         await bot.notify_lifecycle(text)
     except Exception:
         logger.warning("Could not send lifecycle message %r", text, exc_info=True)
+    if companion is None:
+        return
+    try:
+        task = companion.notify_lifecycle(text, important=important)
+        if important and task is not None:
+            await asyncio.wait_for(asyncio.shield(task), _IMPORTANT_PUSH_WAIT)
+    except Exception:
+        logger.warning("Could not push lifecycle message %r", text, exc_info=True)
 
 
 async def graceful_shutdown(
@@ -96,7 +113,7 @@ async def graceful_shutdown(
     """
     queued = bot.pending_updates()
     note = f" Finishing {queued} queued message(s) first." if queued else ""
-    await _notify(bot, f"Restarting...{note}")
+    await _notify(bot, f"Restarting...{note}", companion)
 
     # The ack point: everything already fetched is confirmed to Telegram here,
     # so from now on the only copy of those messages is the local queue.
@@ -129,6 +146,8 @@ async def graceful_shutdown(
                 bot,
                 f"Restart cut short — {dropped} queued message(s) were dropped, "
                 "please resend.",
+                companion,
+                important=True,
             )
 
     with contextlib.suppress(Exception):

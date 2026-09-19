@@ -67,6 +67,11 @@ _ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/st
            "/icon.svg": "icon.svg"}
 
 
+LIFECYCLE = "lifecycle"
+STARTED = "Started"
+STARTED_WITH_UPDATE = "Restarted with an app update. Reload when you're ready."
+
+
 def shell_revision(agent_name, root=None):
     """The worker's cache version: a hash of the instance name and every shell file.
 
@@ -116,6 +121,10 @@ class Companion:
             INSERT OR IGNORE INTO seen (space, through)
                 SELECT space, max(created) FROM messages WHERE role='assistant' AND status!='deleted' GROUP BY space;
         """)
+        # Restart notices are opt-in per device (2026-09-19): every deploy
+        # restarts the bot, and a phone does not need to hear about each one.
+        if "lifecycle" not in {row["name"] for row in self.db.execute("PRAGMA table_info(subscriptions)")}:
+            self.db.execute("ALTER TABLE subscriptions ADD COLUMN lifecycle INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
         self.tasks: dict[str, asyncio.Task] = {}
         self.push_tasks: set[asyncio.Task] = set()
@@ -163,6 +172,7 @@ class Companion:
         self.app.router.add_post("/api/attachments", self.upload)
         self.app.router.add_get("/api/attachment", self.attachment)
         self.app.router.add_post("/api/transcribe", self.transcribe)
+        self.app.router.add_get("/api/push", self.push_state)
         self.app.router.add_post("/api/push", self.subscribe)
         self.app.router.add_delete("/api/push", self.unsubscribe)
         self.app.router.add_post("/api/push/test", self.test_push)
@@ -446,13 +456,24 @@ class Companion:
                 or not re.fullmatch(r"[A-Za-z0-9_-]{80,100}", keys.get("p256dh", ""))
                 or not re.fullmatch(r"[A-Za-z0-9_-]{20,30}", keys.get("auth", ""))):
             raise web.HTTPBadRequest(text="Unsupported push subscription")
-        if (self.db.execute("SELECT count(*) FROM subscriptions").fetchone()[0] >= 20
-                and not self.db.execute("SELECT 1 FROM subscriptions WHERE endpoint=?", (endpoint,)).fetchone()):
+        existing = self.db.execute("SELECT lifecycle FROM subscriptions WHERE endpoint=?", (endpoint,)).fetchone()
+        if existing is None and self.db.execute("SELECT count(*) FROM subscriptions").fetchone()[0] >= 20:
             raise web.HTTPConflict(text="Maximum 20 registered devices; disable an old device first")
-        self.db.execute("INSERT OR REPLACE INTO subscriptions VALUES (?,?)",
-                        (endpoint, json.dumps({"endpoint": endpoint, "keys": keys})))
+        # A re-registration that says nothing about restart notices keeps the
+        # device's choice; only an explicit flag changes it.
+        lifecycle = data.get("lifecycle", bool(existing["lifecycle"]) if existing else False)
+        if not isinstance(lifecycle, bool):
+            raise web.HTTPBadRequest(text="lifecycle must be true or false")
+        self.db.execute("INSERT OR REPLACE INTO subscriptions (endpoint, data, lifecycle) VALUES (?,?,?)",
+                        (endpoint, json.dumps({"endpoint": endpoint, "keys": keys}), int(lifecycle)))
         self.db.commit()
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "lifecycle": lifecycle})
+
+    async def push_state(self, request):
+        """Whether this device is registered and asked for restart notices."""
+        row = self.db.execute("SELECT lifecycle FROM subscriptions WHERE endpoint=?",
+                              (request.query.get("endpoint", ""),)).fetchone()
+        return web.json_response({"registered": row is not None, "lifecycle": bool(row and row["lifecycle"])})
 
     async def unsubscribe(self, request):
         endpoint = (await request.json()).get("endpoint")
@@ -540,6 +561,38 @@ class Companion:
         self.push_tasks.add(task)
         task.add_done_callback(self.push_tasks.discard)
 
+    def notify_lifecycle(self, text, *, important=False):
+        """Push a process event (restarting, started) to the devices that asked.
+
+        Lifecycle text is never archived: it must not become assistant rows the
+        model sees. Only devices that opted in hear routine restarts; an
+        important event (queued work dropped) reaches every device. Returns the
+        push task so a shutdown can wait for an important one.
+        """
+        if not self.public_key or len(self.push_tasks) >= 8:
+            return None
+        task = asyncio.create_task(self._push(text, kind=LIFECYCLE, opted_in_only=not important))
+        self.push_tasks.add(task)
+        task.add_done_callback(self.push_tasks.discard)
+        return task
+
+    def startup_message(self):
+        """The lifecycle text for this start: plain, or naming an app update.
+
+        The shell revision of the previous start is kept in the state dir; a
+        different one now means installed apps will be offered an update, which
+        is the restart worth hearing about.
+        """
+        marker = self.cfg.state_dir / "shell_revision"
+        current = shell_revision(self.cfg.agent_name)
+        try:
+            previous = marker.read_text().strip()
+        except OSError:
+            previous = ""
+        if previous != current:
+            atomic_write_text(marker, current + "\n")
+        return STARTED_WITH_UPDATE if previous and previous != current else STARTED
+
     async def _push_unless_seen(self, text, created, thread=None):
         # "Seen" means displayed on a focused, recently used device with the
         # thread scrolled to the end, not proof of reading; a device that
@@ -551,15 +604,21 @@ class Companion:
             return
         await self._push(text, thread)
 
-    async def _push(self, text="", thread=None):
+    async def _push(self, text="", thread=None, *, kind="reply", opted_in_only=False):
         from pywebpush import WebPushException, webpush
         from requests import Session
 
         # Leave room for encryption overhead under providers' 4 KB payload limit,
         # including text made entirely of four-byte Unicode characters.
         body = text[:500] + ("..." if len(text) > 500 else "")
-        payload = json.dumps({"body": body, "agent_name": self.cfg.agent_name, "thread": thread,
-                              "unread": self.unread_count()}, ensure_ascii=False)
+        if kind == LIFECYCLE:
+            # No thread to open and no unread count: the worker keeps these
+            # under their own notification tag and leaves the badge alone.
+            payload = json.dumps({"body": body, "agent_name": self.cfg.agent_name, "kind": LIFECYCLE},
+                                 ensure_ascii=False)
+        else:
+            payload = json.dumps({"body": body, "agent_name": self.cfg.agent_name, "thread": thread,
+                                  "unread": self.unread_count()}, ensure_ascii=False)
 
         def deliver(subscription):
             with Session() as transport:
@@ -570,7 +629,8 @@ class Companion:
                         vapid_claims={"sub": self.cfg.pwa_push_contact}, timeout=10, ttl=3600,
                         requests_session=transport)
 
-        for row in self.db.execute("SELECT * FROM subscriptions").fetchall():
+        query = "SELECT * FROM subscriptions" + (" WHERE lifecycle=1" if opted_in_only else "")
+        for row in self.db.execute(query).fetchall():
             try:
                 await asyncio.to_thread(deliver, json.loads(row["data"]))
             except WebPushException as exc:
