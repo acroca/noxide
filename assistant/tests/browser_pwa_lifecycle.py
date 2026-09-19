@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from aiohttp import web
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright, expect
 
 
@@ -122,6 +123,33 @@ async def main():
             # keyboard dismissed in the background fires no viewport event.
             await page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
             await expect(page.locator('.shell')).to_have_css('height', '844px')
+            # iOS sometimes leaves the window itself shrunk once the keyboard has
+            # gone (WebKit standalone-PWA bug): every height reads short and no
+            # event fires. The cure is sending the shell through a layout a
+            # moment after the field blurs and after the app returns; it must
+            # keep the thread where it was scrolled and never run while the
+            # field has focus, since hiding the shell would close the keyboard.
+            await page.evaluate("""() => {
+              const thread = document.querySelector('#chat-thread');
+              const filler = document.createElement('div'); filler.style.height = '5000px'; thread.append(filler);
+              thread.scrollTop = 1200; thread.dispatchEvent(new Event('scroll'));
+              window.__relayouts = 0;
+              new MutationObserver(records => { window.__relayouts += records.filter(r => /display: none/.test(r.oldValue || '')).length; })
+                .observe(document.querySelector('.shell'), { attributes: true, attributeFilter: ['style'], attributeOldValue: true });
+            }""")
+            await area.focus()
+            await area.blur()
+            await page.wait_for_function("() => window.__relayouts > 0")
+            assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 1200
+            await expect(page.locator('.shell')).to_have_css('display', 'flex')
+            await expect(page.locator('.shell')).to_have_css('height', '844px')
+            await area.focus()
+            await page.evaluate("() => { window.__relayouts = 0; document.dispatchEvent(new Event('visibilitychange')); }")
+            await page.wait_for_timeout(700)
+            assert await page.evaluate("() => window.__relayouts") == 0
+            await expect(area).to_be_focused()
+            await area.blur()
+            await page.evaluate("() => document.querySelector('#chat-thread').lastChild.remove()")
             # One chat: no topic picker, no channel links, just the title and Reset.
             assert await page.locator('select').count() == 0
             assert await page.locator('#topic-links, #topic-picker, #chat-topic, .channel-picker').count() == 0
@@ -145,7 +173,12 @@ async def main():
             await expect(page.get_by_role("heading", name=f"{agent_name} is unavailable")).to_be_visible()
             assert await page.evaluate("localStorage.getItem('noxide-draft:general')") == "Preserve this draft"
             await context.set_offline(False)
-            await page.get_by_role("button", name="Try again").click()
+            # Regaining connectivity boots on its own (the online event); the
+            # button is for when it does not, and may already be gone.
+            try:
+                await page.get_by_role("button", name="Try again").click(timeout=2000)
+            except PlaywrightTimeoutError:
+                pass
             await expect(area).to_have_value("Preserve this draft")
 
             # Proxy failures, including access denial, remain recoverable.

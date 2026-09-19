@@ -590,6 +590,32 @@ if (window.visualViewport) {
     target.addEventListener(name, fitShell);
   }
   setInterval(() => { if (!document.hidden) fitShell(); }, 2000);
+  // Rechecking cannot help when iOS leaves the window itself shrunk once the
+  // keyboard has gone (a WebKit bug in home-screen apps on iOS 17/18): the
+  // window height, the visual viewport and 100dvh all report the reduced
+  // height, no event fires, and the band below the composer stays until the
+  // app is force-quit. Sending the shell through a layout makes WebKit
+  // recompute the viewport. Done a moment after the field blurs and after
+  // the app returns, never while the field has focus (hiding it would close
+  // the keyboard), and the scrollers are put back where they were, since a
+  // hidden scroller forgets its position.
+  const RELAYOUT_DELAY_MS = 300;
+  let relayoutTimer;
+  const relayout = () => {
+    relayoutTimer = undefined;
+    const shell = document.querySelector('.shell');
+    if (!shell || document.hidden || document.activeElement?.matches('textarea, input')) return;
+    const scrollers = [...shell.querySelectorAll('main, #chat-thread, textarea')].map(el => [el, el.scrollTop]);
+    shell.style.display = 'none';
+    void shell.offsetHeight;
+    shell.style.removeProperty('display');
+    for (const [el, top] of scrollers) el.scrollTop = top;
+    fitShell();
+  };
+  const scheduleRelayout = () => { clearTimeout(relayoutTimer); relayoutTimer = setTimeout(relayout, RELAYOUT_DELAY_MS); };
+  for (const [target, name] of [[window, 'focus'], [window, 'pageshow'], [document, 'visibilitychange'], [document, 'focusout']]) {
+    target.addEventListener(name, scheduleRelayout);
+  }
 }
 window.addEventListener('focus', () => ackVisible());
 document.addEventListener('visibilitychange', () => ackVisible());
