@@ -18,7 +18,7 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True, "replies": [], "generation": 0, "voice": False, "unread": 0}
+    state = {"revision": 1, "available": True, "authorized": True, "replies": [], "generation": 0, "voice": False, "unread": 0, "before": None}
     seen, uploads, submissions = [], [], []
     release = asyncio.Event()
     release.set()
@@ -61,7 +61,7 @@ async def main():
                 return web.json_response({"content": "# Now\n\n## Today\n- [ ] A read-only page"})
             if request.path != "/api/messages" or "space" in request.query:
                 raise web.HTTPNotFound()  # one chat: no topic routes, no space parameter
-            return web.json_response({"threads": thread_page(), "before": None,
+            return web.json_response({"threads": thread_page(), "before": state["before"],
                                       "generation": state["generation"], "unread": state["unread"]})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
@@ -150,13 +150,15 @@ async def main():
             await expect(area).to_be_focused()
             await area.blur()
             await page.evaluate("() => document.querySelector('#chat-thread').lastChild.remove()")
-            # One chat: no topic picker, no channel links, just the title and Reset.
+            # One chat: no topic picker, no channel links, and no second header
+            # row under the topbar; Reset context lives in Preferences.
             assert await page.locator('select').count() == 0
             assert await page.locator('#topic-links, #topic-picker, #chat-topic, .channel-picker').count() == 0
-            await expect(page.locator('h1.chat-title')).to_have_text('Chat')
+            assert await page.locator('.chat-header, .chat-title').count() == 0
             await expect(page.locator('#breadcrumb')).to_have_text('Chat')
             assert await page.title() == f'{agent_name} · Chat'
-            await expect(page.get_by_role('button', name='Reset context')).to_be_visible()
+            await expect(page.get_by_role('button', name='Reset context')).to_be_hidden()
+            assert await page.locator('#settings #reset-context').count() == 1
             # The draft survives a trip to Now and back, and any chat sub-path opens the chat.
             await page.goto(url + '/#now')
             await expect(page.locator('#now-content')).to_be_visible()
@@ -361,6 +363,14 @@ async def main():
             # Every day gets its own separator line, like a chat app.
             await expect(page.locator(".day-divider")).to_have_count(1)
             assert await page.evaluate("() => document.querySelector('#chat-thread').firstElementChild.className") == "day-divider"
+            # Load earlier messages sits at the top of the scrolling timeline,
+            # only when there is an older page, so it is reached by scrolling up.
+            await expect(page.locator("#older-messages")).to_have_count(0)
+            state["before"] = "older-cursor"
+            await expect(page.locator("#older-messages")).to_have_count(1)
+            assert await page.evaluate("() => document.querySelector('#chat-thread').firstElementChild.id") == "older-messages"
+            state["before"] = None
+            await expect(page.locator("#older-messages")).to_have_count(0)
             # Blurring the composer restores its inset and shrinks the thread;
             # the thread stays anchored to its end, unless the reader scrolled up.
             # Chromium re-anchors a shrinking scroller by itself, so this cannot

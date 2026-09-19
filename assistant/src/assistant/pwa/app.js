@@ -197,11 +197,6 @@ function renderChat(pageVersion) {
   $('#main').className = 'chat-main';
   $('#main').innerHTML = `
     <section class="chat-panel" aria-label="Chat">
-      <header class="chat-header">
-        <h1 class="chat-title">Chat</h1>
-        <div><button id="reset-chat" class="quiet" type="button">Reset context</button></div>
-      </header>
-      <button id="older-messages" class="quiet older" hidden>Load earlier messages</button>
       <div id="chat-thread" class="chat-thread" role="log" aria-label="Messages"><div class="loading">Loading messages…</div></div>
       <form id="chat-form" class="chat-composer">
         <div id="reply-chip" class="reply-chip" hidden><span id="reply-excerpt"></span><button id="cancel-reply" type="button" aria-label="Cancel reply">×</button></div>
@@ -422,9 +417,8 @@ function renderChat(pageVersion) {
     if (!active()) return;
     if (loadOlder) { older = [...data.threads, ...older]; cursor = data.before; await loadMessages(); return; }
     if (!older.length) cursor = data.before;
-    $('#older-messages').hidden = cursor === null;
     if (Number.isInteger(data.unread)) showBadge(data.unread);
-    const nextSignature = JSON.stringify([data.threads, older, data.generation]);
+    const nextSignature = JSON.stringify([data.threads, older, data.generation, cursor]);
     loaded = true;
     // Threads keep the order their first message gave them; a reply stays in its box.
     const seen = new Set();
@@ -449,7 +443,10 @@ function renderChat(pageVersion) {
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${m.source !== 'telegram' && ['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
       </article>`;
     const dayOfThread = t => dayOf(t.messages[0].created);
-    thread.innerHTML = threads.length ? threads.map((t, i) => `
+    // The load-earlier button scrolls with the timeline, so it is reached by
+    // scrolling up to the oldest thread instead of sitting over every view.
+    const olderButton = cursor === null ? '' : '<button id="older-messages" class="quiet older" type="button">Load earlier messages</button>';
+    thread.innerHTML = threads.length ? olderButton + threads.map((t, i) => `
       ${!i || dayOfThread(t) !== dayOfThread(threads[i - 1]) ? `<div class="day-divider" role="separator">${escape(dayLabel(dayOfThread(t)))}</div>` : ''}
       ${i && generationOf(t) !== generationOf(threads[i - 1]) ? divider : ''}
       <section class="thread${t.id === replyTo?.thread ? ' replying' : ''}" data-thread="${escape(t.id)}" aria-label="Thread">
@@ -463,18 +460,13 @@ function renderChat(pageVersion) {
       catch (e) { toast(e.message); } finally { b.disabled = false; }
     }));
     $$('[data-reply]').forEach(b => b.addEventListener('click', () => toggleThread(b.dataset.reply)));
+    $('#older-messages')?.addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
     $$('.thread').forEach(swipeToReply);
     if (initial || nearBottom) thread.scrollTop = thread.scrollHeight;
     // One attempt per request: a thread not on this page must not surface later.
     if (pendingThread) { openThread(pendingThread); pendingThread = null; }
     markSeen();
   }
-  $('#older-messages').addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
-  $('#reset-chat').addEventListener('click', async () => {
-    if (!confirm('Start fresh? The shared Telegram/web context will reset. Saved messages remain visible and can still be retrieved through history tools.')) return;
-    try { await api('reset', {}); if (active()) await route(); toast('Context reset. Saved conversation kept.'); }
-    catch (e) { toast(e.message); }
-  });
   area.addEventListener('input', () => {
     fit();
     try { localStorage.setItem(DRAFT_KEY, area.value); } catch { toast('This browser cannot save drafts. Keep this tab open.'); }
@@ -666,6 +658,11 @@ $('#push-toggle').addEventListener('click', async () => {
   } catch (e) { $('#push-status').textContent = e.message; } finally { button.disabled = false; }
 });
 $('#push-test').addEventListener('click', async () => { try { await api('push/test', {}); toast('Test notification requested.'); } catch (e) { toast(e.message); } });
+$('#reset-context').addEventListener('click', async () => {
+  if (!confirm('Start fresh? The shared Telegram/web context will reset. Saved messages remain visible and can still be retrieved through history tools.')) return;
+  try { await api('reset', {}); $('#settings').close(); await route(); toast('Context reset. Saved conversation kept.'); }
+  catch (e) { toast(e.message); }
+});
 $('#clear-local-drafts').addEventListener('click', async () => {
   if (!confirm('Clear saved drafts on this device? Sent messages and notifications are not affected.')) return;
   try {

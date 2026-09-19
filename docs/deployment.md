@@ -246,7 +246,7 @@ remains available through `get_history` and literal `search_history`; raw tool
 protocol and reasoning are not persisted. The vault remains the authority for
 current knowledge, not the chat archive.
 
-**Reset context** (also Telegram `/clear`) clears the background of recent threads
+**Reset context** (in Preferences; also Telegram `/clear`) clears the background of recent threads
 without deleting saved messages; a thread replied to afterwards still carries
 its own earlier messages. Older text is still retrievable explicitly.
 It dismisses pending conversation work, but does not cancel
