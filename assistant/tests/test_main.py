@@ -220,32 +220,60 @@ async def test_run_waits_for_telegram_readiness_before_starting_jobs(runtime) ->
     runtime.backup.drain.assert_awaited_once()
 
 
-async def test_web_companion_starts_drains_and_mirrors_successful_sends(runtime, monkeypatch):
-    from assistant import companion
+async def test_web_companion_starts_drains_and_archives_proactive_sends(runtime, monkeypatch):
+    from assistant import companion, conversations
 
+    class OpenArchive(conversations.ConversationArchive):
+        """Keeps the database open after _run's teardown so the rows can be inspected."""
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(conversations, "ConversationArchive", OpenArchive)
     runtime.cfg.pwa_enabled = True
     service = MagicMock(start=AsyncMock(), drain=AsyncMock(), close=AsyncMock(),
                         observe_delivery=AsyncMock())
     factory = MagicMock(return_value=service)
     monkeypatch.setattr(companion, "Companion", factory)
     await main._run(None)
-    factory.assert_called_once_with(
-        runtime.cfg, runtime.agent, ANY,
-        archive=agent.Agent.call_args.kwargs["archive"], transcriber=ANY,
-    )
-    service.start.assert_awaited_once()
-    service.drain.assert_awaited_once()
-    service.close.assert_awaited_once()
-    assert not service.accepting
-    sender = agent.Agent.call_args.kwargs["send_message_fn"]
-    monkeypatch.setattr(agent.Agent.call_args.kwargs["archive"], "insert", MagicMock())
-    runtime.bot.send_message.return_value = 123
-    assert await sender("A reminder") == 123
-    runtime.bot.send_message.assert_awaited_once_with("A reminder")
-    service.observe_delivery.assert_awaited_once_with("A reminder")
-    runtime.bot.send_message.return_value = None
-    assert await sender("Dropped") is None
-    service.observe_delivery.assert_awaited_once()
+    archive = agent.Agent.call_args.kwargs["archive"]
+    try:
+        assert isinstance(archive, OpenArchive) and archive.closed
+        factory.assert_called_once_with(runtime.cfg, runtime.agent, ANY, archive=archive, transcriber=ANY)
+        service.start.assert_awaited_once()
+        service.drain.assert_awaited_once()
+        service.close.assert_awaited_once()
+        assert not service.accepting
+        sender = agent.Agent.call_args.kwargs["send_message_fn"]
+        runtime.agent.conversation_space = MagicMock(return_value="general")
+        # Before the bot knows its home chat, a send is just forwarded.
+        runtime.bot.home_chat_id = None
+        runtime.bot.send_message.return_value = 5
+        assert await sender("Early") == 5
+        runtime.bot.send_message.assert_awaited_once_with("Early")
+        assert archive.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+        service.observe_delivery.assert_not_awaited()
+        # A delivery is archived first, as a thread root, then sent against its row.
+        runtime.bot.home_chat_id = 123
+        runtime.bot.send_message.reset_mock()
+        runtime.bot.send_message.return_value = 123
+        assert await sender("A reminder") == 123
+        runtime.agent.conversation_space.assert_called_with(123)
+        row = archive.db.execute("SELECT * FROM messages").fetchone()
+        assert (row["space"], row["role"], row["text"], row["status"], row["source"]) == (
+            "general", "assistant", "A reminder", "done", "telegram")
+        assert row["delivery"] == "delivered" and row["reply_to"] is None and row["thread"] == row["id"]
+        runtime.bot.send_message.assert_awaited_once_with("A reminder", archive_id=row["id"])
+        service.observe_delivery.assert_awaited_once_with("A reminder", thread=row["id"])
+        # A dropped delivery keeps its row, marked failed, and is not mirrored.
+        runtime.bot.send_message.return_value = None
+        assert await sender("Dropped") is None
+        dropped = archive.db.execute("SELECT * FROM messages WHERE text='Dropped'").fetchone()
+        assert dropped["delivery"] == "failed" and dropped["status"] == "done" and dropped["thread"] == dropped["id"]
+        assert archive.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
+        service.observe_delivery.assert_awaited_once()
+    finally:
+        archive.db.close()
 
 
 async def test_second_signal_can_force_the_actual_graceful_drain(runtime) -> None:

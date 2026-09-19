@@ -17,6 +17,9 @@ test('push displays the agent name and reply and sets the badge', async () => {
     },
   });
   let pending;
+  // Objects built inside the worker's vm context have a foreign Object prototype,
+  // which strict deepEqual rejects; compare their JSON instead.
+  const data = () => JSON.parse(JSON.stringify(notification.data));
   handlers.push({
     data: { json: () => ({ body: 'Hello there! This is the test reminder', agent_name: 'Cedar', unread: 3 }) },
     waitUntil: promise => { pending = promise; },
@@ -24,18 +27,38 @@ test('push displays the agent name and reply and sets the badge', async () => {
   await pending;
   assert.equal(notification.title, 'Cedar');
   assert.equal(notification.body, 'Hello there! This is the test reminder');
-  // One chat: the click needs no channel, so the notification carries no data.
-  assert.equal(notification.data, undefined);
+  // The test button's push belongs to no thread; the click still opens the chat.
+  assert.deepEqual(data(), { thread: null });
   assert.equal(badge, 3);
   badge = undefined;
 
+  // A reply's push names its thread, so the click can open it in reply mode.
+  // The title stays the agent name: threads have no name of their own.
+  handlers.push({
+    data: { json: () => ({ body: 'Recorded.', agent_name: 'Cedar', thread: 'reply:u1', unread: 1 }) },
+    waitUntil: promise => { pending = promise; },
+  });
+  await pending;
+  assert.equal(notification.title, 'Cedar');
+  assert.equal(notification.body, 'Recorded.');
+  assert.deepEqual(data(), { thread: 'reply:u1' });
+  assert.equal(badge, 1);
+  badge = undefined;
+
+  // A thread that is not a non-empty string is no thread at all.
+  for (const thread of ['', 7, {id: 'x'}, null]) {
+    handlers.push({ data: { json: () => ({ body: 'Hi', thread }) }, waitUntil: promise => { pending = promise; } });
+    await pending;
+    assert.deepEqual(data(), { thread: null }, String(thread));
+  }
+
   // Previously queued pushes have no body; malformed pushes still display safely.
-  for (const data of [{ json: () => ({}) }, { json: () => { throw Error('bad JSON'); } }]) {
-    handlers.push({ data, waitUntil: promise => { pending = promise; } });
+  for (const source of [{ json: () => ({}) }, { json: () => { throw Error('bad JSON'); } }]) {
+    handlers.push({ data: source, waitUntil: promise => { pending = promise; } });
     await pending;
     assert.equal(notification.title, 'Juniper');
     assert.equal(notification.body, 'You have a new update. Open Juniper to read it.');
-    assert.equal(notification.data, undefined);
+    assert.deepEqual(data(), { thread: null });
     assert.equal(badge, undefined);
   }
 });
@@ -101,37 +124,49 @@ function fakeClient(url, {focus} = {}) {
   return client;
 }
 
-async function click(handlers) {
+async function click(handlers, data) {
   let pending, closed = 0;
-  handlers.notificationclick({notification: {close: () => { closed++; }}, waitUntil: promise => { pending = promise; }});
+  handlers.notificationclick({notification: {close: () => { closed++; }, data}, waitUntil: promise => { pending = promise; }});
   await pending;
   return closed;
 }
 
-test('notification click focuses the open app and asks it for the chat', async () => {
+test('notification click focuses the open app and asks it for the thread', async () => {
   // The page switches its own hash: a full navigation would drop an open draft
   // and WindowClient.navigate() rejects for clients this worker does not control.
+  // The thread travels in the message, never in the URL, so the page keeps its state.
   const foreign = fakeClient('https://other.test/');
   const app = fakeClient('https://nox.test/#now');
   const {handlers, opened} = loadClickWorker([foreign, app]);
-  assert.equal(await click(handlers), 1);
+  assert.equal(await click(handlers, {thread: 'reply:u1'}), 1);
   assert.equal(app.focused, 1);
-  assert.deepEqual(app.messages, [{type: 'OPEN_CHAT'}]);
+  assert.deepEqual(app.messages, [{type: 'OPEN_CHAT', thread: 'reply:u1'}]);
   assert.equal(foreign.focused, 0);
   assert.deepEqual(foreign.messages, []);
   assert.deepEqual(opened, []);
+  // A notification without a thread (the test button, an old notification) still opens the chat.
+  for (const data of [{thread: null}, {}, undefined]) {
+    assert.equal(await click(handlers, data), 1);
+    assert.deepEqual(app.messages.at(-1), {type: 'OPEN_CHAT', thread: null});
+  }
+  assert.equal(app.messages.length, 4);
+  assert.deepEqual(opened, []);
 });
 
-test('notification click opens a window on the chat when the app is closed', async () => {
+test('notification click opens a window on the thread when the app is closed', async () => {
   const {handlers, opened} = loadClickWorker([]);
-  assert.equal(await click(handlers), 1);
-  assert.deepEqual(opened, ['https://nox.test/#chat']);
+  assert.equal(await click(handlers, {thread: 'reply:u1'}), 1);
+  // The thread rides the hash, encoded, so the page can pick it out of #chat/<thread>.
+  assert.deepEqual(opened, ['https://nox.test/#chat/reply%3Au1']);
+  assert.equal(await click(handlers, {thread: null}), 1);
+  assert.equal(await click(handlers, undefined), 1);
+  assert.deepEqual(opened, ['https://nox.test/#chat/reply%3Au1', 'https://nox.test/#chat', 'https://nox.test/#chat']);
 });
 
 test('notification click falls back to a new window when the open app cannot be focused', async () => {
   const app = fakeClient('https://nox.test/#chat', {focus: async () => { throw new TypeError('not allowed'); }});
   const {handlers, opened} = loadClickWorker([app]);
-  await click(handlers);
+  await click(handlers, {thread: 'abc'});
   assert.deepEqual(app.messages, []);
-  assert.deepEqual(opened, ['https://nox.test/#chat']);
+  assert.deepEqual(opened, ['https://nox.test/#chat/abc']);
 });

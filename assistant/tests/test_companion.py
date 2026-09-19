@@ -40,6 +40,15 @@ async def settle(service):
     await asyncio.sleep(0)
 
 
+def flat(page):
+    """The messages of a thread page in display order: threads by last activity, each oldest first."""
+    return [message for thread in page["threads"] for message in thread["messages"]]
+
+
+async def timeline(client, **query):
+    return await (await client.get("/api/messages", params=query)).json()
+
+
 async def test_no_password_required_but_csrf_and_host_checks_remain(companion):
     service, client = companion
     assert (await client.get("/")).status == 200
@@ -108,8 +117,10 @@ async def test_submit_idempotency_and_queueing_in_the_home_chat(companion):
         # A second message queues behind the first instead of being refused;
         # Agent.run's conversation lock answers them in order.
         assert (await client.post("/api/messages", json={**data, "id": "b" * 32, "text": "And fed them"})).status == 202
-        timeline = await (await client.get("/api/messages")).json()
-        assert [(m["text"], m["status"]) for m in timeline["messages"]] == [("Watered the plants", "queued"), ("And fed them", "queued")]
+        page = await timeline(client)
+        assert [(m["text"], m["status"]) for m in flat(page)] == [("Watered the plants", "queued"), ("And fed them", "queued")]
+        # Two messages sent without replying are two threads, each rooted at its own id.
+        assert [(t["id"], [m["thread"] for m in t["messages"]]) for t in page["threads"]] == [("a" * 32, ["a" * 32]), ("b" * 32, ["b" * 32])]
         assert (await client.post("/api/reset", json={})).status == 409
     finally:
         release.set()
@@ -117,19 +128,54 @@ async def test_submit_idempotency_and_queueing_in_the_home_chat(companion):
     assert [c.args[1].split("]")[-1].strip() for c in service.agent.run.call_args_list] == ["Watered the plants", "And fed them"]
     # The mock agent has no conversation lock, so its runs interleave here;
     # ordering is Agent.run's job. Each message still gets its own replies.
-    timeline = await (await client.get("/api/messages")).json()
-    assert all(m["status"] == "done" for m in timeline["messages"])
-    replies = [m["reply_to"] for m in timeline["messages"] if m["role"] == "assistant"]
+    page = await timeline(client)
+    assert all(m["status"] == "done" for m in flat(page))
+    replies = [m["reply_to"] for m in flat(page) if m["role"] == "assistant"]
     assert sorted(replies) == sorted(["a" * 32] * 2 + ["b" * 32] * 2)
-    # Every web run is the home conversation: no thread, no room, one context
+    # Replies land in the thread of the message they answer, not in a thread of their own.
+    assert [(t["id"], len(t["messages"])) for t in page["threads"]] == [("a" * 32, 3), ("b" * 32, 3)]
+    assert all(m["thread"] == t["id"] for t in page["threads"] for m in t["messages"])
+    # Every web run is the home conversation: no Telegram thread id, one context
     # shared with the pinned Telegram chat.
     for call in service.agent.run.call_args_list:
         assert call.args[0] == WEB_CHAT_ID
         assert "thread_id" not in call.kwargs
         assert call.kwargs["extra_context"] == _WEB_CONTEXT and call.kwargs["source"] == "web"
-    rows = (await (await client.get("/api/messages")).json())["messages"]
+    rows = flat(await timeline(client))
     assert sorted(r["text"] for r in rows) == sorted([data["text"], "And fed them"] + ["An intermediate update", "Finished"] * 2)
     assert {r["space"] for r in rows} == {"general"}
+
+
+async def test_reply_to_joins_the_parent_thread_and_is_validated(companion):
+    service, client = companion
+    root = {"id": "a" * 32, "text": "Watered the plants"}
+    assert (await client.post("/api/messages", json=root)).status == 202
+    await settle(service)
+    reply = service.db.execute("SELECT id FROM messages WHERE reply_to=?", (root["id"],)).fetchone()["id"]
+    # A reply to the assistant's answer continues the root's thread, as does the answer to it.
+    follow_up = {"id": "b" * 32, "text": "And fed them", "reply_to": reply}
+    assert (await client.post("/api/messages", json=follow_up)).status == 202
+    await settle(service)
+    assert service.archive.get("b" * 32)["thread"] == root["id"]
+    page = await timeline(client)
+    assert [t["id"] for t in page["threads"]] == [root["id"]]
+    assert [(m["role"], m["text"], m["thread"]) for m in page["threads"][0]["messages"]] == [
+        ("user", "Watered the plants", root["id"]), ("assistant", "Recorded.", root["id"]),
+        ("user", "And fed them", root["id"]), ("assistant", "Recorded.", root["id"])]
+    assert page["threads"][0]["started"] == page["threads"][0]["messages"][0]["created"]
+    # An idempotent resend must match the parent too; a different one is a fresh conflict.
+    assert (await client.post("/api/messages", json=follow_up)).status == 202
+    assert (await client.post("/api/messages", json={**follow_up, "reply_to": None})).status == 409
+    assert (await client.post("/api/messages", json={**follow_up, "reply_to": root["id"]})).status == 409
+    assert service.db.execute("SELECT count(*) FROM messages WHERE role='user'").fetchone()[0] == 2
+    # The parent must be a message of this chat: unknown, foreign-chat, deleted or malformed ids are refused.
+    other = service._insert("telegram:555", "user", "Another chat", "done")
+    deleted = service._insert("general", "user", "Gone", "deleted")
+    for bad in ("f" * 32, other, deleted, 123, ""):
+        response = await client.post("/api/messages", json={"id": "c" * 32, "text": "Orphan", "reply_to": bad})
+        assert response.status == 400, bad
+        assert "not in this chat" in (await response.json())["error"]
+    assert service.archive.get("c" * 32) is None
 
 
 async def test_hot_outage_retry_preserves_sender_and_no_automatic_duplicate(companion):
@@ -138,7 +184,7 @@ async def test_hot_outage_retry_preserves_sender_and_no_automatic_duplicate(comp
     data = {"id": "a" * 32, "text": "Remember this"}
     await client.post("/api/messages", json=data)
     await settle(service)
-    rows = (await (await client.get("/api/messages")).json())["messages"]
+    rows = flat(await timeline(client))
     assert rows[0]["status"] == "unavailable"
     assert (await client.post("/api/retry", json={"id": data["id"]})).status == 200
     await settle(service)
@@ -170,11 +216,30 @@ async def test_messages_open_on_a_small_page_with_older_ones_behind_a_cursor(com
     service, client = companion
     for i in range(21):
         service._insert("general", "user", f"m{i}", "done")
-    data = await (await client.get("/api/messages")).json()
-    assert [m["text"] for m in data["messages"]] == [f"m{i}" for i in range(1, 21)]
-    assert data["before"] == data["messages"][0]["created"]
-    older = await (await client.get(f"/api/messages?before={data['before']}")).json()
-    assert [m["text"] for m in older["messages"]] == ["m0"] and older["before"] is None
+    data = await timeline(client)
+    assert [m["text"] for m in flat(data)] == [f"m{i}" for i in range(1, 21)]
+    assert [t["started"] for t in data["threads"]] == [m["created"] for m in flat(data)]
+    assert data["before"] == data["threads"][0]["started"]
+    older = await timeline(client, before=data["before"])
+    assert [m["text"] for m in flat(older)] == ["m0"] and older["before"] is None
+
+
+async def test_paging_walks_threads_by_their_first_message(companion):
+    service, client = companion
+    roots = [service._insert("general", "user", f"m{i}", "done") for i in range(21)]
+    # A late reply does not move its thread: the timeline is ordered by first
+    # message, so the oldest thread stays on the older page, reply included.
+    service._insert("general", "assistant", "Answering m0 late", "done", reply_to=roots[0])
+    data = await timeline(client)
+    assert [t["id"] for t in data["threads"]] == roots[1:]
+    assert data["before"] == data["threads"][0]["started"] == service.archive.get(roots[1])["created"]
+    older = await timeline(client, before=data["before"])
+    assert [t["id"] for t in older["threads"]] == [roots[0]] and older["before"] is None
+    assert [(m["text"], m["thread"]) for m in older["threads"][0]["messages"]] == [("m0", roots[0]), ("Answering m0 late", roots[0])]
+    assert older["threads"][0]["started"] == service.archive.get(roots[0])["created"]
+    # A cursor before everything finds nothing.
+    empty = await timeline(client, before=service.archive.get(roots[0])["created"])
+    assert empty["threads"] == [] and empty["before"] is None
 
 
 async def test_web_search_shows_on_the_running_message(companion):
@@ -190,27 +255,28 @@ async def test_web_search_shows_on_the_running_message(companion):
     data = {"id": "c" * 32, "text": "What is the capital of Bhutan?"}
     assert (await client.post("/api/messages", json=data)).status == 202
     await asyncio.sleep(0)
-    timeline = await (await client.get("/api/messages")).json()
-    assert timeline["messages"][0]["activity"] == "Searching the web…"
+    assert flat(await timeline(client))[0]["activity"] == "Searching the web…"
     release.set()
     await settle(service)
-    timeline = await (await client.get("/api/messages")).json()
-    assert "activity" not in timeline["messages"][0] and service.activity == {}
+    assert "activity" not in flat(await timeline(client))[0] and service.activity == {}
 
 
 async def test_reset_marks_a_new_generation_the_timeline_can_draw(companion):
     service, client = companion
     service._insert("general", "user", "before", "done")
     await service.observe_delivery("A scheduled reminder")
-    service.agent._queue_sent_note.assert_called_once_with(WEB_CHAT_ID, "A scheduled reminder")
-    data = await (await client.get("/api/messages")).json()
-    assert data["generation"] == 0 and [m["generation"] for m in data["messages"]] == [0, 0]
+    # Deliveries are thread roots now; nothing is queued into a pending-notes mirror.
+    service.agent._queue_sent_note.assert_not_called()
+    data = await timeline(client)
+    assert data["generation"] == 0 and [m["generation"] for m in flat(data)] == [0, 0]
     service.agent.reset_conversation = AsyncMock(side_effect=lambda *a, **k: service.archive.reset("general"))
     assert (await client.post("/api/reset", json={})).status == 200
     service._insert("general", "user", "after", "done")
-    data = await (await client.get("/api/messages")).json()
+    data = await timeline(client)
     assert data["generation"] == 1
-    assert [(m["text"], m["generation"]) for m in data["messages"]] == [("before", 0), ("A scheduled reminder", 0), ("after", 1)]
+    assert [(m["text"], m["generation"]) for m in flat(data)] == [("before", 0), ("A scheduled reminder", 0), ("after", 1)]
+    # Each is its own thread, so the timeline can draw the divider between the roots' generations.
+    assert [(t["id"], t["messages"][0]["generation"]) for t in data["threads"]] == [(m["id"], m["generation"]) for m in flat(data)]
 
 
 async def test_push_keys_persist_and_endpoints_are_restricted(companion):
@@ -225,8 +291,12 @@ async def test_push_keys_persist_and_endpoints_are_restricted(companion):
     with patch("pywebpush.webpush") as send:
         await service._push("Hello there! This is the test reminder")
         assert json.loads(send.call_args.kwargs["data"]) == {
-            "body": "Hello there! This is the test reminder", "agent_name": service.cfg.agent_name, "unread": 0}
+            "body": "Hello there! This is the test reminder", "agent_name": service.cfg.agent_name, "thread": None, "unread": 0}
         assert send.call_args.kwargs["requests_session"].max_redirects == 0
+        # A reply's push names its thread, so the notification click can open it in reply mode.
+        await service._push("Recorded.", "a" * 32)
+        assert json.loads(send.call_args.kwargs["data"]) == {
+            "body": "Recorded.", "agent_name": service.cfg.agent_name, "thread": "a" * 32, "unread": 0}
     assert (await client.delete("/api/push", json={"endpoint": endpoint})).status == 200
     assert service.db.execute("SELECT count(*) FROM subscriptions").fetchone()[0] == 0
     service.cfg.pwa_push_contact = "mailto:test@example.com"
@@ -248,7 +318,7 @@ async def test_push_preview_is_bounded_and_preserves_unicode(companion):
         await service._push("\U0001f331" * 2000)
     payload = send.call_args.kwargs["data"]
     assert len(payload.encode("utf-8")) < 3000
-    assert json.loads(payload) == {"body": "\U0001f331" * 500 + "...", "agent_name": service.cfg.agent_name, "unread": 0}
+    assert json.loads(payload) == {"body": "\U0001f331" * 500 + "...", "agent_name": service.cfg.agent_name, "thread": None, "unread": 0}
 
 
 async def test_agent_name_in_shell_manifest_session_and_worker(companion):
@@ -278,10 +348,16 @@ async def test_push_triggers_include_reply_reminder_and_test_text(companion):
     service, client = companion
     with patch.object(service, "notify_push") as notify:
         await service.observe_delivery("Your reminder")
-        notify.assert_called_with("Your reminder")
+        reminder = service.db.execute("SELECT id, thread FROM messages WHERE text='Your reminder'").fetchone()
+        assert reminder["thread"] == reminder["id"]
+        notify.assert_called_with("Your reminder", thread=reminder["id"])
         await client.post("/api/messages", json={"id": "c" * 32, "text": "Hi"})
         await settle(service)
-        notify.assert_called_with("Recorded.")
+        notify.assert_called_with("Recorded.", thread="c" * 32)
+        # A reply in an existing thread pushes that thread, not its own message id.
+        await client.post("/api/messages", json={"id": "d" * 32, "text": "Thanks", "reply_to": "c" * 32})
+        await settle(service)
+        notify.assert_called_with("Recorded.", thread="c" * 32)
         service.public_key = "configured"
         assert (await client.post("/api/push/test", json={})).status == 200
         notify.assert_called_with("Hello there! This is the test reminder", grace=False)
@@ -305,21 +381,22 @@ async def test_push_waits_a_grace_period_and_skips_replies_seen_on_a_focused_dev
         await settle(service)
         assert not push.called
         await asyncio.gather(*service.push_tasks)
-        push.assert_called_once_with("Recorded.")
+        push.assert_called_once_with("Recorded.", "e" * 32)
 
         # A scheduled delivery waits out the same grace and notifies unless seen.
         push.reset_mock()
         await service.observe_delivery("Your reminder")
         assert not push.called
         await asyncio.gather(*service.push_tasks)
-        push.assert_called_once_with("Your reminder")
+        reminder = service.db.execute("SELECT id FROM messages WHERE text='Your reminder'").fetchone()["id"]
+        push.assert_called_once_with("Your reminder", reminder)
 
         # The test button never waits and is never suppressed.
         push.reset_mock()
         await client.post("/api/seen", json={"through": 1e12})
         assert (await client.post("/api/push/test", json={})).status == 200
         await asyncio.gather(*service.push_tasks)
-        push.assert_called_once_with("Hello there! This is the test reminder")
+        push.assert_called_once_with("Hello there! This is the test reminder", None)
 
 
 async def test_unread_count_follows_seen_marks_and_survives_restart(companion):
@@ -366,7 +443,8 @@ async def test_drain_waits_for_delayed_pushes(companion):
         await service.observe_delivery("Your reminder")
         assert not push.called
         await service.drain()
-        push.assert_called_once_with("Your reminder")
+        reminder = service.db.execute("SELECT id FROM messages WHERE text='Your reminder'").fetchone()["id"]
+        push.assert_called_once_with("Your reminder", reminder)
 
 
 def test_shell_revision_follows_every_shell_file_and_the_instance_name(tmp_path):
@@ -436,19 +514,24 @@ async def test_now_returns_unmodified_text_without_model_or_actions(companion):
 async def test_deliveries_mirror_to_the_web_chat_unless_the_agent_shares_the_archive(companion):
     service, client = companion
     # An agent with its own archive (the fake here) needs the companion to
-    # show the delivery and queue the note for the shared context.
-    await service.observe_delivery("Time for your medication")
-    service.agent._queue_sent_note.assert_called_once_with(WEB_CHAT_ID, "Time for your medication")
-    rows = service.db.execute("SELECT space, role, text FROM messages").fetchall()
-    assert [tuple(r) for r in rows] == [("general", "assistant", "Time for your medication")]
-    # An agent on the same archive already mirrored it through run_job: the
-    # companion only notifies, or the reminder would show twice.
+    # record the delivery as a thread root of its own and push that thread.
+    with patch.object(service, "notify_push") as notify:
+        await service.observe_delivery("Time for your medication")
+    rows = service.db.execute("SELECT id, space, role, text, status, thread, reply_to FROM messages").fetchall()
+    assert [tuple(r)[1:] for r in rows] == [("general", "assistant", "Time for your medication", "done", rows[0]["id"], None)]
+    notify.assert_called_once_with("Time for your medication", thread=rows[0]["id"])
+    # There is no pending-notes mirror any more: the delivery reaches the model
+    # as an archived thread, through the ambient block and native replies.
+    service.agent._queue_sent_note.assert_not_called()
+    # An agent on the same archive already recorded it in the main path, which
+    # passes the row id along: the companion only notifies, with that thread,
+    # or the reminder would show twice.
     service.agent.archive = service.archive
     with patch.object(service, "notify_push") as notify:
-        await service.observe_delivery("Second reminder")
-    notify.assert_called_once_with("Second reminder")
-    service.agent._queue_sent_note.assert_called_once()
+        await service.observe_delivery("Second reminder", thread="root-from-main")
+    notify.assert_called_once_with("Second reminder", thread="root-from-main")
     assert service.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+    service.agent._queue_sent_note.assert_not_called()
 
 
 async def test_shared_timeline_reset_delete_and_restart_context(companion):
@@ -464,11 +547,17 @@ async def test_shared_timeline_reset_delete_and_restart_context(companion):
         assert (await client.post("/api/messages", json={"id": "a"*32, "text": "Web input"})).status == 202
         await settle(service)
         assert "Telegram input" in str(model.chat.call_args.args[0])
-        rows = (await (await client.get("/api/messages")).json())["messages"]
+        page = await timeline(client)
+        rows = flat(page)
         assert [r["source"] for r in rows] == ["telegram", "telegram", "web", "web"]
         assert len(rows) == 4
+        # The Telegram exchange and the web exchange are two threads; the agent's
+        # own reply row (reply:<id>) sits in the thread of the message it answers.
+        assert [(t["id"], [m["id"] for m in t["messages"]]) for t in page["threads"]] == [
+            (rows[0]["id"], [rows[0]["id"], f"reply:{rows[0]['id']}"]), ("a" * 32, ["a" * 32, "reply:" + "a" * 32])]
+        assert all(m["thread"] == t["id"] for t in page["threads"] for m in t["messages"])
         assert (await client.post("/api/reset", json={})).status == 200
-        assert len((await (await client.get("/api/messages")).json())["messages"]) == 4
+        assert len(flat(await timeline(client))) == 4
         service.agent = Agent(service.vault, archive=service.archive, home_chat_fn=lambda: 123)
         assert service.agent._get_history(123).messages() == []
         assert "Telegram input" in service.agent._get_history(123).retrieve("get_history", {})
@@ -516,7 +605,7 @@ async def test_message_with_attachments_reaches_the_model_as_vision_input(compan
     assert call.kwargs["image_data_urls"] == ["data:image/png;base64," + base64.b64encode(PNG).decode()] * 2
     assert "without a caption" in call.args[1]
     assert all(f"[attached image {n} of 2 — already stored in the vault at {path}" in call.args[1] for n, path in enumerate(paths, 1))
-    rows = (await (await client.get("/api/messages")).json())["messages"]
+    rows = flat(await timeline(client))
     assert rows[0]["text"] == "" and json.loads(rows[0]["metadata"])["attachments"] == paths
     # A caption keeps its own text; the stored-path note follows it.
     service.agent.run.reset_mock()

@@ -8,7 +8,6 @@ import logging
 import re
 import time
 import traceback
-from collections import deque
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -87,6 +86,22 @@ _JOB_CLOSE_RESPONSE_FORMAT: dict[str, Any] = {
 # recorded in the very page its prompt named as the ingest destination).
 _SNAPSHOT_MAX_FILES = 5
 _SNAPSHOT_MAX_CHARS = 5000
+# Background for a thread's live turn: the newest threads of the past day.
+_AMBIENT_THREADS = 5
+_AMBIENT_WINDOW_SECONDS = 24 * 3600
+_AMBIENT_CHARS = 600
+_AMBIENT_HEADER = (
+    "[Recent conversations, background only — the message above may refer to one of them "
+    "without saying so. Deliveries marked as sent from a scheduled run were sent by you; do not "
+    "repeat them. The vault, not this list, is the source of current state.]"
+)
+
+
+def _clip(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= _AMBIENT_CHARS else text[:_AMBIENT_CHARS] + "…"
+
+
 _SNAPSHOT_HEADER = (
     "[state snapshot, fetched at fire time — current content of pages this job references]"
 )
@@ -243,33 +258,35 @@ class Agent:
         self._fan_out_fn = fan_out_fn
         self._skills = skills
         self._backup = backup
-        self._histories: dict[int, ConversationHistory] = {}
-        # Scheduled-run deliveries queued for mirroring into the target
-        # conversation's history, keyed like _histories. Queued at send time,
-        # drained by that conversation's next run — appending directly from
-        # the job run could interleave into an in-flight run's tool sequence,
-        # and waiting for the target's run lock inside a send_message dispatch
-        # could outlive the tool timeout and bait the model into re-sending.
-        self._pending_notes: dict[int, deque[str]] = {}
-        # One lock per conversation: concurrent runs for the same chat would
-        # interleave appends into one history and produce tool messages the
-        # API rejects. Different conversations (other chats, scheduled jobs
-        # on chat 0) run in parallel.
-        self._run_locks: dict[int, asyncio.Lock] = {}
+        # Histories and locks are keyed by (chat, thread): a thread is one root
+        # message and its replies, and each runs under its own lock — concurrent
+        # runs on one history would interleave appends into tool orderings the
+        # API rejects, while different threads, chats and scheduled jobs (chat
+        # 0, no thread) proceed in parallel. A settled thread history is
+        # dropped after its run; the archive rebuilds it for the next reply.
+        self._histories: dict[tuple[int, str | None], ConversationHistory] = {}
+        self._run_locks: dict[tuple[int, str | None], asyncio.Lock] = {}
         self._history_exchanges = history_exchanges
         self.archive = archive
         self._home_chat_fn = home_chat_fn
         self._home_chat_aliases: set[int] = set()
         self._tz = ZoneInfo(tz_name)
 
-    def _get_history(self, chat_id: int) -> ConversationHistory:
-        key = self.conversation_key(chat_id)
+    def _get_history(self, chat_id: int, thread: str | None = None) -> ConversationHistory:
+        chat_id = self.conversation_key(chat_id)
+        key = (chat_id, thread)
         if key not in self._histories:
             self._histories[key] = ConversationHistory(
                 self._history_exchanges, archive=self.archive if chat_id != 0 else None,
-                space=self.conversation_space(key),
+                space=self.conversation_space(chat_id), thread=thread,
             )
         return self._histories[key]
+
+    def _thread_of(self, chat_id: int, message_id: str | None) -> str | None:
+        """The thread an archived message belongs to; None outside the archive (chat 0, tests)."""
+        if self.archive is None or chat_id == 0 or message_id is None:
+            return None
+        return self.archive.thread_of(message_id)
 
     def conversation_key(self, chat_id: int) -> int:
         """The canonical conversation: the pinned Telegram home chat is the web chat."""
@@ -283,29 +300,43 @@ class Agent:
         return conversation_space(self.conversation_key(chat_id))
 
     async def reset_conversation(self, chat_id: int):
-        key = self.conversation_key(chat_id)
-        async with self._run_locks.setdefault(key, asyncio.Lock()):
-            self._histories.pop(key, None)
-            self._pending_notes.pop(key, None)
-            if self.archive:
-                self.archive.reset(self.conversation_space(key))
+        """Forget a chat's in-memory histories and start a new archive generation.
+
+        Threads already running keep their own history object and finish;
+        the archive refuses to complete a message from the old generation, so
+        callers wait for in-flight work first (the bot awaits the open batch,
+        the web app refuses while a message is queued or running).
+        """
+        self.clear_history(chat_id)
 
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def _queue_sent_note(self, chat_id: int, text: str) -> None:
-        """Queue a scheduled-run delivery for the target conversation's history.
+    def _ambient_context(self, space: str, thread: str) -> str | None:
+        """The last few threads of this chat, as background for the live turn only.
 
-        The stamp is frozen now, like user-message stamps; the provenance
-        prefix tells the model this is a message it already sent, not one to
-        send again.
+        A thread's own context is just its messages, so a new root like
+        "done" or "pastilla tomada" would otherwise arrive cold. The newest
+        threads of the past day — root plus latest reply, scheduled-run
+        deliveries included — ride the live turn like a job's state snapshot:
+        never stored, so replies do not re-pay them.
         """
-        key = self.conversation_key(chat_id)
-        note = f"[{self._local_stamp()}, sent from a scheduled run] {text}"
-        if self.archive:
-            self.archive.queue_note(self.conversation_space(key), note)
-        else:
-            self._pending_notes.setdefault(key, deque()).append(note)
+        assert self.archive is not None
+        threads = self.archive.recent_threads(
+            space, generation=self.archive.generation(space),
+            since=time.time() - _AMBIENT_WINDOW_SECONDS, limit=_AMBIENT_THREADS, exclude=thread,
+        )
+        if not threads:
+            return None
+        blocks = [_AMBIENT_HEADER]
+        for item in reversed(threads):  # oldest first, like a transcript
+            stamp = datetime.fromtimestamp(item["root_created"], tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M")
+            who = "Assistant (sent from a scheduled run)" if item["root_role"] == "assistant" else "User"
+            lines = [f"--- {stamp} ---", f"{who}: {_clip(item['root_text'])}"]
+            if item["reply_text"]:
+                lines.append(f"Assistant: {_clip(item['reply_text'])}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
 
     def _job_state_snapshot(self, prompt: str) -> str | None:
         """Current content of the vault pages a job prompt names.
@@ -330,12 +361,12 @@ class Agent:
         return "\n\n".join(blocks)
 
     def clear_history(self, chat_id: int) -> None:
-        """Forget one chat's conversation; the next run starts fresh."""
-        key = self.conversation_key(chat_id)
-        self._histories.pop(key, None)
-        self._pending_notes.pop(key, None)
+        """Forget one chat's threads in memory and open a new archive generation."""
+        chat_id = self.conversation_key(chat_id)
+        for key in [key for key in self._histories if key[0] == chat_id]:
+            self._histories.pop(key, None)
         if self.archive:
-            self.archive.reset(self.conversation_space(key))
+            self.archive.reset(self.conversation_space(chat_id))
 
     def _base_prompt(self) -> str:
         """Embedded capability prompt: ships with the code, sections gated by enabled features."""
@@ -536,17 +567,22 @@ class Agent:
         unwind_on_unavailable: bool = False,
         message_id: str | None = None,
         source: str = "telegram",
+        reply_to: str | None = None,
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
 
         ``transient_context`` rides the user message during this run only;
         stored history keeps the bare message (same treatment as images).
 
-        Runs for the same conversation are serialized on a lock —
-        interleaved appends into one history would produce orphaned tool
-        messages the API rejects. Runs for different conversations (other
-        chats, scheduled jobs) proceed in parallel; the lock queue is FIFO,
-        so same-conversation messages are handled in arrival order.
+        With an archive, the message is a thread: a reply (``reply_to`` an
+        archived message, or a pre-inserted ``message_id`` that already
+        replies to one) continues its parent's thread and sees that thread's
+        exchanges; anything else starts a new thread and sees only the
+        ambient background of recent threads. Runs on one thread are
+        serialized on a lock — interleaved appends into one history would
+        produce orphaned tool messages the API rejects — while other threads,
+        chats and scheduled jobs proceed in parallel; the lock queue is FIFO,
+        so replies within a thread are handled in arrival order.
 
         ``on_research`` is awaited once, best-effort, the first time this run
         dispatches the ``research`` tool (e.g. to react to the Telegram message).
@@ -556,8 +592,10 @@ class Agent:
         chat_id = self.conversation_key(chat_id)  # Freeze identity before lock waits or network calls.
         if self.archive and chat_id != 0:
             message_id = self.archive.insert(self.conversation_space(chat_id), "user", user_message, "queued",
-                                             message_id=message_id, source=source) if message_id is None else message_id
-        lock = self._run_locks.setdefault(chat_id, asyncio.Lock())
+                                             message_id=message_id, source=source,
+                                             reply_to=reply_to) if message_id is None else message_id
+        thread = self._thread_of(chat_id, message_id)
+        lock = self._run_locks.setdefault((chat_id, thread), asyncio.Lock())
         async with lock:
             if self.archive and message_id:
                 row = self.archive.get(message_id)
@@ -568,12 +606,13 @@ class Agent:
                 if row["status"] == "done":
                     return self.archive.reply(message_id) or ""
                 self.archive.status(message_id, "running")
-                self._get_history(chat_id).request_ids.add(message_id)
-                self._get_history(chat_id).active_request_id = message_id
+                self._get_history(chat_id, thread).request_ids.add(message_id)
+                self._get_history(chat_id, thread).active_request_id = message_id
             try:
                 reply, touched = await self._run_locked(
                     chat_id,
                     user_message,
+                    thread=thread,
                     extra_context=extra_context,
                     image_data_urls=image_data_urls,
                     transient_context=transient_context,
@@ -585,21 +624,47 @@ class Agent:
             except BaseException as exc:
                 if self.archive and message_id:
                     status = "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed"
-                    self.archive.status(message_id, status, "Run did not finish; some work may have completed.")
+                    self._mark_unfinished(message_id, status, "Run did not finish; some work may have completed.")
                 raise
             if self.archive and message_id:
                 if reply == MAX_ITERATIONS_REPLY:
                     self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+            self._release_thread(chat_id, thread)
         # One commit per interaction, in the background: the reply is not
         # delayed by git, and the commit message carries the full exchange.
         if self._backup is not None and touched:
             self._backup.schedule_commit(touched, trigger=user_message, response=reply)
         return reply
 
+    def _mark_unfinished(self, message_id: str, status: str, error: str) -> None:
+        """Record why a run stopped, unless the user already dismissed the message.
+
+        A reset landing while a thread runs tombstones its rows; the run then
+        fails on completion, and that failure must not revive the row as
+        retryable work.
+        """
+        assert self.archive is not None
+        row = self.archive.get(message_id)
+        if row is not None and row["status"] not in ("dismissed", "deleted"):
+            self.archive.status(message_id, status, error)
+
+    def _release_thread(self, chat_id: int, thread: str | None) -> None:
+        """Drop a thread's history once nothing unfinished remains in it.
+
+        Its completed exchanges are in the archive, and a later reply
+        restores them; keeping every thread ever run would grow without
+        bound. Unfinished work (a failed or iteration-capped run) stays for
+        the hot retry that resumes it.
+        """
+        key = (chat_id, thread)
+        if thread is not None and key in self._histories and self._histories[key].is_settled():
+            del self._histories[key]
+
     async def _run_locked(
         self,
         chat_id: int,
         user_message: str,
+        thread: str | None = None,
         extra_context: str | None = None,
         image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
@@ -621,20 +686,14 @@ class Agent:
         unwind touches only the unfinished work block.
         """
         t_start = time.monotonic()
-        history = self._get_history(chat_id)
+        history = self._get_history(chat_id, thread)
         history.begin_run()
         touched: set[str] = set()
 
-        # Messages a scheduled run delivered to this conversation since its
-        # last run enter history here, under its run lock, so the incoming
-        # user message lands with the reminder it is replying to in context.
-        for note in self._pending_notes.pop(self.conversation_key(chat_id), ()):
-            history.append({"role": "assistant", "content": note})
-        if history.archive:
-            for note in history.archive.notes(history.space):
-                if note["id"] not in history.note_ids:
-                    history.append({"role": "assistant", "content": note["content"]})
-                    history.note_ids.add(note["id"])
+        if history.archive and thread is not None:
+            ambient = self._ambient_context(history.space, thread)
+            if ambient:
+                transient_context = f"{transient_context}\n\n{ambient}" if transient_context else ambient
 
         system_prompt = self._load_system_prompt()
         if extra_context:
@@ -829,7 +888,8 @@ class Agent:
         queue keeps the item.
         """
         chat_id = self.conversation_key(chat_id)
-        lock = self._run_locks.setdefault(chat_id, asyncio.Lock())
+        thread = self._thread_of(chat_id, message_id)
+        lock = self._run_locks.setdefault((chat_id, thread), asyncio.Lock())
         async with lock:
             if self.archive and message_id:
                 row = self.archive.get(message_id)
@@ -837,10 +897,10 @@ class Agent:
                     return None
                 if row["space"] != self.conversation_space(chat_id):
                     raise ValueError("Retry belongs to a different conversation")
-                self._get_history(chat_id).request_ids.add(message_id)
-                self._get_history(chat_id).active_request_id = message_id
+                self._get_history(chat_id, thread).request_ids.add(message_id)
+                self._get_history(chat_id, thread).active_request_id = message_id
             if hot:
-                msgs = self._get_history(chat_id).messages()
+                msgs = self._get_history(chat_id, thread).messages()
                 if not msgs:
                     return None  # /clear deliberately supersedes queued work
                 last = msgs[-1]
@@ -858,7 +918,7 @@ class Agent:
                 )
             try:
                 reply, touched = await self._run_locked(
-                    chat_id, note, unwind_on_unavailable=True,
+                    chat_id, note, thread=thread, unwind_on_unavailable=True,
                     send_message_fn=send_message_fn, extra_context=extra_context,
                     # A cold replay shows the pictures again; a hot one's turn
                     # already carried them.
@@ -866,12 +926,13 @@ class Agent:
                 )
             except BaseException as exc:
                 if self.archive and message_id:
-                    self.archive.status(message_id,
-                                        "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed",
-                                        "Retry did not finish; some work may have completed.")
+                    self._mark_unfinished(message_id,
+                                          "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed",
+                                          "Retry did not finish; some work may have completed.")
                 raise
             if self.archive and message_id and reply == MAX_ITERATIONS_REPLY:
                 self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+            self._release_thread(chat_id, thread)
         if self._backup is not None and touched:
             self._backup.schedule_commit(touched, trigger=note, response=reply)
         return reply
@@ -901,12 +962,6 @@ class Agent:
             if base_send:
                 target_chat = await base_send(text)
             delivered += 1
-            # Mirror the delivery into the target conversation's history so a
-            # user reply to it there arrives with context — this run is the
-            # chat-0 job conversation, invisible to the one the message
-            # landed in. A None chat id means the delivery was dropped.
-            if target_chat is not None and self.archive is None:
-                self._queue_sent_note(target_chat, text)
             return target_chat
 
         reply = await self.run(

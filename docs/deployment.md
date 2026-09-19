@@ -121,8 +121,7 @@ Next: set up your vault — see [vault.md](vault.md#starting-a-vault).
 
 The companion runs beside Telegram in the same Python process. Chat is the
 home screen: one conversation, the same one as the pinned Telegram home chat,
-sharing its archive, model context (five completed exchanges by default) and
-run lock. Other Telegram chats remain isolated. Now is a read-only,
+sharing its archive and threads. Other Telegram chats remain isolated. Now is a read-only,
 plain-text display of `wiki/now.md`, preserving all sections and Markdown as
 written. Opening Now never calls the model. There are no dashboard cards,
 project navigation, or task/reminder buttons; make changes through chat.
@@ -190,8 +189,8 @@ Notifications use the instance name as their title and include the reply or
 reminder text (up to 500 characters). Content can appear on your lock screen; control previews
 in your device notification settings. Ordinary Telegram replies still notify
 only through Telegram. A reply or reminder waits five seconds before any push
-goes out; if a focused device is showing that conversation scrolled to the end
-by then, no device is notified. Being on the Now tab, unfocused, or scrolled up
+goes out; if a focused device that you have used in the last few minutes is
+showing that conversation scrolled to the end by then, no device is notified. Being on the Now tab, unfocused, or scrolled up
 reading older messages does not count, and a device that starts showing the
 reply after the window still gets the push. Opening one opens the chat.
 Delivery depends on the OS, browser permissions and network; Telegram remains
@@ -239,14 +238,18 @@ references) and final assistant replies are archived alongside web messages in
 `state_dir/companion.sqlite3`, even when the PWA is disabled. The web timeline
 labels each message Telegram or Web. Existing web exchanges are migrated once;
 Telegram recording starts with this version, without downloading old backlog.
-By default, five completed text exchanges are restored after restart. Older completed text
+The chat is organised in threads: sending a message starts one, and Reply (or a
+Telegram reply) continues it. The model sees the whole thread it is answering in,
+plus the newest few threads of the past day as background, so a reminder answered
+with a bare "done" is still understood. Older completed text
 remains available through `get_history` and literal `search_history`; raw tool
 protocol and reasoning are not persisted. The vault remains the authority for
 current knowledge, not the chat archive.
 
-**Reset context** (also Telegram `/clear`) starts a new automatic-context window
-without deleting saved messages. Older text is still retrievable explicitly.
-It dismisses pending conversation work and queued notes, but does not cancel
+**Reset context** (also Telegram `/clear`) clears the background of recent threads
+without deleting saved messages; a thread replied to afterwards still carries
+its own earlier messages. Older text is still retrievable explicitly.
+It dismisses pending conversation work, but does not cancel
 independent scheduled jobs. The web chat draws a "Context reset" divider at
 the cut, so you can see which messages the model no longer has in front of it.
 It does not change messages in Telegram itself, vault files, or backups.

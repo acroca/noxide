@@ -16,11 +16,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from assistant.agent import (
+    _AMBIENT_HEADER,
     _JOB_CLOSE_RESPONSE_FORMAT,
     Agent,
     _extract_vault_paths,
     _parse_job_close,
 )
+from assistant.conversations import WEB_CHAT_ID, ConversationArchive
 from assistant.history import (
     _HISTORY_TOOL_RESULT_CAP,
     _HISTORY_TRIM_MARKER,
@@ -1101,163 +1103,260 @@ async def test_run_job_sends_nothing_for_empty_reply(vault: VaultTools) -> None:
 
 
 # ------------------------------------------------------------------
-# Mirroring scheduled-run deliveries into the target conversation
+# Threads: a root message and its replies, with the newest threads of the
+# chat riding the live turn as ambient background (never stored)
 # ------------------------------------------------------------------
 
-_NOTE_RX = re.compile(
-    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} local, sent from a scheduled run\] "
-)
+_AMBIENT_STAMP_RX = re.compile(r"--- \d{4}-\d{2}-\d{2} \d{2}:\d{2} ---")
 
 
-def _mirror_agent(vault: VaultTools, deliver_to: int | None = 7) -> Agent:
+@pytest.fixture
+def archive(tmp_path: Path) -> ConversationArchive:
+    state = tmp_path / "state"
+    state.mkdir()
+    archive = ConversationArchive(state)
+    yield archive
+    archive.close()
+
+
+@pytest.fixture
+def threaded(vault: VaultTools, archive: ConversationArchive) -> Agent:
+    """Archive-backed agent whose chat 7 is the pinned home chat (space ``general``)."""
+    return Agent(vault_tools=vault, archive=archive, home_chat_fn=lambda: 7)
+
+
+def _live_turn(sent: list[dict]) -> str:
+    """The content of the live user message of a request (always the last message)."""
+    assert sent[-1]["role"] == "user"
+    return str(sent[-1]["content"])
+
+
+def _delivery_shapes() -> list[tuple[str, list[dict]]]:
+    """The three ways a scheduled run delivers: the tool, the close JSON, the raw fallback."""
+    return [
+        ("send_message tool", [
+            _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
+            _make_text_response('{"silent": false, "message": null}'),
+        ]),
+        ("close JSON", [_make_text_response('{"silent": false, "message": "Reminder: take the pill"}')]),
+        ("raw fallback", [_make_text_response("Reminder: take the pill")]),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape,responses", _delivery_shapes(), ids=lambda v: v if isinstance(v, str) else "")
+async def test_scheduled_delivery_is_ambient_background_for_the_next_root(
+    vault: VaultTools, archive: ConversationArchive, shape: str, responses: list[dict],
+) -> None:
+    """A delivery archived as a thread root (what __main__'s sender does) reaches
+    the next new thread through the ambient block, marked as sent by the bot, and
+    the stored context of that thread keeps the bare message."""
+
+    async def send(text: str) -> int | None:
+        archive.insert("general", "assistant", text, "done", source="telegram", delivery="delivered")
+        return 7
+
+    agent = Agent(vault_tools=vault, archive=archive, home_chat_fn=lambda: 7, send_message_fn=send)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[*responses, _make_text_response("Logged!")])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Remind the user to take the pill")
+        assert await agent.run(chat_id=7, user_message="Pill taken") == "Logged!"
+
+    sent = mock_client.chat.call_args.args[0]
+    assert [m["role"] for m in sent] == ["system", "user"], "a new root carries no other thread's messages"
+    live = _live_turn(sent)
+    assert live.index("Pill taken") < live.index(_AMBIENT_HEADER)
+    assert "Assistant (sent from a scheduled run): Reminder: take the pill" in live
+    assert len(_AMBIENT_STAMP_RX.findall(live)) == 1
+    assert "sent from a scheduled run" not in _load_system(sent)
+    stored = archive.load_context("general")
+    assert [r["role"] for r in stored] == ["user", "assistant"]
+    assert stored[0]["content"].endswith("] Pill taken")
+    assert _AMBIENT_HEADER not in str(stored) and "Reminder" not in str(stored)
+
+
+def _load_system(sent: list[dict]) -> str:
+    return str(sent[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_ambient_block_lists_user_threads_with_their_reply(
+    threaded: Agent, archive: ConversationArchive,
+) -> None:
+    """A new root sees the recent threads' root and latest reply as background,
+    oldest first, and no other thread's messages in the message list."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response("A1"), _make_text_response("A2"), _make_text_response("A3"),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await threaded.run(chat_id=7, user_message="first question")
+        await threaded.run(chat_id=7, user_message="second question")
+        await threaded.run(chat_id=7, user_message="unrelated")
+
+    sent = mock_client.chat.call_args.args[0]
+    assert [m["role"] for m in sent] == ["system", "user"]
+    live = _live_turn(sent)
+    assert live.startswith("[") and "] unrelated" in live.split("\n")[0]
+    assert live.count(_AMBIENT_HEADER) == 1
+    assert len(_AMBIENT_STAMP_RX.findall(live)) == 2
+    assert live.index("User: first question") < live.index("Assistant: A1") < live.index("User: second question") < live.index("Assistant: A2")
+    assert "sent from a scheduled run):" not in live
+    stored = archive.load_context("general")
+    assert [r["content"] for r in stored if r["role"] == "assistant"] == ["A1", "A2", "A3"]
+    assert _AMBIENT_HEADER not in str(stored)
+
+
+@pytest.mark.asyncio
+async def test_reply_runs_with_its_thread_exchanges(threaded: Agent, archive: ConversationArchive) -> None:
+    """A reply (``reply_to``, or a pre-inserted row that replies) sees the parent
+    thread's completed exchanges as messages, joins the thread in the archive, and
+    gets no ambient block for the thread it is already in."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response("A1"), _make_text_response("A2"), _make_text_response("A3"),
+    ])
+    root = archive.insert("general", "user", "first question", "queued", source="telegram")
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await threaded.run(chat_id=7, user_message="first question", message_id=root)
+        assert await threaded.run(chat_id=7, user_message="and then?", reply_to=root) == "A2"
+        sent = mock_client.chat.call_args.args[0]
+        assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
+        assert "] first question" in sent[1]["content"] and sent[2]["content"] == "A1"
+        assert "] and then?" in _live_turn(sent)
+        assert _AMBIENT_HEADER not in str(sent)
+        # The web flow inserts the row first, replying to any message of the thread.
+        later = archive.insert("general", "user", "more", "queued", source="web",
+                               reply_to=archive.db.execute(
+                                   "SELECT id FROM messages WHERE text='and then?'").fetchone()[0])
+        assert await threaded.run(chat_id=WEB_CHAT_ID, user_message="more", message_id=later, source="web") == "A3"
+
+    sent = mock_client.chat.call_args.args[0]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user", "assistant", "user"]
+    assert [m["content"] for m in sent if m["role"] == "assistant"] == ["A1", "A2"]
+    rows = archive.db.execute("SELECT id, thread, reply_to FROM messages ORDER BY created").fetchall()
+    assert {r["thread"] for r in rows} == {root}
+    assert len(rows) == 6
+    assert archive.get(later)["reply_to"] != root and archive.thread_of(later) == root
+    assert archive.get(f"reply:{later}")["thread"] == root
+
+
+async def _run_records_concurrency(agent: Agent, calls: list) -> dict:
+    active = {"now": 0, "max": 0}
+
+    async def chat(messages, tools, **kwargs):
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        await asyncio.sleep(0.02)
+        active["now"] -= 1
+        return _make_text_response("ok")
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=chat)
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await asyncio.gather(*calls)
+    return active
+
+
+async def test_different_threads_of_one_chat_run_in_parallel(threaded: Agent) -> None:
+    """Two new roots in the one chat are two threads: neither waits for the other."""
+    active = await _run_records_concurrency(threaded, [
+        threaded.run(chat_id=7, user_message="root one"),
+        threaded.run(chat_id=WEB_CHAT_ID, user_message="root two", source="web"),
+    ])
+    assert active["max"] == 2
+
+
+async def test_replies_in_one_thread_are_serialized(threaded: Agent, archive: ConversationArchive) -> None:
+    """Two replies to one thread must never interleave: concurrent appends into
+    one history produce tool orderings the API rejects. FIFO: arrival order."""
+    root = archive.insert("general", "user", "root", "queued", source="telegram")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("ok"))
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await threaded.run(chat_id=7, user_message="root", message_id=root)
+    active = await _run_records_concurrency(threaded, [
+        threaded.run(chat_id=7, user_message="first reply", reply_to=root),
+        threaded.run(chat_id=WEB_CHAT_ID, user_message="second reply", source="web", reply_to=root),
+    ])
+    assert active["max"] == 1
+    msgs = threaded._get_history(7, root).messages()
+    assert [m["role"] for m in msgs] == ["user", "assistant"] * 3
+    users = [m["content"] for m in msgs if m["role"] == "user"]
+    assert "root" in users[0] and "first reply" in users[1] and "second reply" in users[2]
+
+
+async def test_settled_thread_history_is_released_and_rebuilt_from_the_archive(
+    threaded: Agent, archive: ConversationArchive,
+) -> None:
+    """A finished thread's history leaves memory; a reply restores it from the
+    archive. A failed run keeps its history for the hot retry that resumes it."""
+    from assistant.copilot import CopilotUnavailableError
+
+    root = archive.insert("general", "user", "first", "queued", source="telegram")
+    broken = archive.insert("general", "user", "broken", "queued", source="telegram")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response("A1"), _make_text_response("A2"),
+        CopilotUnavailableError("HTTP 502"), _make_text_response("Resumed"),
+    ])
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await threaded.run(chat_id=7, user_message="first", message_id=root)
+        assert (WEB_CHAT_ID, root) not in threaded._histories
+        await threaded.run(chat_id=7, user_message="again", reply_to=root)
+        sent = mock_client.chat.call_args.args[0]
+        assert "] first" in sent[1]["content"] and sent[2]["content"] == "A1"
+        assert (WEB_CHAT_ID, root) not in threaded._histories
+
+        with pytest.raises(CopilotUnavailableError):
+            await threaded.run(chat_id=7, user_message="broken", message_id=broken)
+        assert (WEB_CHAT_ID, broken) in threaded._histories
+        assert not threaded._histories[(WEB_CHAT_ID, broken)].is_settled()
+        assert await threaded.retry_message(7, "broken", "earlier", hot=True, message_id=broken) == "Resumed"
+        assert (WEB_CHAT_ID, broken) not in threaded._histories
+    assert archive.get(broken)["status"] == "done" and archive.reply(broken) == "Resumed"
+
+
+@pytest.mark.asyncio
+async def test_clear_history_hides_earlier_threads_from_the_ambient_block(
+    threaded: Agent, archive: ConversationArchive,
+) -> None:
+    """/clear opens a new generation: deliveries and threads before it are no
+    longer background for new messages (they stay searchable)."""
+    archive.insert("general", "assistant", "Reminder: take the pill", "done",
+                   source="telegram", delivery="delivered")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response("Logged!"))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await threaded.run(chat_id=7, user_message="Pill taken")
+        assert "Reminder: take the pill" in _live_turn(mock_client.chat.call_args.args[0])
+        threaded.clear_history(7)
+        await threaded.run(chat_id=7, user_message="Pill taken again")
+
+    sent = mock_client.chat.call_args.args[0]
+    assert [m["role"] for m in sent] == ["system", "user"]
+    live = _live_turn(sent)
+    assert _AMBIENT_HEADER not in live and "Reminder" not in live
+    assert archive.generation("general") == 1
+
+
+# ------------------------------------------------------------------
+# Fire-time state snapshot for scheduled runs
+# ------------------------------------------------------------------
+
+
+def _delivering_agent(vault: VaultTools, deliver_to: int | None = 7) -> Agent:
     """Agent whose send fn reports delivering to chat ``deliver_to``."""
 
     async def send(text: str) -> int | None:
         return deliver_to
 
     return Agent(vault_tools=vault, send_message_fn=send)
-
-
-def _mirror_notes(messages: list[dict]) -> list[str]:
-    return [
-        m["content"]
-        for m in messages
-        if m.get("role") == "assistant" and _NOTE_RX.match(m.get("content") or "")
-    ]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_send_is_mirrored_before_next_user_message(vault: VaultTools) -> None:
-    """A reminder delivered by a scheduled run shows up in the target
-    conversation's history, so the user's reply to it has context."""
-    agent = _mirror_agent(vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=[
-        _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
-        _make_text_response('{"silent": false, "message": null}'),
-        _make_text_response("Logged!"),
-    ])
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind the user to take the pill")
-        await agent.run(chat_id=7, user_message="Pill taken")
-
-    messages = mock_client.chat.call_args[0][0]
-    notes = _mirror_notes(messages)
-    assert len(notes) == 1
-    assert notes[0].endswith("Reminder: take the pill")
-    note_idx = next(i for i, m in enumerate(messages) if m.get("content") == notes[0])
-    user_idx = next(
-        i for i, m in enumerate(messages)
-        if m.get("role") == "user" and "Pill taken" in str(m.get("content"))
-    )
-    assert note_idx < user_idx
-
-
-@pytest.mark.asyncio
-async def test_mirrored_note_lands_only_in_target_chat(vault: VaultTools) -> None:
-    """A delivery is mirrored into the conversation of the chat it was
-    delivered to, not into any other chat."""
-    agent = _mirror_agent(vault, deliver_to=778)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=[
-        _make_tool_call_response("send_message", {"text": "Chat reminder"}),
-        _make_text_response('{"silent": false, "message": null}'),
-        _make_text_response("reply other"),
-        _make_text_response("reply target"),
-    ])
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind the user")
-        await agent.run(chat_id=777, user_message="Hi other")
-        other_messages = mock_client.chat.call_args[0][0]
-        await agent.run(chat_id=778, user_message="Hi target")
-        target_messages = mock_client.chat.call_args[0][0]
-
-    assert _mirror_notes(other_messages) == []
-    assert len(_mirror_notes(target_messages)) == 1
-
-
-@pytest.mark.asyncio
-async def test_no_mirror_when_delivery_target_unknown(vault: VaultTools) -> None:
-    """A send fn that cannot say where it delivered (dropped message, legacy
-    None-returning signature) queues no note anywhere."""
-    agent = _mirror_agent(vault, deliver_to=None)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=[
-        _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
-        _make_text_response('{"silent": false, "message": null}'),
-        _make_text_response("Logged!"),
-    ])
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind the user to take the pill")
-        await agent.run(chat_id=7, user_message="Pill taken")
-
-    assert _mirror_notes(mock_client.chat.call_args[0][0]) == []
-
-
-@pytest.mark.asyncio
-async def test_close_json_delivery_is_mirrored(vault: VaultTools) -> None:
-    """A reminder delivered via the job-close message (no send_message call)
-    is mirrored like any other delivery."""
-    agent = _mirror_agent(vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=[
-        _make_text_response('{"silent": false, "message": "Cita con el dentista"}'),
-        _make_text_response("ok"),
-    ])
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind about the dentist")
-        await agent.run(chat_id=7, user_message="Vale, gracias")
-
-    notes = _mirror_notes(mock_client.chat.call_args[0][0])
-    assert len(notes) == 1
-    assert notes[0].endswith("Cita con el dentista")
-
-
-@pytest.mark.asyncio
-async def test_raw_fallback_delivery_is_mirrored(vault: VaultTools) -> None:
-    """The safety-net raw-reply delivery is mirrored too."""
-    agent = _mirror_agent(vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=[
-        _make_text_response("Plain reminder"),
-        _make_text_response("ok"),
-    ])
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind the user")
-        await agent.run(chat_id=7, user_message="ok!")
-
-    notes = _mirror_notes(mock_client.chat.call_args[0][0])
-    assert len(notes) == 1
-    assert notes[0].endswith("Plain reminder")
-
-
-@pytest.mark.asyncio
-async def test_clear_history_drops_pending_notes(vault: VaultTools) -> None:
-    """/clear forgets queued cross-conversation notes along with history."""
-    agent = _mirror_agent(vault)
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(side_effect=[
-        _make_tool_call_response("send_message", {"text": "Reminder: take the pill"}),
-        _make_text_response('{"silent": false, "message": null}'),
-        _make_text_response("Logged!"),
-    ])
-
-    with patch("assistant.copilot.get_client", return_value=mock_client):
-        await agent.run_job("Remind the user to take the pill")
-        agent.clear_history(7)
-        await agent.run(chat_id=7, user_message="Pill taken")
-
-    assert _mirror_notes(mock_client.chat.call_args[0][0]) == []
-
-
-# ------------------------------------------------------------------
-# Fire-time state snapshot for scheduled runs
-# ------------------------------------------------------------------
 
 
 def test_extract_vault_paths_finds_slashed_md_paths() -> None:
@@ -1298,7 +1397,7 @@ async def test_run_job_injects_referenced_page_state(vault: VaultTools) -> None:
     """The live turn of a scheduled run carries the current content of every
     vault page the job prompt names — the premise check cannot be skipped."""
     vault.write_file("wiki/x.md", "**Estado:** ya realizado y registrado")
-    agent = _mirror_agent(vault)
+    agent = _delivering_agent(vault)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
 
@@ -1317,7 +1416,7 @@ async def test_run_job_snapshot_not_stored_in_history(vault: VaultTools) -> None
     """Snapshots ride the live turn only: chat-0 history keeps the bare
     prompt, or every later job run would re-pay old snapshots."""
     vault.write_file("wiki/x.md", "**Estado:** ya realizado")
-    agent = _mirror_agent(vault)
+    agent = _delivering_agent(vault)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
 
@@ -1336,7 +1435,7 @@ async def test_run_job_snapshot_not_stored_in_history(vault: VaultTools) -> None
 async def test_run_job_snapshot_inlines_not_found_sentinel(vault: VaultTools) -> None:
     """A named page that no longer exists is itself information: the job's
     premise is broken and the model should see that, not guess."""
-    agent = _mirror_agent(vault)
+    agent = _delivering_agent(vault)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
 
@@ -1350,7 +1449,7 @@ async def test_run_job_snapshot_inlines_not_found_sentinel(vault: VaultTools) ->
 
 @pytest.mark.asyncio
 async def test_run_job_without_page_references_gets_no_snapshot(vault: VaultTools) -> None:
-    agent = _mirror_agent(vault)
+    agent = _delivering_agent(vault)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
 
@@ -1364,7 +1463,7 @@ async def test_run_job_without_page_references_gets_no_snapshot(vault: VaultTool
 @pytest.mark.asyncio
 async def test_run_job_snapshot_truncates_long_pages(vault: VaultTools) -> None:
     vault.write_file("wiki/big.md", "x" * 6000)
-    agent = _mirror_agent(vault)
+    agent = _delivering_agent(vault)
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
 

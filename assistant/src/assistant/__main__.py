@@ -236,14 +236,22 @@ async def _run(config_path: Path | None) -> None:
     companion = None
 
     async def send_message(text: str) -> int | None:
-        target = await bot.send_message(text)
-        if target is not None:
-            archive.insert(agent.conversation_space(target), "assistant", text, "done",
-                           source="telegram", delivery="delivered")
-            agent._queue_sent_note(target, text)
+        # A proactive delivery is a thread root: archived first, so the
+        # Telegram messages that carry it map back to it and a reply to any
+        # of them continues its thread.
+        home = bot.home_chat_id
+        if home is None:
+            return await bot.send_message(text)
+        row_id = archive.insert(agent.conversation_space(home), "assistant", text, "done",
+                                source="telegram", delivery="pending")
+        target = await bot.send_message(text, archive_id=row_id)
+        archive.status(row_id, "done")
+        archive.db.execute("UPDATE messages SET delivery=? WHERE id=?",
+                           ("delivered" if target is not None else "failed", row_id))
+        archive.db.commit()
         if companion is not None and target is not None:
             try:
-                await companion.observe_delivery(text)
+                await companion.observe_delivery(text, thread=row_id)
             except Exception:
                 logging.getLogger(__name__).exception("Could not mirror delivery into web companion")
         return target

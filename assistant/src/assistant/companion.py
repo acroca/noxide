@@ -36,9 +36,11 @@ logger = logging.getLogger(__name__)
 # Longer than the client's poll interval, so the device already showing the
 # conversation gets to acknowledge before phones buzz.
 PUSH_GRACE_SECONDS = 5
-# Newest messages the chat opens with; the same page feeds the 2.2s poll, so it
-# is kept small. Earlier pages load behind the timeline's manual link.
+# Newest threads the chat opens with; the same page feeds the 2.2s poll, so it
+# is kept small. Earlier pages load behind the timeline's manual link. Most
+# threads are two messages; a long one is capped rather than paged.
 MESSAGE_PAGE = 20
+THREAD_MESSAGES = 100
 # Web runs in flight, queued ones included; they still run one at a time
 # behind the agent's conversation lock.
 MAX_IN_FLIGHT = 16
@@ -240,17 +242,32 @@ class Companion:
         return content
 
     async def messages(self, request):
+        """A page of threads in the order they started, newest last; ``before`` pages by start time.
+
+        A reply does not move its thread: the list is a timeline of
+        interactions, each box staying where its first message put it.
+        """
         before = float(request.query.get("before", "inf"))
-        rows = self.db.execute("SELECT * FROM messages WHERE space=? AND status!='deleted' AND created<? ORDER BY created DESC LIMIT ?",
-                               (SPACE, before, MESSAGE_PAGE + 1)).fetchall()
+        heads = self.db.execute(
+            "SELECT thread, min(created) AS started FROM messages WHERE space=? AND status!='deleted'"
+            " GROUP BY thread HAVING started<? ORDER BY started DESC LIMIT ?",
+            (SPACE, before, MESSAGE_PAGE + 1)).fetchall()
+        threads = []
+        for head in reversed(heads[:MESSAGE_PAGE]):
+            # A thread past the cap keeps its newest messages: that is where
+            # the reply goes and what the last-activity cursor refers to.
+            rows = self.db.execute(
+                "SELECT * FROM messages WHERE space=? AND thread=? AND status!='deleted' ORDER BY created DESC LIMIT ?",
+                (SPACE, head["thread"], THREAD_MESSAGES)).fetchall()
+            messages = [dict(r) for r in reversed(rows)]
+            for message in messages:
+                if message["id"] in self.activity:
+                    message["activity"] = self.activity[message["id"]]
+            threads.append({"id": head["thread"], "started": head["started"], "messages": messages})
         # The current generation lets the timeline draw a divider after a
-        # reset that no message has followed yet.
-        messages = [dict(r) for r in reversed(rows[:MESSAGE_PAGE])]
-        for message in messages:
-            if message["id"] in self.activity:
-                message["activity"] = self.activity[message["id"]]
-        return web.json_response({"messages": messages,
-                                  "before": rows[MESSAGE_PAGE - 1]["created"] if len(rows) > MESSAGE_PAGE else None,
+        # reset that no thread has followed yet.
+        return web.json_response({"threads": threads,
+                                  "before": heads[MESSAGE_PAGE - 1]["started"] if len(heads) > MESSAGE_PAGE else None,
                                   "unread": self.unread_count(),
                                   "generation": self.archive.generation(SPACE)})
 
@@ -264,7 +281,11 @@ class Companion:
         data = await request.json()
         if not self.accepting:
             raise web.HTTPServiceUnavailable(text="Service restarting; your draft has not been sent")
-        text, message_id = data.get("text"), data.get("id")
+        text, message_id, reply_to = data.get("text"), data.get("id"), data.get("reply_to")
+        if reply_to is not None:
+            parent = self.archive.get(reply_to) if isinstance(reply_to, str) else None
+            if parent is None or parent["space"] != SPACE or parent["status"] == "deleted":
+                raise web.HTTPBadRequest(text="The message you are replying to is not in this chat")
         attachments = self._attachments(data.get("attachments", []))
         if not isinstance(text, str) or len(text) > 20000 or not (text.strip() or attachments):
             raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters or an image")
@@ -272,15 +293,15 @@ class Companion:
             raise web.HTTPBadRequest(text="A valid message ID is required")
         existing = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
         if existing:
-            if existing["space"] != SPACE or existing["text"] != text:
+            if existing["space"] != SPACE or existing["text"] != text or existing["reply_to"] != reply_to:
                 raise web.HTTPConflict(text="Message ID already used")
             return web.json_response({"id": message_id}, status=202)
         if len(self.tasks) >= MAX_IN_FLIGHT:
             raise web.HTTPTooManyRequests(text="Too many messages are in progress. Try again shortly.")
-        # Several messages may be pending: each is its own run, serialized in
-        # arrival order by Agent.run's conversation lock, so a later reply
-        # sees the earlier exchange in its history.
-        self._insert(SPACE, "user", text, "queued", message_id=message_id,
+        # Several messages may be pending: each is its own thread and its own
+        # run, in parallel; replies within one thread are serialized in
+        # arrival order by the agent's thread lock.
+        self._insert(SPACE, "user", text, "queued", message_id=message_id, reply_to=reply_to,
                      metadata={"attachments": attachments} if attachments else None)
         self._launch(message_id)
         return web.json_response({"id": message_id}, status=202)
@@ -328,8 +349,6 @@ class Companion:
 
         async def send(text):
             self._insert(SPACE, "assistant", text, "done", reply_to=message_id)
-            if getattr(self.agent, "archive", None) is self.archive:
-                self.agent._queue_sent_note(WEB_CHAT_ID, text)
             return WEB_CHAT_ID
 
         try:
@@ -362,7 +381,7 @@ class Companion:
                 self._insert(SPACE, "assistant", reply, "done", reply_to=message_id)
             self.db.execute("UPDATE messages SET status='done', error='' WHERE id=? AND status NOT IN ('deleted','dismissed')", (message_id,))
             self.hot.discard(message_id)
-            self.notify_push(reply or "")
+            self.notify_push(reply or "", thread=row["thread"])
         except CopilotUnavailableError:
             self.db.execute("UPDATE messages SET status='unavailable', error=? WHERE id=?",
                             ("Copilot is unavailable. Your message is saved; retry when ready.", message_id))
@@ -400,12 +419,15 @@ class Companion:
         self.hot.difference_update(row["id"] for row in self.db.execute("SELECT id FROM messages WHERE space=?", (SPACE,)))
         return web.json_response({"ok": True})
 
-    async def observe_delivery(self, text):
-        """A scheduled run delivered to the home chat: show it here and notify devices."""
+    async def observe_delivery(self, text, thread=None):
+        """A scheduled run delivered to the home chat: show it here and notify devices.
+
+        The main path archives the delivery as a thread root and passes its
+        id; a companion on its own archive records it itself.
+        """
         if getattr(self.agent, "archive", None) is not self.archive:
-            self._insert(SPACE, "assistant", text, "done")
-            self.agent._queue_sent_note(WEB_CHAT_ID, text)
-        self.notify_push(text)
+            thread = self._insert(SPACE, "assistant", text, "done")
+        self.notify_push(text, thread=thread)
 
     async def subscribe(self, request):
         if not self.public_key:
@@ -507,35 +529,36 @@ class Companion:
             " AND created > COALESCE((SELECT through FROM seen WHERE space=?), 0)",
             (SPACE, SPACE)).fetchone()[0]
 
-    def notify_push(self, text="", *, grace=True):
+    def notify_push(self, text="", *, thread=None, grace=True):
         if not self.public_key or len(self.push_tasks) >= 8:
             return
         row = self.db.execute("SELECT max(created) FROM messages WHERE space=? AND role='assistant' AND status!='deleted'",
                               (SPACE,)).fetchone()
         created = row[0] if row and row[0] is not None else time.time()
-        task = asyncio.create_task(self._push_unless_seen(text, created) if grace
-                                   else self._push(text))
+        task = asyncio.create_task(self._push_unless_seen(text, created, thread) if grace
+                                   else self._push(text, thread))
         self.push_tasks.add(task)
         task.add_done_callback(self.push_tasks.discard)
 
-    async def _push_unless_seen(self, text, created):
-        # "Seen" means displayed on a focused device with the thread scrolled
-        # to the end, not proof of reading; a device that acknowledges after
-        # the window still gets the push, since it cannot be retracted.
+    async def _push_unless_seen(self, text, created, thread=None):
+        # "Seen" means displayed on a focused, recently used device with the
+        # thread scrolled to the end, not proof of reading; a device that
+        # acknowledges after the window still gets the push, since it cannot
+        # be retracted.
         await asyncio.sleep(PUSH_GRACE_SECONDS)
         if self.seen.get(SPACE, 0.0) >= created:
             logger.debug("Push skipped: already displayed on a focused device")
             return
-        await self._push(text)
+        await self._push(text, thread)
 
-    async def _push(self, text=""):
+    async def _push(self, text="", thread=None):
         from pywebpush import WebPushException, webpush
         from requests import Session
 
         # Leave room for encryption overhead under providers' 4 KB payload limit,
         # including text made entirely of four-byte Unicode characters.
         body = text[:500] + ("..." if len(text) > 500 else "")
-        payload = json.dumps({"body": body, "agent_name": self.cfg.agent_name,
+        payload = json.dumps({"body": body, "agent_name": self.cfg.agent_name, "thread": thread,
                               "unread": self.unread_count()}, ensure_ascii=False)
 
         def deliver(subscription):

@@ -9,6 +9,7 @@ const paths = {
   send: 'M12 19V5m-5 5 5-5 5 5',
   image: 'M4 5h16v14H4zM4 15l5-5 4 4 3-3 4 4M15.5 9.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0',
   mic: 'M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3M8 21h8',
+  reply: 'M9 7 4 12l5 5M4 12h9a7 7 0 0 1 7 7',
 };
 const MAX_IMAGES = 4, IMAGE_EDGE = 2000, KEEP_ORIGINAL_BYTES = 4 * 1024 * 1024, MAX_RECORDING_MS = 5 * 60 * 1000;
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
@@ -17,11 +18,27 @@ function icon(name) {
 }
 $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 let session, poll, installPrompt, toastTimer, version = 0;
+// A thread to open in reply mode once the chat has loaded: from a notification
+// click (the worker names the thread) or a #chat/<thread> URL.
+let pendingThread = null;
+const REPLY_EXCERPT = 90;
+const SWIPE_START = 8, SWIPE_COMMIT = 56, SWIPE_MAX = 80;
 let agentName = $('meta[name="agent-name"]').content;
 let serverUnavailable = false, booting = false, pendingMutations = 0;
 let waitingWorker = null, reloadRequested = false, workerChanged = false;
 let hadController = Boolean(navigator.serviceWorker?.controller);
 let ackVisible = () => {};
+// Presence: acknowledging a reply as seen silences the push on every device,
+// so it needs a person, not just a focused window — a desktop left open on the
+// chat overnight swallowed a reminder's notification (2026-09-19). Recent
+// input counts as presence; a still window does not.
+const ACTIVE_WINDOW_MS = 3 * 60 * 1000;
+let lastActivity = Date.now();
+const noteActivity = () => { lastActivity = Date.now(); };
+for (const name of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart']) document.addEventListener(name, noteActivity, { passive: true, capture: true });
+window.addEventListener('focus', noteActivity);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) noteActivity(); });
+const isActive = () => Date.now() - lastActivity < ACTIVE_WINDOW_MS;
 // Draft keys keep the shape from when the chat had topics, so drafts saved
 // before the switch to one chat are still found.
 const DRAFT_KEY = 'noxide-draft:general', SUBMISSION_KEY = 'noxide-submission:general';
@@ -154,8 +171,23 @@ function markdown(text) {
   closeList(); closeTable(); if (fence) out.push(`<pre>${escape(code.join('\n'))}</pre>`);
   return `<div class="markdown">${out.join('')}</div>`;
 }
-function dateLabel(seconds) {
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: session?.timezone }).format(new Date(seconds * 1000));
+// Calendar day of a timestamp in the assistant's timezone, as YYYY-MM-DD.
+function dayOf(seconds) {
+  return new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: session?.timezone }).format(new Date(seconds * 1000));
+}
+function timeLabel(seconds) {
+  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', timeZone: session?.timezone }).format(new Date(seconds * 1000));
+}
+// Day separators read like a chat app: Today, Yesterday, then the date, with
+// the year only when it differs from the current one.
+function dayLabel(day) {
+  const now = Date.now() / 1000, today = dayOf(now), yesterday = dayOf(now - 86400);
+  if (day === today) return 'Today';
+  if (day === yesterday) return 'Yesterday';
+  const date = new Date(day + 'T12:00:00');
+  const options = { month: 'long', day: 'numeric' };
+  if (day.slice(0, 4) !== today.slice(0, 4)) options.year = 'numeric';
+  return new Intl.DateTimeFormat(undefined, options).format(date);
 }
 function draft() {
   try { return localStorage.getItem(DRAFT_KEY) || ''; } catch { return ''; }
@@ -172,6 +204,7 @@ function renderChat(pageVersion) {
       <button id="older-messages" class="quiet older" hidden>Load earlier messages</button>
       <div id="chat-thread" class="chat-thread" role="log" aria-label="Messages"><div class="loading">Loading messages…</div></div>
       <form id="chat-form" class="chat-composer">
+        <div id="reply-chip" class="reply-chip" hidden><span id="reply-excerpt"></span><button id="cancel-reply" type="button" aria-label="Cancel reply">×</button></div>
         <div id="composer-images" class="composer-images" hidden></div>
         <button id="attach-image" class="tool-button" type="button" aria-label="Attach image">${icon('image')}</button>
         <input id="image-input" type="file" accept="image/*" multiple hidden>
@@ -184,6 +217,74 @@ function renderChat(pageVersion) {
   const active = () => version === pageVersion && Boolean($('#chat-thread'));
   let signature = '', cursor = null, older = [], sending = false, loaded = false;
   let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
+  // The message the next send replies to; null starts a new thread. Most
+  // threads are two messages long, so a new thread is the no-gesture default.
+  let replyTo = null;
+  function excerpt(text) { const line = (text || '').replace(/\s+/g, ' ').trim(); return line.length > REPLY_EXCERPT ? line.slice(0, REPLY_EXCERPT).trimEnd() + '…' : line; }
+  function setReply(message) {
+    replyTo = message ? { id: message.id, thread: message.thread } : null;
+    $('#reply-chip').hidden = !replyTo;
+    if (replyTo) $('#reply-excerpt').textContent = `Replying to ${message.role === 'user' ? 'yourself' : agentName}: ${excerpt(message.text)}`;
+    $$('.thread').forEach(s => {
+      const active = s.dataset.thread === replyTo?.thread;
+      s.classList.toggle('replying', active);
+      const button = s.querySelector('.thread-reply');
+      if (button) { button.textContent = active ? 'Replying' : 'Reply'; button.toggleAttribute('aria-pressed', active); }
+    });
+    updateComposer();
+  }
+  // Replying targets a thread's last message; asking for the active thread
+  // again starts a new thread instead.
+  function toggleThread(threadId) {
+    if (replyTo?.thread === threadId) { setReply(null); return; }
+    const last = latest.filter(m => m.thread === threadId).at(-1);
+    if (last) { setReply(last); area.focus(); }
+  }
+  // Swipe a box to the right to reply, as chat apps do. Touch only: a mouse
+  // drag is text selection. The box follows the finger up to SWIPE_MAX and
+  // commits past SWIPE_COMMIT; vertical movement hands over to scrolling.
+  function swipeToReply(section) {
+    let start = null, dx = 0;
+    const settle = () => {
+      section.classList.remove('swiping');
+      section.style.transform = '';
+      section.style.setProperty('--swipe', '0');
+      start = null; dx = 0;
+    };
+    section.addEventListener('pointerdown', event => {
+      if (event.pointerType !== 'touch' || !event.isPrimary) return;
+      start = { x: event.clientX, y: event.clientY, id: event.pointerId };
+    });
+    section.addEventListener('pointermove', event => {
+      if (!start || event.pointerId !== start.id) return;
+      const moveX = event.clientX - start.x, moveY = event.clientY - start.y;
+      if (!section.classList.contains('swiping')) {
+        if (Math.abs(moveY) > Math.abs(moveX) || moveX < SWIPE_START) { if (Math.abs(moveY) > SWIPE_START) start = null; return; }
+        section.classList.add('swiping');
+        try { section.setPointerCapture(event.pointerId); } catch {}
+      }
+      dx = Math.max(0, Math.min(SWIPE_MAX, moveX));
+      section.style.transform = `translateX(${dx}px)`;
+      section.style.setProperty('--swipe', String(Math.min(1, dx / SWIPE_COMMIT)));
+    });
+    const end = event => {
+      if (!start || event.pointerId !== start.id) return;
+      const commit = section.classList.contains('swiping') && dx >= SWIPE_COMMIT;
+      settle();
+      if (commit) toggleThread(section.dataset.thread);
+    };
+    section.addEventListener('pointerup', end);
+    section.addEventListener('pointercancel', end);
+  }
+  function openThread(threadId) {
+    const section = $(`[data-thread="${CSS.escape(threadId)}"]`);
+    if (!section) return false;
+    const last = latest.filter(m => m.thread === threadId).at(-1);
+    if (last) setReply(last);
+    section.scrollIntoView({ block: 'center' });
+    area.focus();
+    return true;
+  }
   const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
   const atEnd = thread => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
   // One line tall, growing with the text up to the stylesheet's cap. Measuring
@@ -196,10 +297,11 @@ function renderChat(pageVersion) {
   };
   fit();
   function markSeen() {
-    // Tell the server this device is showing the newest reply: focused, on the
-    // chat, scrolled to the end. Other devices then skip the push for it.
-    // Merely being open, or reading older messages, acknowledges nothing.
-    if (!active() || document.hidden || !document.hasFocus() || !atEnd($('#chat-thread'))) return;
+    // Tell the server this device is showing the newest reply to someone:
+    // focused, recently used, on the chat, scrolled to the end. Other devices
+    // then skip the push for it. Merely being open, idle, or reading older
+    // messages acknowledges nothing.
+    if (!active() || document.hidden || !document.hasFocus() || !isActive() || !atEnd($('#chat-thread'))) return;
     const newest = Math.max(0, ...latest.filter(m => m.role === 'assistant').map(m => m.created));
     if (newest <= acked) return;
     const previous = acked;
@@ -220,7 +322,7 @@ function renderChat(pageVersion) {
     $('#attach-image').disabled = sending || images.length >= MAX_IMAGES;
     $('#discard-recording').hidden = !recorder;
     $('#chat-status').firstChild.textContent = (!navigator.onLine ? 'Offline. Your draft stays on this device.'
-      : activity ? activity : 'Ready') + ' ';
+      : activity ? activity : replyTo ? 'Replying in a thread' : 'Ready') + ' ';
   }
   function setActivity(text) { activity = text; updateComposer(); }
   function renderImages() {
@@ -252,6 +354,7 @@ function renderChat(pageVersion) {
   // Composer buttons leave focus in the textarea: the keyboard stays open
   // across a send, and blurring would shift the layout under the tap.
   form.querySelectorAll('button').forEach(b => b.addEventListener('mousedown', event => event.preventDefault()));
+  $('#cancel-reply').addEventListener('click', () => setReply(null));
   $('#attach-image').addEventListener('click', () => $('#image-input').click());
   $('#image-input').addEventListener('change', event => { addImages([...event.target.files]); event.target.value = ''; });
   area.addEventListener('paste', event => {
@@ -317,37 +420,53 @@ function renderChat(pageVersion) {
   async function loadMessages(loadOlder = false) {
     const data = await api('messages' + (loadOlder ? `?before=${cursor}` : ''));
     if (!active()) return;
-    if (loadOlder) { older = [...data.messages, ...older]; cursor = data.before; await loadMessages(); return; }
+    if (loadOlder) { older = [...data.threads, ...older]; cursor = data.before; await loadMessages(); return; }
     if (!older.length) cursor = data.before;
     $('#older-messages').hidden = cursor === null;
     if (Number.isInteger(data.unread)) showBadge(data.unread);
-    const nextSignature = JSON.stringify([data.messages, older, data.generation]);
+    const nextSignature = JSON.stringify([data.threads, older, data.generation]);
     loaded = true;
-    latest = data.messages;
+    // Threads keep the order their first message gave them; a reply stays in its box.
+    const seen = new Set();
+    const threads = [...older, ...data.threads].filter(t => { if (seen.has(t.id)) return false; seen.add(t.id); return true; });
+    latest = threads.flatMap(t => t.messages);
     updateComposer();
     if (nextSignature === signature) { markSeen(); return; }
     const initial = !signature;
     signature = nextSignature;
     const thread = $('#chat-thread'), nearBottom = atEnd(thread);
-    const ids = new Set();
-    const messages = [...older, ...data.messages].filter(m => { if (ids.has(m.id)) return false; ids.add(m.id); return true; });
     // A context reset starts a new generation: mark where the model stopped
-    // seeing earlier messages, including a reset nothing has followed yet.
+    // seeing earlier threads, including a reset nothing has followed yet.
     const divider = '<div class="context-divider" role="separator">Context reset</div>';
-    const trailing = messages.length && messages[messages.length - 1].generation < data.generation ? divider : '';
-    thread.innerHTML = messages.length ? messages.map((m, i) => `
-      ${i && m.generation !== messages[i - 1].generation ? divider : ''}
-      <article class="message message-${escape(m.role)}">
-        <div class="message-meta"><strong>${m.role === 'user' ? 'You' : escape(agentName)}</strong><time>${escape(dateLabel(m.created))}</time>${m.role === 'assistant' && !m.reply_to ? '' : `<span>${m.source === 'telegram' ? 'Telegram' : 'Web'}</span>`}${m.role === 'assistant' && ['failed','partial','pending'].includes(m.delivery) ? `<span>Telegram delivery: ${escape(m.delivery)}</span>` : ''}</div>
-        <div class="message-body">${m.role === 'user' ? thumbnails(m) + escape(m.text) : markdown(m.text)}</div>
+    const generationOf = t => t.messages[0].generation;
+    const trailing = threads.length && generationOf(threads[threads.length - 1]) < data.generation ? divider : '';
+    // Who wrote a message is its side; the time sits small inside the bubble,
+    // with the day only when it differs from the thread's day.
+    const article = (m, day) => `
+      <article class="message message-${escape(m.role)}" data-message="${escape(m.id)}">
+        <div class="message-body">${m.role === 'user' ? thumbnails(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}" title="${escape(m.source === 'telegram' ? 'Telegram' : 'Web')}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
+        ${m.role === 'assistant' && ['failed', 'partial', 'pending'].includes(m.delivery) ? `<div class="message-status"><span>Telegram delivery: ${escape(m.delivery)}</span></div>` : ''}
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${m.source !== 'telegram' && ['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
-      </article>`).join('') + trailing : `<div class="chat-empty"><h1>${escape(name)}</h1><p>No messages yet. Send a message to start.</p></div>`;
+      </article>`;
+    const dayOfThread = t => dayOf(t.messages[0].created);
+    thread.innerHTML = threads.length ? threads.map((t, i) => `
+      ${!i || dayOfThread(t) !== dayOfThread(threads[i - 1]) ? `<div class="day-divider" role="separator">${escape(dayLabel(dayOfThread(t)))}</div>` : ''}
+      ${i && generationOf(t) !== generationOf(threads[i - 1]) ? divider : ''}
+      <section class="thread${t.id === replyTo?.thread ? ' replying' : ''}" data-thread="${escape(t.id)}" aria-label="Thread">
+        <span class="swipe-hint" aria-hidden="true">${icon('reply')}</span>
+        ${t.messages.map(m => article(m, dayOfThread(t))).join('')}
+        <button class="quiet thread-reply" type="button" data-reply="${escape(t.id)}"${t.id === replyTo?.thread ? ' aria-pressed="true"' : ''}>${t.id === replyTo?.thread ? 'Replying' : 'Reply'}</button>
+      </section>`).join('') + trailing : `<div class="chat-empty"><h1>${escape(name)}</h1><p>No messages yet. Send a message to start.</p></div>`;
     $$('[data-retry]').forEach(b => b.addEventListener('click', async () => {
       b.disabled = true;
       try { await api('retry', { id: b.dataset.retry }); await loadMessages(); }
       catch (e) { toast(e.message); } finally { b.disabled = false; }
     }));
+    $$('[data-reply]').forEach(b => b.addEventListener('click', () => toggleThread(b.dataset.reply)));
+    $$('.thread').forEach(swipeToReply);
     if (initial || nearBottom) thread.scrollTop = thread.scrollHeight;
+    // One attempt per request: a thread not on this page must not surface later.
+    if (pendingThread) { openThread(pendingThread); pendingThread = null; }
     markSeen();
   }
   $('#older-messages').addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
@@ -385,13 +504,15 @@ function renderChat(pageVersion) {
       const attachments = images.map(image => image.path);
       let pending;
       try { pending = JSON.parse(localStorage.getItem(SUBMISSION_KEY)); } catch {}
-      if (pending?.text !== text || JSON.stringify(pending?.attachments || []) !== JSON.stringify(attachments)) pending = { id: crypto.randomUUID(), text, attachments };
+      const reply_to = replyTo?.id || null;
+      if (pending?.text !== text || pending?.reply_to !== reply_to || JSON.stringify(pending?.attachments || []) !== JSON.stringify(attachments)) pending = { id: crypto.randomUUID(), text, attachments, reply_to };
       localStorage.setItem(SUBMISSION_KEY, JSON.stringify(pending));
-      await api('messages', { id: pending.id, text, attachments });
+      await api('messages', { id: pending.id, text, attachments, reply_to });
       // Do not erase a new draft typed while the request was in flight.
       if (draft().trim() === text) localStorage.removeItem(DRAFT_KEY);
       localStorage.removeItem(SUBMISSION_KEY);
       if (area.value.trim() === text) { area.value = ''; fit(); }
+      setReply(null);
       clearImages();
       await loadMessages();
     } catch (e) { toast(e.message); } finally { sending = false; setActivity(''); }
@@ -404,8 +525,10 @@ async function route() {
   if (!session) return;
   clearInterval(poll);
   const pageVersion = ++version;
-  const [requested] = location.hash.slice(1).split('/');
+  const [requested, ...parts] = location.hash.slice(1).split('/');
   const view = requested === 'now' || requested === 'today' ? 'now' : 'chat';
+  // #chat/<thread> opens that thread in reply mode (a notification with no open window).
+  if (view === 'chat' && parts.length) { try { pendingThread = decodeURIComponent(parts.join('/')); } catch {} history.replaceState(null, '', '#chat'); }
   $$('[data-nav]').forEach(a => { a.classList.toggle('active', a.dataset.nav === view); a.setAttribute('aria-current', a.dataset.nav === view ? 'page' : 'false'); });
   try {
     if (view === 'now') {
@@ -554,8 +677,10 @@ $('#reload-update').addEventListener('click', () => {
 });
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', event => {
-    // A notification click: the worker focuses this window and asks for the chat.
+    // A notification click: the worker focuses this window and asks for the
+    // chat, naming the thread the reply belongs to.
     if (event.data?.type !== 'OPEN_CHAT') return;
+    if (typeof event.data.thread === 'string' && event.data.thread) pendingThread = event.data.thread;
     if (location.hash === '#chat') route(); else location.hash = '#chat';
   });
   navigator.serviceWorker.addEventListener('controllerchange', () => {

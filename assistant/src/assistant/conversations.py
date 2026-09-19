@@ -74,6 +74,10 @@ class ConversationArchive:
                 chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
                 request_id TEXT NOT NULL, PRIMARY KEY(chat_id,message_id)
             );
+            CREATE TABLE IF NOT EXISTS telegram_outputs (
+                chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                archive_id TEXT NOT NULL, PRIMARY KEY(chat_id,message_id)
+            );
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(messages)")}
         for name, definition in (
@@ -81,14 +85,18 @@ class ConversationArchive:
             ("metadata", "TEXT NOT NULL DEFAULT '{}'"),
             ("generation", "INTEGER NOT NULL DEFAULT 0"),
             ("delivery", "TEXT NOT NULL DEFAULT ''"),
+            ("thread", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+        if "thread" not in {row["name"] for row in self.db.execute("PRAGMA table_info(context_records)")}:
+            self.db.execute("ALTER TABLE context_records ADD COLUMN thread TEXT")
         self.db.execute("UPDATE messages SET status='interrupted', error=? WHERE status IN ('queued','running')",
                         ("Service restarted. Work may have partially completed. Review before retrying.",))
         self._import_existing_web_context()
         self._flatten_threaded_spaces()
         self._merge_legacy_home_spaces()
+        self._backfill_threads()
         self.db.commit()
 
     def _import_existing_web_context(self):
@@ -168,23 +176,48 @@ class ConversationArchive:
                 self.db.execute(f"DELETE FROM seen WHERE space IN ({marks})", spaces)
         self.db.execute("INSERT INTO archive_meta VALUES ('merge_home_spaces','1')")
 
+    def _backfill_threads(self):
+        """Give rows from before threads (2026-09-18) a thread: each message its own, replies their parent's.
+
+        Idempotent and cheap: only rows with an empty thread are touched, and
+        ``insert`` sets the column, so after the first start there are none.
+        Context records from before threads keep a NULL thread — they stay
+        searchable through the history tools but belong to no thread's context.
+        """
+        self.db.execute("UPDATE messages SET thread=id WHERE thread='' AND (reply_to IS NULL OR reply_to='')")
+        # Reply chains are one deep today (assistant answers user); loop anyway.
+        for _ in range(8):
+            changed = self.db.execute(
+                "UPDATE messages SET thread=(SELECT p.thread FROM messages p WHERE p.id=messages.reply_to AND p.thread!='')"
+                " WHERE thread='' AND EXISTS (SELECT 1 FROM messages p WHERE p.id=messages.reply_to AND p.thread!='')").rowcount
+            if not changed:
+                break
+        self.db.execute("UPDATE messages SET thread=id WHERE thread=''")
+
+    def thread_of(self, message_id):
+        """The root id of the thread a message belongs to, or None for an unknown message."""
+        row = self.db.execute("SELECT thread FROM messages WHERE id=?", (message_id,)).fetchone()
+        return row[0] if row else None
+
     def generation(self, space):
         row = self.db.execute("SELECT generation FROM context_generations WHERE space=?", (space,)).fetchone()
         return row[0] if row else 0
 
     def insert(self, space, role, text, status, *, message_id=None, reply_to=None,
                source="web", metadata=None, delivery=""):
+        """Record a message. A reply joins its parent's thread; anything else starts one."""
         message_id = message_id or secrets.token_hex(16)
         existing = self.get(message_id)
         if existing:
             if (existing["space"], existing["role"], existing["text"]) != (space, role, text):
                 raise ValueError("Message ID already used for different content")
             return message_id
+        thread = (self.thread_of(reply_to) if reply_to else None) or message_id
         self.db.execute("""INSERT INTO messages
-            (id,space,role,text,status,created,reply_to,source,metadata,generation,delivery)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (id,space,role,text,status,created,reply_to,source,metadata,generation,delivery,thread)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (message_id, space, role, text, status, time.time(), reply_to, source,
-                         json.dumps(metadata or {}, ensure_ascii=False), self.generation(space), delivery))
+                         json.dumps(metadata or {}, ensure_ascii=False), self.generation(space), delivery, thread))
         self.db.commit()
         return message_id
 
@@ -204,45 +237,83 @@ class ConversationArchive:
                         (status, json.dumps({"telegram_message_ids": receipts or []}), f"reply:{message_id}"))
         self.db.commit()
 
-    def save_context(self, space, exchange, timestamp, *, message_id=None, request_ids=(), note_ids=()):
+    def save_context(self, space, exchange, timestamp, *, thread=None, message_id=None, request_ids=()):
         exchange_id = secrets.token_hex(16)
         generation = self.generation(space)
-        # Publish context, reply, completion and note consumption atomically.
+        # Publish context, reply and completion atomically.
         with self.db:
             for record in exchange:
-                cursor = self.db.execute("INSERT INTO context_records(space,exchange_id,role,content,completed_at,generation) VALUES (?,?,?,?,?,?)",
-                                         (space, exchange_id, record["role"], record["content"], timestamp, generation))
+                cursor = self.db.execute("INSERT INTO context_records(space,exchange_id,role,content,completed_at,generation,thread) VALUES (?,?,?,?,?,?,?)",
+                                         (space, exchange_id, record["role"], record["content"], timestamp, generation, thread))
                 record["id"] = cursor.lastrowid
             if message_id:
                 row = self.get(message_id)
                 if row is None or row["space"] != space or row["generation"] != generation:
                     raise ValueError("Conversation changed before completion")
                 self.db.execute("""INSERT INTO messages
-                    (id,space,role,text,status,created,reply_to,source,generation,delivery)
-                    VALUES (?,?,'assistant',?,'done',?,?,?,?,?)""",
+                    (id,space,role,text,status,created,reply_to,source,generation,delivery,thread)
+                    VALUES (?,?,'assistant',?,'done',?,?,?,?,?,?)""",
                                 (f"reply:{message_id}", space, exchange[-1]["content"], time.time(),
                                  message_id, row["source"], generation,
-                                 "available" if row["source"] == "web" else "pending"))
+                                 "available" if row["source"] == "web" else "pending", row["thread"]))
                 for request_id in set(request_ids) | {message_id}:
                     self.db.execute("UPDATE messages SET status='done',error='' WHERE id=? AND space=? AND generation=? AND status NOT IN ('deleted','dismissed')",
                                     (request_id, space, generation))
-            self.db.executemany("DELETE FROM pending_notes WHERE id=?", [(i,) for i in note_ids])
 
-    def load_context(self, space):
+    def load_context(self, space, thread=None):
+        """Completed context records of a space, or of one thread within it, oldest first."""
+        if thread is None:
+            return [dict(row) for row in self.db.execute(
+                "SELECT * FROM context_records WHERE space=? ORDER BY id", (space,))]
         return [dict(row) for row in self.db.execute(
-            "SELECT * FROM context_records WHERE space=? ORDER BY id", (space,))]
+            "SELECT * FROM context_records WHERE space=? AND thread=? ORDER BY id", (space, thread))]
 
-    def queue_note(self, space, content):
-        self.db.execute("INSERT INTO pending_notes(space,content) VALUES (?,?)", (space, content))
+    def recent_threads(self, space, *, generation, since, limit, exclude=None):
+        """The newest threads by last activity: root message plus the latest assistant reply.
+
+        Background for a new message that refers to an earlier exchange
+        without replying to it ("done", "pastilla tomada"). Only completed
+        rows of the current generation count, so a context reset clears it.
+        """
+        threads = []
+        rows = self.db.execute(
+            "SELECT thread, max(created) AS last FROM messages WHERE space=? AND status='done'"
+            " AND generation=? AND created>? GROUP BY thread ORDER BY last DESC LIMIT ?",
+            (space, generation, since, limit + 1)).fetchall()
+        for row in rows:
+            if row["thread"] == exclude:
+                continue
+            root = self.db.execute("SELECT role, text, created FROM messages WHERE id=? AND status='done'", (row["thread"],)).fetchone()
+            if root is None:
+                continue
+            reply = self.db.execute(
+                "SELECT text, created FROM messages WHERE thread=? AND role='assistant' AND status='done'"
+                " AND id!=? ORDER BY created DESC LIMIT 1", (row["thread"], row["thread"])).fetchone()
+            threads.append({"thread": row["thread"], "root_role": root["role"], "root_text": root["text"],
+                            "root_created": root["created"],
+                            "reply_text": reply["text"] if reply else None})
+            if len(threads) == limit:
+                break
+        return threads
+
+    def record_outputs(self, chat_id, message_ids, archive_id):
+        """Remember which Telegram messages carried an archived row, so replies to them find its thread."""
+        self.db.executemany("INSERT OR REPLACE INTO telegram_outputs VALUES (?,?,?)",
+                            [(chat_id, mid, archive_id) for mid in message_ids])
         self.db.commit()
 
-    def notes(self, space):
-        return self.db.execute("SELECT * FROM pending_notes WHERE space=? ORDER BY id", (space,)).fetchall()
+    def resolve_telegram(self, chat_id, message_id):
+        """The archived row a Telegram message corresponds to — a user input or a bot output — or None."""
+        row = self.db.execute("SELECT request_id FROM telegram_inputs WHERE chat_id=? AND message_id=?",
+                              (chat_id, message_id)).fetchone()
+        if row is None:
+            row = self.db.execute("SELECT archive_id FROM telegram_outputs WHERE chat_id=? AND message_id=?",
+                                  (chat_id, message_id)).fetchone()
+        return row[0] if row else None
 
     def reset(self, space):
         generation = self.generation(space) + 1
         self.db.execute("INSERT OR REPLACE INTO context_generations VALUES (?,?)", (space, generation))
-        self.db.execute("DELETE FROM pending_notes WHERE space=?", (space,))
         # Durable queue references become tombstones, so a cold retry cannot
         # bring back work deliberately reset by the user.
         self.db.execute("UPDATE messages SET status='dismissed',error='' WHERE space=? AND status NOT IN ('done','deleted')", (space,))

@@ -50,32 +50,53 @@ async def test_both_transports_restore_five_exchanges_and_search_old_text(setup)
     assert restored._get_history(999) is not history
 
 
-async def test_shared_lock_serializes_web_and_telegram_and_reset(setup):
+async def test_replies_serialize_roots_run_in_parallel_and_reset_does_not_wait(setup):
     archive, _, agent = setup
     started, release = asyncio.Event(), asyncio.Event()
+    calls = {}
 
     async def reply(messages, *args, **kwargs):
-        if "first" in messages[-1]["content"]:
+        text = messages[-1]["content"].split("\n")[0]
+        calls[text.split("] ", 1)[1]] = messages
+        if "first" in text:
             started.set()
             await release.wait()
         return _make_text_response("finished")
 
     client = MagicMock(chat=AsyncMock(side_effect=reply))
+    root = archive.insert("general", "user", "first", "queued", source="telegram")
     with patch("assistant.copilot.get_client", return_value=client):
-        first = asyncio.create_task(agent.run(123, "first"))
+        first = asyncio.create_task(agent.run(123, "first", message_id=root))
         await started.wait()
-        second = asyncio.create_task(agent.run(WEB_CHAT_ID, "second", source="web"))
-        await asyncio.sleep(0)
-        assert client.chat.await_count == 1
+        second = asyncio.create_task(agent.run(WEB_CHAT_ID, "second", source="web", reply_to=root))
+        third = asyncio.create_task(agent.run(WEB_CHAT_ID, "third", source="web"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # The reply waits for its thread; the new root does not.
+        assert third.done() and "second" not in calls
+        assert [m["role"] for m in calls["third"]] == ["system", "user"]
+        # A reset returns at once instead of waiting for the in-flight thread...
         reset = asyncio.create_task(agent.reset_conversation(WEB_CHAT_ID))
         await asyncio.sleep(0)
-        assert not reset.done()
+        assert reset.done() and not first.done()
         release.set()
-        await asyncio.gather(first, second, reset)
-    assert "first" in str(client.chat.call_args.args[0])
+        # ...so the archive refuses to publish the old generation's run, and the
+        # queued reply finds its row dismissed.
+        with pytest.raises(ValueError, match="Conversation changed"):
+            await first
+        assert await second == ""
+        await reset
+    assert "second" not in calls
     assert agent._get_history(123).messages() == []
-    assert "first" in agent._get_history(123).retrieve("search_history", {"query": "first"})
-    assert archive.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 4
+    assert "third" in agent._get_history(123).retrieve("search_history", {"query": "third"})
+    assert "first" not in str(archive.load_context("general"))
+    rows = {r["text"]: r for r in archive.db.execute("SELECT * FROM messages")}
+    assert set(rows) == {"first", "second", "third", "finished"}
+    assert rows["second"]["status"] == "dismissed" and rows["second"]["thread"] == root
+    # The in-flight run's failure must not revive the tombstoned row as retryable work.
+    assert rows["first"]["status"] == "dismissed" and rows["first"]["error"] == ""
+    assert rows["third"]["status"] == "done" and rows["finished"]["thread"] == rows["third"]["id"]
+    assert archive.generation("general") == 1
 
 
 async def test_reset_dismisses_pending_work_but_keeps_archived_text(setup):
@@ -114,32 +135,154 @@ async def test_outage_retry_commits_one_reply_and_completed_context(setup):
     assert "read it" in str(restored.messages())
 
 
-def test_atomic_completion_rolls_back_context_and_note_consumption(setup):
+def test_atomic_completion_rolls_back_context_and_request_status(setup):
     archive, _, _ = setup
     mid = archive.insert("general", "user", "question", "queued")
-    archive.queue_note("general", "note")
-    note = archive.notes("general")[0]
     archive.db.execute("""CREATE TRIGGER reject_reply BEFORE INSERT ON messages
                         WHEN NEW.role='assistant' BEGIN SELECT RAISE(ABORT,'test'); END""")
     with pytest.raises(sqlite3.IntegrityError):
         archive.save_context("general", [{"role": "user", "content": "question"},
                                          {"role": "assistant", "content": "answer"}], "now",
-                             message_id=mid, request_ids={mid}, note_ids={note["id"]})
+                             thread=mid, message_id=mid, request_ids={mid})
     assert archive.load_context("general") == []
     assert archive.get(mid)["status"] == "queued"
-    assert len(archive.notes("general")) == 1
+    assert archive.reply(mid) is None
 
 
-async def test_notes_survive_restart_without_double_injection(setup):
+def test_completion_stamps_the_thread_on_records_and_reply(setup):
+    archive, _, _ = setup
+    root = archive.insert("general", "user", "question", "done", source="web")
+    mid = archive.insert("general", "user", "follow-up", "queued", source="web", reply_to=root)
+    exchange = [{"role": "user", "content": "follow-up"}, {"role": "assistant", "content": "answer"}]
+    archive.save_context("general", exchange, "now", thread=root, message_id=mid, request_ids={mid})
+    assert [r["thread"] for r in archive.load_context("general")] == [root, root]
+    assert archive.load_context("general", root) == archive.load_context("general")
+    assert archive.load_context("general", mid) == []
+    reply = archive.get(f"reply:{mid}")
+    assert reply["thread"] == root and reply["reply_to"] == mid and reply["delivery"] == "available"
+    assert archive.get(mid)["status"] == "done"
+    assert [r["id"] for r in exchange] == [1, 2]
+
+
+async def test_delivery_root_survives_restart_and_is_shown_once_as_background(setup):
     archive, vault, agent = setup
-    agent._queue_sent_note(123, "Medicine reminder")
+    archive.insert("general", "assistant", "Medicine reminder", "done", source="telegram", delivery="delivered")
     restored = Agent(vault, archive=archive, home_chat_fn=lambda: 123)
     client = MagicMock(chat=AsyncMock(return_value=_make_text_response("Done")))
     with patch("assistant.copilot.get_client", return_value=client):
         await restored.run(WEB_CHAT_ID, "taken", source="web")
-    assert str(client.chat.call_args.args[0]).count("Medicine reminder") == 1
-    assert archive.notes("general") == []
-    assert "Medicine reminder" in str(Agent(vault, archive=archive)._get_history(WEB_CHAT_ID).messages())
+    sent = client.chat.call_args.args[0]
+    assert [m["role"] for m in sent] == ["system", "user"]
+    assert sent[-1]["content"].count("Medicine reminder") == 1
+    assert "Assistant (sent from a scheduled run): Medicine reminder" in sent[-1]["content"]
+    assert "Medicine reminder" not in str(Agent(vault, archive=archive)._get_history(WEB_CHAT_ID).messages())
+    assert "Medicine reminder" not in str(archive.load_context("general"))
+    assert archive.db.execute("SELECT count(*) FROM pending_notes").fetchone()[0] == 0
+
+
+def test_backfill_gives_pre_thread_rows_a_thread_once(tmp_path):
+    archive = ConversationArchive(tmp_path)
+    root = archive.insert("general", "user", "question", "done", source="web")
+    answer = archive.insert("general", "assistant", "answer", "done", message_id=f"reply:{root}", reply_to=root)
+    deeper = archive.insert("general", "user", "and?", "done", source="web", reply_to=answer)
+    alone = archive.insert("general", "assistant", "reminder", "done", source="telegram")
+    orphan = archive.insert("general", "assistant", "orphan", "done", reply_to="gone")
+    archive.db.execute("UPDATE messages SET thread=''")
+    archive.db.commit()
+    archive.close()
+    archive = ConversationArchive(tmp_path)
+    try:
+        assert {archive.thread_of(i) for i in (root, answer, deeper)} == {root}
+        assert archive.thread_of(alone) == alone and archive.thread_of(orphan) == orphan
+        assert archive.thread_of("gone") is None
+        assert archive.db.execute("SELECT count(*) FROM messages WHERE thread=''").fetchone()[0] == 0
+    finally:
+        archive.close()
+
+
+def test_insert_joins_the_parent_thread_or_starts_one(setup):
+    archive, _, _ = setup
+    root = archive.insert("general", "user", "root", "done", source="telegram")
+    reply = archive.insert("general", "assistant", "reply", "done", reply_to=root)
+    deeper = archive.insert("general", "user", "deeper", "queued", reply_to=reply)
+    fresh = archive.insert("general", "user", "fresh", "queued")
+    dangling = archive.insert("general", "user", "dangling", "queued", reply_to="missing")
+    assert archive.get(root)["thread"] == root and archive.get(root)["reply_to"] is None
+    assert archive.get(reply)["thread"] == root and archive.get(reply)["reply_to"] == root
+    assert archive.get(deeper)["thread"] == root and archive.get(deeper)["reply_to"] == reply
+    assert archive.get(fresh)["thread"] == fresh
+    assert archive.get(dangling)["thread"] == dangling and archive.get(dangling)["reply_to"] == "missing"
+    # An idempotent resend keeps the first row (and its thread) untouched.
+    assert archive.insert("general", "user", "deeper", "queued", message_id=deeper) == deeper
+    assert archive.get(deeper)["thread"] == root
+    with pytest.raises(ValueError):
+        archive.insert("general", "user", "other text", "queued", message_id=deeper)
+
+
+def test_recent_threads_orders_by_last_activity_and_filters(setup):
+    archive, _, _ = setup
+
+    def at(message_id, created):
+        archive.db.execute("UPDATE messages SET created=? WHERE id=?", (created, message_id))
+        archive.db.commit()
+
+    old = archive.insert("general", "user", "old era", "done", source="web")
+    archive.reset("general")
+    at(old, 100)
+    a = archive.insert("general", "user", "a root", "done", source="web")
+    at(a, 10)
+    a_reply = archive.insert("general", "assistant", "a first reply", "done", reply_to=a)
+    at(a_reply, 11)
+    a_last = archive.insert("general", "assistant", "a latest reply", "done", reply_to=a)
+    at(a_last, 50)
+    b = archive.insert("general", "assistant", "b delivery", "done", source="telegram")
+    at(b, 20)
+    b_pending = archive.insert("general", "user", "b pending", "running", reply_to=b)
+    at(b_pending, 60)
+    c = archive.insert("general", "user", "c root", "done", source="telegram")
+    at(c, 30)
+    stale = archive.insert("general", "user", "too old", "done", source="web")
+    at(stale, 1)
+    queued = archive.insert("general", "user", "not done", "queued", source="web")
+    at(queued, 70)
+    elsewhere = archive.insert("telegram:9", "user", "other chat", "done", source="telegram")
+    at(elsewhere, 80)
+
+    def recent(**kwargs):
+        return archive.recent_threads("general", **{"generation": 1, "since": 5, "limit": 5, **kwargs})
+
+    threads = recent()
+    assert [t["thread"] for t in threads] == [a, c, b]
+    assert threads[0] == {"thread": a, "root_role": "user", "root_text": "a root", "root_created": 10,
+                          "reply_text": "a latest reply"}
+    assert threads[1] == {"thread": c, "root_role": "user", "root_text": "c root", "root_created": 30,
+                          "reply_text": None}
+    assert threads[2] == {"thread": b, "root_role": "assistant", "root_text": "b delivery",
+                          "root_created": 20, "reply_text": None}
+    assert [t["thread"] for t in recent(exclude=a)] == [c, b]
+    assert [t["thread"] for t in recent(limit=2)] == [a, c]
+    assert [t["thread"] for t in recent(limit=2, exclude=a)] == [c, b]
+    assert [t["thread"] for t in recent(since=25)] == [a, c]
+    assert [t["thread"] for t in recent(generation=0)] == [old]
+    assert recent(generation=2) == []
+    archive.status(a, "dismissed")
+    assert [t["thread"] for t in recent()] == [c, b]
+
+
+def test_telegram_outputs_resolve_to_their_archived_row(setup):
+    archive, _, _ = setup
+    archive.db.execute("INSERT INTO telegram_inputs VALUES (123, 1, 'telegram:123:1')")
+    archive.db.commit()
+    archive.record_outputs(123, [10, 11], "reply:telegram:123:1")
+    assert archive.resolve_telegram(123, 1) == "telegram:123:1"
+    assert archive.resolve_telegram(123, 10) == archive.resolve_telegram(123, 11) == "reply:telegram:123:1"
+    assert archive.resolve_telegram(123, 12) is None
+    assert archive.resolve_telegram(124, 10) is None
+    archive.record_outputs(123, [11], "proactive")
+    assert archive.resolve_telegram(123, 11) == "proactive"
+    assert archive.resolve_telegram(123, 10) == "reply:telegram:123:1"
+    archive.record_outputs(123, [], "nothing")
+    assert archive.db.execute("SELECT count(*) FROM telegram_outputs").fetchone()[0] == 2
 
 
 def test_legacy_web_context_migration_is_once_and_lands_in_the_home_chat(tmp_path):
@@ -196,7 +339,7 @@ def test_threaded_telegram_spaces_are_flattened_once_into_their_chat(tmp_path):
         assert spaces == {"telegram:123", "general"}
         assert {archive.get(i)["space"] for i in ("m0", "m7")} == {"telegram:123"}
         assert [r["content"] for r in archive.load_context("telegram:123")] == ["thread zero", "thread seven"]
-        assert [n["content"] for n in archive.notes("telegram:123")] == ["note zero", "note seven"]
+        assert [r[0] for r in archive.db.execute("SELECT content FROM pending_notes WHERE space='telegram:123'")] == ["note zero", "note seven"]
         assert archive.generation("telegram:123") == 5
         assert archive.generation("telegram:123:0") == archive.generation("telegram:123:7") == 0
         # The home topic joins the one chat, in the era of the general row it precedes
@@ -204,7 +347,8 @@ def test_threaded_telegram_spaces_are_flattened_once_into_their_chat(tmp_path):
         assert archive.get("t5")["space"] == archive.get("g")["space"] == "general"
         assert archive.get("t5")["generation"] == archive.get("g")["generation"] == 0
         assert [(r["content"], r["generation"]) for r in archive.load_context("general")] == [("home topic", 1), ("home", 1)]
-        assert [n["content"] for n in archive.notes("general")] == ["note topic", "note home"]
+        assert [r[0] for r in archive.db.execute("SELECT content FROM pending_notes WHERE space='general'")] == ["note topic", "note home"]
+        assert {r["thread"] for r in archive.db.execute("SELECT thread FROM messages")} == {"m0", "m7", "t5", "g"}
         assert archive.generation("topic:5") == 0 and archive.generation("general") == 1
         assert archive.db.execute("SELECT value FROM archive_meta WHERE key='flat_spaces'").fetchone()[0] == "1"
         # Reopening must not migrate again: a threaded space added afterwards stays as written.
@@ -260,7 +404,8 @@ def test_old_rooms_merge_into_the_home_chat_without_inventing_resets(tmp_path):
             ("after reset", 1), ("project chat", 1), ("new era", 1)]
         history = Agent(VaultTools(tmp_path / "vault"), archive=archive)._get_history(WEB_CHAT_ID).messages()
         assert "new era" in str(history) and "project chat" in str(history) and "old era" not in str(history)
-        assert [n["content"] for n in archive.notes("general")] == ["room note"]
+        assert [r[0] for r in archive.db.execute("SELECT content FROM pending_notes WHERE space='general'")] == ["room note"]
+        assert all(r["thread"] == r["id"] for r in archive.db.execute("SELECT id, thread FROM messages"))
         assert archive.generation("general") == 1 and archive.generation("topic:9") == 0
         assert [tuple(r) for r in archive.db.execute("SELECT space, through FROM seen")] == [("general", 6.5)]
         assert archive.db.execute("SELECT value FROM archive_meta WHERE key='merge_home_spaces'").fetchone()[0] == "1"

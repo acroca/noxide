@@ -23,6 +23,18 @@ async def main():
     release.set()
     started = asyncio.Event()
 
+    def thread_page():
+        """The server's shape: threads in the order they started, each message carrying its thread."""
+        threads = {}
+        for message in state["replies"]:
+            thread = message.get("thread") or message["id"]
+            entry = threads.setdefault(thread, {"id": thread, "started": message["created"], "messages": []})
+            entry["messages"].append({**message, "thread": thread})
+            entry["started"] = min(entry["started"], message["created"])
+        for entry in threads.values():
+            entry["messages"].sort(key=lambda m: m["created"])
+        return sorted(threads.values(), key=lambda t: t["started"])
+
     async def handle(request):
         if request.path.startswith("/api/"):
             if not state["available"]:
@@ -48,7 +60,7 @@ async def main():
                 return web.json_response({"content": "# Now\n\n## Today\n- [ ] A read-only page"})
             if request.path != "/api/messages" or "space" in request.query:
                 raise web.HTTPNotFound()  # one chat: no topic routes, no space parameter
-            return web.json_response({"messages": state["replies"], "before": None,
+            return web.json_response({"threads": thread_page(), "before": None,
                                       "generation": state["generation"], "unread": state["unread"]})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
@@ -207,9 +219,19 @@ async def main():
             await page.evaluate("() => { document.hasFocus = () => false; }")
             await asyncio.sleep(3)
             assert seen == [{"through": 1700000000.5}], seen
-            await page.evaluate("() => { delete document.hasFocus; window.dispatchEvent(new Event('focus')); }")
+            # Focused but idle: a window left open with no input for a few
+            # minutes acknowledges nothing until someone touches it again.
+            await page.evaluate("() => { delete document.hasFocus; }")
+            await page.clock.install()
+            await page.clock.fast_forward(4 * 60 * 1000)
+            await page.clock.run_for(3000)
+            await asyncio.sleep(1)  # the poll's requests complete in real time
+            assert seen == [{"through": 1700000000.5}], seen
+            await page.mouse.move(40, 40)
+            await page.clock.run_for(3000)
             await asyncio.sleep(1)
             assert seen == [{"through": 1700000000.5}, {"through": 1700000001.5}], seen
+            await page.clock.resume()
             # A notification click: the worker asks for the chat and the page
             # switches its own hash, keeping the draft it left on the composer.
             await page.evaluate("() => document.querySelector('#settings').close()")  # modal would trap focus
@@ -294,13 +316,18 @@ async def main():
             await expect(page.locator(".message-assistant")).to_have_count(3)
             await expect(page.locator(".context-divider")).to_have_count(1)
             assert await page.evaluate("() => document.querySelector('.context-divider').nextElementSibling.textContent.includes('Done.')")
-            assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "message message-assistant"
-            # A message the assistant started, such as a reminder, answers no
-            # request, so it carries no source chip; replies keep theirs.
-            assert await page.locator(".message-meta span").count() == 0
+            # The divider sits between threads, and the timeline ends on the newest thread, not a divider.
+            assert await page.evaluate("() => document.querySelector('.context-divider').nextElementSibling.className") == "thread"
+            assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "thread"
+            # No name labels or full date lines: the side says who wrote it, the
+            # time sits small inside the bubble and names the source on hover.
+            assert await page.locator(".message-meta").count() == 0
             state["replies"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
-            await expect(page.locator(".message-meta span")).to_have_count(1)
-            await expect(page.locator(".message-meta span")).to_have_text("Web")
+            await expect(page.locator('[data-message="r4"] .message-time')).to_have_attribute("title", "Web")
+            assert await page.evaluate("() => /^\\d{1,2}:\\d{2}( [AP]M)?$/.test(document.querySelector('[data-message=\"r4\"] .message-time').textContent)")
+            # Every day gets its own separator line, like a chat app.
+            await expect(page.locator(".day-divider")).to_have_count(1)
+            assert await page.evaluate("() => document.querySelector('#chat-thread').firstElementChild.className") == "day-divider"
             # Blurring the composer restores its inset and shrinks the thread;
             # the thread stays anchored to its end, unless the reader scrolled up.
             # Chromium re-anchors a shrinking scroller by itself, so this cannot
@@ -365,11 +392,129 @@ async def main():
             state["voice"] = True
             await page.reload()
             await expect(page.get_by_role("button", name="Record voice message")).to_be_visible()
+
+            # Threads: a root and its replies render as one box, in the order the
+            # threads started, each ending on a Reply link; links inside keep working.
+            def message(id, role, text, created, thread=None, reply_to=None):
+                return {"id": id, "space": "general", "role": role, "text": text, "status": "done", "created": created,
+                        "source": "web", "generation": 1, "thread": thread or id, "reply_to": reply_to}
+            state["replies"] = [
+                message("u1", "user", "Water the plants", 1700000200),
+                message("reply:u1", "assistant", "Done.", 1700000201, "u1", "u1"),
+                message("u2", "user", "Plan the walk", 1700000210),
+                message("reply:u2", "assistant", "Which day?", 1700000211, "u2", "u2"),
+                message("u3", "user", "Saturday", 1700000212, "u2", "reply:u2"),
+                message("reply:u3", "assistant", "Saturday it is.", 1700000213, "u2", "u3"),
+                message("u4", "user", "A note to myself, still unanswered", 1700000220),
+            ]
+            await expect(page.locator("section.thread")).to_have_count(3)
+            assert await page.evaluate("() => [...document.querySelectorAll('section.thread')].map(s => s.dataset.thread)") == ["u1", "u2", "u4"]
+            assert await page.evaluate("() => [...document.querySelectorAll('section.thread')].map(s => [...s.querySelectorAll('article')].map(a => a.dataset.message))") == [["u1", "reply:u1"], ["u2", "reply:u2", "u3", "reply:u3"], ["u4"]]
+            assert await page.evaluate("() => [...document.querySelectorAll('section.thread')].map(s => s.querySelector('.thread-reply')?.dataset.reply)") == ["u1", "u2", "u4"]
+            assert await page.evaluate("() => [...document.querySelectorAll('section.thread')].every(s => !s.getAttribute('role') && s.lastElementChild.classList.contains('thread-reply'))")
+            # The assistant's messages sit left, yours right, inside the box.
+            assert await page.evaluate("() => { const box = document.querySelector('section.thread[data-thread=\"u1\"]').getBoundingClientRect(); const u = document.querySelector('[data-message=\"u1\"]').getBoundingClientRect(); const a = document.querySelector('[data-message=\"reply:u1\"]').getBoundingClientRect(); return a.left - box.left < 40 && box.right - u.right < 40 && a.left < u.left; }")
+            assert await page.locator(".context-divider").count() == 0
+            # Reply: the link replies to the thread's last message; the box is
+            # marked and its link reads Replying, the chip names who is being
+            # answered, the status line says so, and the send carries that message.
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            await page.locator('section.thread[data-thread="u2"] .thread-reply').click()
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            assert await page.evaluate("() => [...document.querySelectorAll('section.thread')].map(s => s.classList.contains('replying'))") == [False, True, False]
+            await expect(page.locator('section.thread[data-thread="u2"] .thread-reply')).to_have_text("Replying")
+            await expect(page.locator('section.thread[data-thread="u1"] .thread-reply')).to_have_text("Reply")
+            await expect(page.locator("#reply-excerpt")).to_have_text(f"Replying to {agent_name}: Saturday it is.")
+            await expect(page.locator("#chat-status")).to_contain_text("Replying in a thread")
+            await expect(area).to_be_focused()
+            await area.fill("Leaving at eight")
+            await page.get_by_role("button", name="Send message", exact=True).click()
+            await expect(area).to_have_value("")
+            assert submissions[-1]["text"] == "Leaving at eight" and submissions[-1]["reply_to"] == "reply:u3", submissions[-1]
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            await expect(page.locator("#chat-status")).to_contain_text("Ready")
+            assert await page.evaluate("() => document.querySelectorAll('section.thread.replying').length") == 0
+            await expect(page.locator('section.thread[data-thread="u2"] .thread-reply')).to_have_text("Reply")
+            # A thread whose last message is the user's own reads "yourself"; the
+            # active link again, or Cancel, clears the chip, and the next send
+            # starts a new thread. A tap on the box itself does nothing.
+            await page.locator('section.thread[data-thread="u4"] .thread-reply').click()
+            await expect(page.locator("#reply-excerpt")).to_have_text("Replying to yourself: A note to myself, still unanswered")
+            await page.locator('section.thread[data-thread="u4"] .thread-reply').click()
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            await page.locator('section.thread[data-thread="u4"] .message-body').click()
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            # Swiping a box to the right with a finger replies too; a short or a
+            # vertical drag does not.
+            swipe = """([thread, dx, dy]) => { const s = document.querySelector(`section.thread[data-thread="${thread}"]`); const r = s.getBoundingClientRect();
+                const ev = (type, x, y) => s.dispatchEvent(new PointerEvent(type, {bubbles: true, pointerId: 7, pointerType: 'touch', isPrimary: true, clientX: x, clientY: y}));
+                ev('pointerdown', r.left + 20, r.top + 20); ev('pointermove', r.left + 20 + dx / 2, r.top + 20 + dy / 2); ev('pointermove', r.left + 20 + dx, r.top + 20 + dy);
+                const mid = s.style.transform; ev('pointerup', r.left + 20 + dx, r.top + 20 + dy); return mid; }"""
+            assert await page.evaluate(swipe, ["u4", 70, 0]) == "translateX(70px)"
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            await expect(page.locator("#reply-excerpt")).to_have_text("Replying to yourself: A note to myself, still unanswered")
+            assert await page.evaluate("() => document.querySelector('section.thread[data-thread=\"u4\"]').style.transform") == ""
+            assert await page.evaluate(swipe, ["u4", 30, 0]) == "translateX(30px)"
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            assert await page.evaluate(swipe, ["u4", 30, 70]) == ""
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            assert await page.evaluate(swipe, ["u4", 70, 0]) == "translateX(70px)"
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            await page.locator('section.thread[data-thread="u4"] .thread-reply').click()
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            await page.get_by_role("button", name="Cancel reply", exact=True).click()
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            await expect(page.locator("#chat-status")).to_contain_text("Ready")
+            await area.fill("Something new")
+            await page.get_by_role("button", name="Send message", exact=True).click()
+            await expect(area).to_have_value("")
+            assert submissions[-1]["text"] == "Something new" and submissions[-1]["reply_to"] is None, submissions[-1]
+            # Long excerpts are clipped so the chip stays one line.
+            state["replies"].append(message("u5", "user", "word " * 40, 1700000230))
+            await expect(page.locator("section.thread")).to_have_count(4)
+            await page.locator('section.thread[data-thread="u5"] .thread-reply').click()
+            await expect(page.locator("#reply-excerpt")).to_have_text("Replying to yourself: " + ("word " * 18).rstrip() + "…")
+            await page.get_by_role("button", name="Cancel reply", exact=True).click()
+            # Threads from different days are separated by a day line: Today,
+            # Yesterday, then the date.
+            state["replies"].append(message("old", "user", "From another day", 1600000000))
+            await expect(page.locator(".day-divider")).to_have_count(2)
+            await expect(page.locator(".day-divider").first).to_have_text("September 13, 2020")
+            # #chat/<thread> (a notification with no open window) opens that thread
+            # in reply mode and drops the thread from the URL again.
+            await page.goto(url + "/#chat/u1")
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            await expect(page.locator("#reply-excerpt")).to_have_text(f"Replying to {agent_name}: Done.")
+            assert await page.evaluate("() => location.hash") == "#chat"
+            await expect(area).to_be_focused()
+            # A thread that is not on the page opens the chat with no reply mode.
+            await page.goto(url + "/#chat/nothing-here")
+            await expect(page.get_by_label(composer)).to_be_visible()
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            assert await page.evaluate("() => location.hash") == "#chat"
+            await page.goto(url + "/#chat/u2")
+            await expect(page.locator("#reply-excerpt")).to_have_text(f"Replying to {agent_name}: Saturday it is.")
+            assert await page.evaluate("() => location.hash") == "#chat"
+            # A notification click with the app open: the worker names the thread,
+            # from the Now page or from the chat itself.
+            await page.goto(url + "/#now")
+            await expect(page.locator("#now-content")).to_be_visible()
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_CHAT', thread: 'u1'}}))")
+            await expect(page.locator("#reply-excerpt")).to_have_text(f"Replying to {agent_name}: Done.")
+            assert await page.evaluate("() => location.hash") == "#chat"
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_CHAT', thread: 'u2'}}))")
+            await expect(page.locator("#reply-excerpt")).to_have_text(f"Replying to {agent_name}: Saturday it is.")
+            assert await page.evaluate("() => location.hash") == "#chat"
+            # A click without a thread opens the chat with no reply mode.
+            await page.evaluate("() => navigator.serviceWorker.dispatchEvent(new MessageEvent('message', {data: {type: 'OPEN_CHAT', thread: null}}))")
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            await expect(page.locator("#chat-status")).to_contain_text("Ready")
+
             keys = await page.evaluate("() => caches.keys()")
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, notification click to chat, reset dividers, pasted images, voice button.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, notification click to chat, reset dividers, pasted images, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()

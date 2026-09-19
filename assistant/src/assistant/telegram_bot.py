@@ -180,6 +180,9 @@ class _BatchItem:
     msg: Message
     text: str
     image_data_url: str | None = None
+    # The archived message this one replies to, when the Telegram reply
+    # target is one the bot sent or received: the batch joins its thread.
+    reply_to: str | None = None
 
 
 @dataclass
@@ -279,14 +282,16 @@ class TelegramBot:
             persisted_chat_id if persisted_chat_id is not None else default_chat_id
         )
 
-    async def send_message(self, text: str, chat_id: int | None = None) -> int | None:
+    async def send_message(self, text: str, chat_id: int | None = None,
+                           archive_id: str | None = None) -> int | None:
         """Send a proactive message (e.g. from a scheduled job).
 
         ``chat_id`` overrides the pinned home chat — retry-queue replays answer
-        into the conversation the failed message came from.
-        Returns the chat id the message was delivered to — the caller may need
-        the real conversation key (the agent mirrors scheduled-run deliveries
-        into that conversation's history) — or None when the message was dropped.
+        into the conversation the failed message came from. ``archive_id``
+        names the archived row this text is, so a Telegram reply to any of
+        the sent messages resolves to that row's thread.
+        Returns the chat id the message was delivered to, or None when the
+        message was dropped.
         """
         target_chat_id = chat_id if chat_id is not None else self._chat_id
         if target_chat_id is None:
@@ -295,8 +300,13 @@ class TelegramBot:
         if self._app is None:
             logger.warning("send_message called before bot started; dropping.")
             return None
+        sent_ids: list[int] = []
         for chunk in _split_message(text):
-            await self._app.bot.send_message(chat_id=target_chat_id, text=chunk)
+            sent = await self._app.bot.send_message(chat_id=target_chat_id, text=chunk)
+            if sent is not None:
+                sent_ids.append(sent.message_id)
+        if archive_id and self.archive and sent_ids:
+            self.archive.record_outputs(target_chat_id, sent_ids, archive_id)
         return target_chat_id
 
     @property
@@ -565,10 +575,23 @@ class TelegramBot:
             return None
         if item is None:
             return None
-        reply_context = _reply_context(msg)
+        reply_to = self._resolve_reply(msg)
+        if reply_to:
+            item = replace(item, reply_to=reply_to)
+        # A resolved reply continues the thread, so the quoted text is already
+        # in context; the prefix stays for a quoted passage (the user pointed
+        # at a part) and for replies to messages the archive does not know.
+        reply_context = _reply_context(msg) if msg.quote or not reply_to else None
         if reply_context:
             return replace(item, text=f"{reply_context}\n{item.text}")
         return item
+
+    def _resolve_reply(self, msg: Message) -> str | None:
+        """The archived message a Telegram reply points at, or None."""
+        reply = msg.reply_to_message
+        if reply is None or self.archive is None:
+            return None
+        return self.archive.resolve_telegram(msg.chat_id, reply.message_id)
 
     async def _handle_audio(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, audio) -> _BatchItem | None:
         """Transcribe a voice note or audio file into the agent's text."""
@@ -732,7 +755,9 @@ class TelegramBot:
         if self.archive:
             message_id = f"telegram:{chat_id}:" + ",".join(str(item.msg.message_id) for item in items)
             space = self._agent.conversation_space(chat_id)
+            reply_to = next((item.reply_to for item in items if item.reply_to), None)
             self.archive.insert(space, "user", text, "queued", message_id=message_id, source="telegram",
+                                reply_to=reply_to,
                                 metadata={"chat_id": chat_id,
                                           "message_ids": [item.msg.message_id for item in items],
                                           "items": [{"id": item.msg.message_id, "text": item.text,
@@ -792,6 +817,7 @@ class TelegramBot:
             raise
         if self.archive and message_id:
             self.archive.delivery(message_id, "delivered", receipts)
+            self.archive.record_outputs(chat_id, receipts, f"reply:{message_id}")
 
     def _is_allowed(self, update: Update) -> bool:
         uid = update.effective_user.id if update.effective_user else None

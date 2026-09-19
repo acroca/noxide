@@ -56,7 +56,17 @@ async def main():
             return {"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
 
         copilot._client = MagicMock(chat=AsyncMock(side_effect=chat))
-        archive.insert("general", "user", "A message captured in Telegram.", "done", source="telegram")
+        # The chat is threads: a root and its replies. Most are two messages;
+        # a longer one shows the marked, indented form.
+        captured = archive.insert("general", "user", "A message captured in Telegram: watered the balcony plants.", "done",
+                                  source="telegram")
+        archive.insert("general", "assistant", "Noted — the herbs will be glad of it.", "done", reply_to=captured,
+                       source="telegram")
+        opener = archive.insert("general", "user", "Can we plan the mountain walk?", "done")
+        question = archive.insert("general", "assistant", "Of course. Saturday or Sunday?", "done", reply_to=opener)
+        answer = archive.insert("general", "user", "Saturday, leaving early.", "done", reply_to=question)
+        archive.insert("general", "assistant", "Saturday it is; I've noted an early start on the weekend page.", "done",
+                       reply_to=answer)
         cfg = Config(state_dir=root, vault_path=root / "vault", pwa_origin="http://localhost:8080",
                      timezone="Europe/Madrid")
         service = Companion(cfg, agent, vault, archive=archive)
