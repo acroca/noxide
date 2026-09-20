@@ -277,18 +277,29 @@ function renderChat(pageVersion) {
     const last = latest.filter(m => m.thread === threadId).at(-1);
     if (last) setReply(last);
     section.scrollIntoView({ block: 'center' });
+    stickToEnd = atEnd(thread);  // the app moved the reader; do not pull them back to the end
     area.focus();
     return true;
   }
   const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
   const atEnd = thread => thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+  // The thread follows its end until the reader scrolls up, and again once
+  // they scroll back down: an intent, kept from the reader's own scrolling,
+  // not a measurement taken when something changes. The timeline grows under
+  // the reader without any scroll of theirs (a thumbnail has no reserved
+  // height and lands after the render pinned the end), and measuring then
+  // read the reader as scrolled up and left every later message unpinned.
+  const thread = $('#chat-thread');
+  let stickToEnd = true;
+  const pin = () => { if (stickToEnd) thread.scrollTop = thread.scrollHeight; };
+  thread.addEventListener('scroll', () => { stickToEnd = atEnd(thread); });
   // One line tall, growing with the text up to the stylesheet's cap. Measuring
   // means shrinking to one line first, which lets the thread grow and clamps
   // its scroll position; put the thread back where it was in the same step.
   const fit = () => {
-    const thread = $('#chat-thread'), wasAtEnd = thread && atEnd(thread), top = thread?.scrollTop;
+    const top = thread.scrollTop;
     area.style.height = 'auto'; area.style.height = area.scrollHeight + 'px';
-    if (thread) thread.scrollTop = wasAtEnd ? thread.scrollHeight : top;
+    thread.scrollTop = stickToEnd ? thread.scrollHeight : top;
   };
   fit();
   function markSeen() {
@@ -307,10 +318,11 @@ function renderChat(pageVersion) {
   // Closing the keyboard restores the bottom nav's home-indicator inset, which
   // shrinks the thread; a shrinking scroller keeps its offset and hides the
   // end. Stay anchored to the end across resizes unless the reader scrolled up.
-  const thread = $('#chat-thread');
-  let stickToEnd = true;
-  thread.addEventListener('scroll', () => { stickToEnd = atEnd(thread); });
-  new ResizeObserver(() => { if (stickToEnd) thread.scrollTop = thread.scrollHeight; }).observe(thread);
+  new ResizeObserver(pin).observe(thread);
+  // The timeline's own growth (thumbnails arriving, images decoding) fires no
+  // scroll and does not resize the scroller: watch what it holds, re-targeted
+  // on every render since the render replaces it.
+  const contents = new ResizeObserver(pin);
   function updateComposer() {
     if (!active()) return;
     button.disabled = !loaded || sending || !navigator.onLine || Boolean(recorder);
@@ -426,9 +438,7 @@ function renderChat(pageVersion) {
     latest = threads.flatMap(t => t.messages);
     updateComposer();
     if (nextSignature === signature) { markSeen(); return; }
-    const initial = !signature;
     signature = nextSignature;
-    const thread = $('#chat-thread'), nearBottom = atEnd(thread);
     // A context reset starts a new generation: mark where the model stopped
     // seeing earlier threads, including a reset nothing has followed yet.
     const divider = '<div class="context-divider" role="separator">Context reset</div>';
@@ -462,7 +472,9 @@ function renderChat(pageVersion) {
     $$('[data-reply]').forEach(b => b.addEventListener('click', () => toggleThread(b.dataset.reply)));
     $('#older-messages')?.addEventListener('click', () => loadMessages(true).catch(e => toast(e.message)));
     $$('.thread').forEach(swipeToReply);
-    if (initial || nearBottom) thread.scrollTop = thread.scrollHeight;
+    contents.disconnect();
+    for (const child of thread.children) contents.observe(child);
+    pin();
     // One attempt per request: a thread not on this page must not surface later.
     if (pendingThread) { openThread(pendingThread); pendingThread = null; }
     markSeen();

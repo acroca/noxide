@@ -5,6 +5,7 @@ Requires Chromium installed through Playwright. No real vault or model calls.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -48,6 +49,9 @@ async def main():
                 uploads.append((request.content_type, await request.read()))
                 return web.json_response({"path": f"attachments/2026-09-15-{len(uploads):06x}.png"})
             if request.path == "/api/attachment":
+                if state.get("thumbnail"):  # a late, tall thumbnail for the scroll-pin scenario
+                    await asyncio.sleep(0.5)
+                    return web.Response(body=state["thumbnail"], content_type="image/png")
                 return web.Response(body=uploads[-1][1], content_type="image/png")
             if request.path == "/api/messages" and request.method == "POST":
                 started.set()
@@ -381,13 +385,18 @@ async def main():
             state["replies"].extend({**reply, "id": f"r{i}", "created": 1700000010 + i, "generation": 1, "text": "Filler line " * 12} for i in range(10, 40))
             await expect(page.locator(".message-assistant")).to_have_count(34)
             gap = "() => { const t = document.querySelector('#chat-thread'); return t.scrollHeight - t.scrollTop - t.clientHeight; }"
+
+            async def scroll_thread(top):
+                """Scroll the thread as a reader would, and let the scroll event land: it carries the intent."""
+                await page.evaluate(f"() => {{ document.querySelector('#chat-thread').scrollTop = {top}; }}")
+                await page.evaluate("() => new Promise(r => requestAnimationFrame(() => setTimeout(r)))")
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollHeight > document.querySelector('#chat-thread').clientHeight * 2")
-            await page.evaluate("() => { const t = document.querySelector('#chat-thread'); t.scrollTop = t.scrollHeight; }")
+            await scroll_thread("document.querySelector('#chat-thread').scrollHeight")
             await page.get_by_label(composer).focus()
             await page.wait_for_function("() => document.querySelector('#chat-thread').scrollHeight - document.querySelector('#chat-thread').scrollTop - document.querySelector('#chat-thread').clientHeight < 1")
             await page.get_by_label(composer).blur()
             await page.wait_for_function(f"() => ({gap})() < 1")
-            await page.evaluate("() => { document.querySelector('#chat-thread').scrollTop = 0; }")
+            await scroll_thread(0)
             await page.get_by_label(composer).focus()
             await page.get_by_label(composer).blur()
             await asyncio.sleep(0.5)
@@ -395,11 +404,11 @@ async def main():
             # Growing the composer by several lines moves neither an end-anchored
             # thread nor one the reader scrolled up in.
             await page.get_by_label(composer).fill("")
-            await page.evaluate("() => { const t = document.querySelector('#chat-thread'); t.scrollTop = t.scrollHeight; }")
+            await scroll_thread("document.querySelector('#chat-thread').scrollHeight")
             await page.get_by_label(composer).fill("one\ntwo\nthree\nfour\nfive")
             assert await page.evaluate(f"() => ({gap})()") < 1
             await page.get_by_label(composer).fill("")
-            await page.evaluate("() => { document.querySelector('#chat-thread').scrollTop = 120; }")
+            await scroll_thread(120)
             await page.get_by_label(composer).fill("one\ntwo\nthree\nfour\nfive")
             assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 120
             await page.get_by_label(composer).fill("")
@@ -432,6 +441,33 @@ async def main():
                                      "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png"]})})
             await expect(page.locator(".message-user .message-images img")).to_have_count(1)
             assert await page.locator(".message-user .message-images a").get_attribute("href") == "/api/attachment?path=attachments%2F2026-09-15-000001.png"
+            # An end-anchored thread stays at the end while the timeline grows
+            # under it: a thumbnail has no reserved height, so it lands after
+            # the render pinned the end and pushes the end away. Pinning by
+            # measuring the gap then judged the reader scrolled up and left
+            # every later message unpinned (2026-09-19). Only the reader's own
+            # scroll releases the anchor.
+            state["thumbnail"] = base64.b64decode(await page.evaluate("""() => {
+                const c = document.createElement('canvas'); c.width = 200; c.height = 200;
+                c.getContext('2d').fillStyle = '#c33'; c.getContext('2d').fillRect(0, 0, 200, 200);
+                return c.toDataURL('image/png').split(',')[1]; }"""))
+            await scroll_thread("document.querySelector('#chat-thread').scrollHeight")
+            await page.wait_for_function(f"() => ({gap})() < 1")
+            state["replies"].append({**reply, "id": "p1", "role": "user", "text": "Look at this", "created": 1700000110,
+                                     "generation": 1, "metadata": json.dumps({"attachments": ["attachments/2026-09-15-late.png"]})})
+            await page.wait_for_function("() => (document.querySelector('[data-message=\"p1\"] img')?.naturalHeight || 0) > 0")
+            assert await page.evaluate("() => document.querySelector('[data-message=\"p1\"] img').getBoundingClientRect().height") > 100
+            await page.wait_for_function(f"() => ({gap})() < 1", timeout=3000)
+            state["replies"].append({**reply, "id": "p2", "text": "A red square.", "created": 1700000111, "generation": 1, "thread": "p1"})
+            await expect(page.locator('[data-message="p2"]')).to_have_count(1)
+            await page.wait_for_function(f"() => ({gap})() < 1", timeout=3000)
+            # ...unless the reader scrolled up, in which case nothing moves them.
+            await scroll_thread(0)
+            state["replies"].append({**reply, "id": "p3", "text": "Still a red square.", "created": 1700000112, "generation": 1, "thread": "p1"})
+            await expect(page.locator('[data-message="p3"]')).to_have_count(1)
+            await asyncio.sleep(0.5)
+            assert await page.evaluate("() => document.querySelector('#chat-thread').scrollTop") == 0
+            del state["thumbnail"]
             state["voice"] = True
             await page.reload()
             await expect(page.get_by_role("button", name="Record voice message")).to_be_visible()
@@ -557,7 +593,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, notification click to chat, reset dividers, pasted images, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, notification click to chat, reset dividers, pasted images, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()
