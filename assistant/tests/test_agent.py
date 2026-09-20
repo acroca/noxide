@@ -1245,6 +1245,38 @@ async def test_reply_runs_with_its_thread_exchanges(threaded: Agent, archive: Co
     assert archive.get(f"reply:{later}")["thread"] == root
 
 
+@pytest.mark.asyncio
+async def test_reply_to_a_delivery_sees_the_delivery(threaded: Agent, archive: ConversationArchive) -> None:
+    """A scheduled-run delivery is a thread root archived as a message row, never a
+    context record, so a reply to it restored an empty thread and ran blind to the
+    very reminder it answered while the ambient block excluded that thread; "Hecho"
+    on a pill reminder got "the pills, the stock check, or both?" (2026-09-20). The
+    delivery is the thread's first assistant message on every restore, and stays
+    out of the stored context."""
+    root = archive.insert("general", "assistant", "Reminder: take the pill", "done",
+                          source="telegram", delivery="delivered")
+    archive.insert("general", "assistant", "Reminder: check the pill stock", "done",
+                   source="telegram", delivery="delivered")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[_make_text_response("Logged!"), _make_text_response("Noted.")])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        assert await threaded.run(chat_id=7, user_message="Done", reply_to=root) == "Logged!"
+        sent = mock_client.chat.call_args.args[0]
+        assert [m["role"] for m in sent] == ["system", "assistant", "user"]
+        assert sent[1]["content"] == "Reminder: take the pill"
+        assert "] Done" in _live_turn(sent)
+        assert "Reminder: check the pill stock" in _live_turn(sent), "other threads stay ambient background"
+        assert "Reminder: take the pill" not in _live_turn(sent), "the thread's own root is not repeated as background"
+        # The settled history is rebuilt from the archive for the next reply, delivery first.
+        assert await threaded.run(chat_id=7, user_message="and the stock is fine", reply_to=root) == "Noted."
+
+    sent = mock_client.chat.call_args.args[0]
+    assert [m["role"] for m in sent] == ["system", "assistant", "user", "assistant", "user"]
+    assert [m["content"] for m in sent[1:4]] == ["Reminder: take the pill", sent[2]["content"], "Logged!"]
+    assert [r["role"] for r in archive.load_context("general", root)] == ["user", "assistant", "user", "assistant"]
+
+
 async def _run_records_concurrency(agent: Agent, calls: list) -> dict:
     active = {"now": 0, "max": 0}
 

@@ -54,6 +54,10 @@ def history_tool_schemas() -> list[dict[str, Any]]:
     return tools
 
 
+def _clip_root(text: str) -> str:
+    return text if len(text) <= _EXCHANGE_CHARS else text[:_EXCHANGE_CHARS] + "\n[message truncated]"
+
+
 class ConversationHistory:
     """Archive completed text exchanges; never window unfinished protocol work."""
 
@@ -65,6 +69,13 @@ class ConversationHistory:
         self._unfinished = False
         self._history: deque[dict[str, Any]] = deque()
         self._exchanges: list[list[dict[str, Any]]] = []
+        # A thread rooted in a scheduled-run delivery (a reminder the bot sent)
+        # opens on that delivery: it is archived as a message row, never as a
+        # context record, so restoring records alone left a reply running blind
+        # to the very message it answered while the ambient block excluded that
+        # thread. Kept apart from the exchanges: never stored again, never
+        # windowed out of a long thread.
+        self._root: list[dict[str, Any]] = []
         # The whole space's completed text, for the history tools. Loaded on
         # first use: a thread history is created per message and rarely needs it.
         self._transcript: list[dict[str, Any]] = []
@@ -77,6 +88,9 @@ class ConversationHistory:
             # history (no thread) restores those since the last context reset.
             if thread is not None:
                 records = archive.load_context(space, thread)
+                root = archive.get(thread)
+                if root is not None and root["role"] == "assistant" and root["status"] == "done":
+                    self._root = [{"role": "assistant", "content": _clip_root(root["text"])}]
             else:
                 generation = archive.generation(space)
                 records = [r for r in archive.load_context(space) if r["generation"] == generation]
@@ -134,7 +148,7 @@ class ConversationHistory:
         self._history.append(msg)
 
     def messages(self) -> list[dict[str, Any]]:
-        messages = []
+        messages = list(self._root)
         for exchange in self._exchanges[-self._window:]:
             allowance = max(1, _EXCHANGE_CHARS // len(exchange))
             for record in exchange:
