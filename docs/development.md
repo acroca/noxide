@@ -11,8 +11,8 @@ mise exec uv -- uv run ruff check src/ tests/                    # lint
 
 Pytest uses `asyncio_mode = "auto"`, so async tests need no decorator. External
 HTTP is mocked with `respx`; companion/browser tests use disposable local
-servers. Tests must not contact real Telegram, Copilot, push providers, or
-other external services.
+servers. Tests must not contact real Copilot, push providers, or other
+external services.
 
 ## Running the bot locally
 
@@ -21,7 +21,7 @@ No container needed. Paths default to the working directory, so:
 ```bash
 cd assistant
 cp -r ../vault.template/. ./vault     # gitignored
-cp config.example.toml config.toml    # add your bot token and user id
+cp config.example.toml config.toml    # adjust timezone and the like
 mise exec uv -- uv run assistant auth  # one-time device flow
 mise exec uv -- uv run assistant run
 ```
@@ -29,9 +29,8 @@ mise exec uv -- uv run assistant run
 `./vault`, `./state`, `./config.toml` and any local Compose file are all
 gitignored, so a development setup can never be committed by accident.
 
-You need your own Telegram bot for this — don't develop against the one you
-actually use. `/newbot` in [@BotFather](https://t.me/BotFather) is free and
-takes a minute.
+The app comes up at `http://localhost:8080`. Use a separate vault and state
+directory from the ones you actually use.
 
 To develop against a container instead, copy the Compose file from
 [deployment.md](deployment.md) and swap `image:` for `build: .` — deployment
@@ -40,7 +39,7 @@ in the repo.
 
 ## Layout
 
-### Preview the web companion
+### Preview the web app
 
 ```bash
 mise exec uv -- uv run python -m tests.preview_companion
@@ -48,7 +47,7 @@ mise exec uv -- uv run python -m tests.preview_companion
 
 Open `http://localhost:8080` directly, without signing in.
 This uses a temporary sample vault and a fake assistant; it does
-not contact Telegram/Copilot or read your vault. Stop the process to delete
+not contact Copilot or read your vault. Stop the process to delete
 the preview data. The UI is vanilla JavaScript and CSS packaged under
 `src/assistant/pwa/`; there is no Node build or CDN dependency. API regression
 tests use a local aiohttp test server and mock all external services:
@@ -86,10 +85,9 @@ assistant/
     copilot.py      ← auth + model turns (streaming), routed per model to
                       chat completions or the Responses endpoint
     responses.py    ← chat-completions ⇄ Responses API translation
-    models.py       ← /models catalog parsing: picker options, capabilities
-    telegram_bot.py ← long polling, handlers, allowlist
-    companion.py    ← optional private-network HTTP service, web delivery ledger, push
-    conversations.py ← shared SQLite conversation archive and atomic text completion
+    models.py       ← /models catalog parsing, picker options and runtime switch
+    companion.py    ← the private-network web app: HTTP API, delivery ledger, push
+    conversations.py ← SQLite conversation archive and atomic text completion
     pwa/            ← packaged responsive UI, manifest, service worker
     tools.py        ← vault file tools (path-jailed)
     vault_check.py  ← deterministic wiki consistency checks

@@ -81,7 +81,7 @@ def test_long_text_is_fully_recoverable_and_search_finds_omitted_tail():
     ("get_history", {"offset": 10}),
     ("get_history", {"message_id": 1, "offset": -1}),
     ("get_history", {"message_id": 1, "before_id": 2}),
-    ("get_history", {"chat_id": 2}),
+    ("get_history", {"thread": "x"}),
     ("search_history", {}),
     ("search_history", {"query": " "}),
     ("search_history", {"query": 12}),
@@ -153,12 +153,9 @@ def test_only_text_is_archived_and_tool_heavy_work_is_one_exchange():
     assert "medication" in history.retrieve("search_history", {"query": "medication"})
 
 
-@pytest.mark.parametrize("chat_id", [1, 2, 3, 0])
-async def test_real_loop_scopes_history_tools_and_clear(tmp_path, chat_id):
+async def test_real_loop_scopes_history_tools_and_clear(tmp_path):
     agent = Agent(VaultTools(tmp_path))
-    keys = [1, 2, 3, 0]
-    for key in keys:
-        complete(agent._get_history(key), f"unique {key}")
+    complete(agent._get_history(), "unique text")
     client = MagicMock()
     client.chat = AsyncMock(side_effect=[
         _make_tool_call_response("search_history", {"query": "unique"}),
@@ -166,24 +163,21 @@ async def test_real_loop_scopes_history_tools_and_clear(tmp_path, chat_id):
         _make_text_response("found"),
     ])
     with patch("assistant.copilot.get_client", return_value=client):
-        await agent.run(chat_id, "look back")
+        await agent.run("look back")
     tools = client.chat.call_args.args[1]
     assert {"get_history", "search_history"} <= {t["function"]["name"] for t in tools}
     outputs = [m["content"] for m in client.chat.call_args.args[0] if m["role"] == "tool"]
     assert len(outputs) == 2
     for output in outputs:
-        assert f"unique {chat_id}" in output
-        for key in keys:
-            if key != chat_id:
-                assert f"unique {key}" not in output
-    agent.clear_history(chat_id)
-    assert json.loads(agent._get_history(chat_id).retrieve("get_history", {}))["messages"] == []
+        assert "unique text" in output
+    agent.clear_history()
+    assert json.loads(agent._get_history().retrieve("get_history", {}))["messages"] == []
     assert "no conversation history" in await agent._dispatch_tool("get_history", {})
 
 
 async def test_older_context_window_is_frozen_while_outage_work_survives(tmp_path):
     agent = Agent(VaultTools(tmp_path))
-    history = agent._get_history(1)
+    history = agent._get_history()
     for n in range(7):
         complete(history, f"completed {n}")
     client = MagicMock()
@@ -195,7 +189,7 @@ async def test_older_context_window_is_frozen_while_outage_work_survives(tmp_pat
     ])
     with patch("assistant.copilot.get_client", return_value=client):
         with pytest.raises(CopilotUnavailableError):
-            await agent.run(1, "original task")
+            await agent.run("original task")
         first = client.chat.call_args_list[0].args[0]
         second = client.chat.call_args_list[1].args[0]
         assert first == second[:len(first)]
@@ -203,9 +197,9 @@ async def test_older_context_window_is_frozen_while_outage_work_survives(tmp_pat
         assert "completed 0" not in str(first)
         before = history.messages()
         with pytest.raises(CopilotUnavailableError):
-            await agent.retry_message(1, "original task", "earlier", hot=True)
+            await agent.resume()
         assert history.messages() == before
-        await agent.retry_message(1, "original task", "earlier", hot=True)
+        await agent.resume()
     sent = client.chat.call_args.args[0]
     assert "original task" in str(sent)
     assert any(m["role"] == "tool" and "completed 0" in m["content"] for m in sent)
@@ -217,14 +211,14 @@ async def test_empty_success_reply_still_supersedes_hot_retry(tmp_path):
     client = MagicMock()
     client.chat = AsyncMock(return_value=_make_text_response(""))
     with patch("assistant.copilot.get_client", return_value=client):
-        await agent.run(1, "question")
-        assert await agent.retry_message(1, "question", "earlier", hot=True) is None
+        await agent.run("question")
+        assert await agent.resume() is None
 
 
 def _save(archive, thread, text, reply, root_status="done"):
     """Archive one completed exchange of ``thread`` (creating its root row on first use)."""
     if archive.get(thread) is None:
-        archive.insert("general", "user", text, root_status, message_id=thread, source="web")
+        archive.insert("general", "user", text, root_status, message_id=thread)
     archive.save_context("general", [{"role": "user", "content": text},
                                      {"role": "assistant", "content": reply}],
                          "2026-09-18 12:00 local", thread=thread)

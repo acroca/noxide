@@ -282,9 +282,9 @@ the message, the recent conversation and the wiki index — asking one short
 question when a terse message could mean more than one open item. Standing
 directions for a subject (language, tone, what to record, whom to keep
 informed) live on that subject's page under `## Instructions`, where the bot
-reads them whenever the conversation touches it. Telegram forum topics used to
-be separate rooms with their own prompt; that was removed on 2026-09-17, and
-old room conversations were merged into the one chat.
+reads them whenever the conversation touches it. Earlier versions had
+separate rooms with their own prompt; that was removed on 2026-09-17, and old
+room conversations were merged into the one chat.
 
 Scheduled jobs still run in parallel with the conversation, and messages within
 the conversation stay strictly ordered. Writes to the vault are guarded against

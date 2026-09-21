@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from . import copilot, usage
 from .backup import VaultBackup
-from .conversations import WEB_CHAT_ID, ConversationArchive, conversation_space
+from .conversations import SPACE, ConversationArchive
 from .history import ConversationHistory, history_tool_schemas
 from .skills import SkillLibrary
 from .tools import VaultTools
@@ -52,11 +52,8 @@ _ERROR_RESULT_RX = re.compile(
 # finds its purpose already met; run_job then delivers nothing.
 _SILENT_SENTINEL = "[silent]"
 
-# A proactive sender: delivers text to the home chat and returns the chat id
-# it delivered to, or None when the message was dropped. The chat id is how
-# run_job learns the real conversation key when mirroring a delivery into
-# that conversation's history.
-SendMessageFn = Callable[[str], Coroutine[Any, Any, int | None]]
+# A proactive sender: delivers text to the user.
+SendMessageFn = Callable[[str], Coroutine[Any, Any, None]]
 
 # Scheduled runs close with a JSON object matching this schema (the contract
 # in prompts/schedule.md). It also rides job-run requests as response_format:
@@ -245,7 +242,6 @@ class Agent:
         history_exchanges: int = 5,
         tz_name: str = "UTC",
         archive: ConversationArchive | None = None,
-        home_chat_fn: Callable[[], int | None] | None = None,
         agent_name: str = "Noxide",
     ) -> None:
         self._vault = vault_tools
@@ -258,62 +254,43 @@ class Agent:
         self._fan_out_fn = fan_out_fn
         self._skills = skills
         self._backup = backup
-        # Histories and locks are keyed by (chat, thread): a thread is one root
-        # message and its replies, and each runs under its own lock — concurrent
-        # runs on one history would interleave appends into tool orderings the
-        # API rejects, while different threads, chats and scheduled jobs (chat
-        # 0, no thread) proceed in parallel. A settled thread history is
-        # dropped after its run; the archive rebuilds it for the next reply.
-        self._histories: dict[tuple[int, str | None], ConversationHistory] = {}
-        self._run_locks: dict[tuple[int, str | None], asyncio.Lock] = {}
+        # Histories and locks are keyed by thread: a thread is one root message
+        # and its replies, and each runs under its own lock — concurrent runs
+        # on one history would interleave appends into tool orderings the API
+        # rejects, while different threads proceed in parallel. Key None is
+        # the one unthreaded history: scheduled jobs (never archived, so no
+        # thread), and every run when there is no archive at all (tests). A
+        # settled thread history is dropped after its run; the archive
+        # rebuilds it for the next reply.
+        self._histories: dict[str | None, ConversationHistory] = {}
+        self._run_locks: dict[str | None, asyncio.Lock] = {}
         self._history_exchanges = history_exchanges
         self.archive = archive
-        self._home_chat_fn = home_chat_fn
-        self._home_chat_aliases: set[int] = set()
         self._tz = ZoneInfo(tz_name)
 
-    def _get_history(self, chat_id: int, thread: str | None = None) -> ConversationHistory:
-        chat_id = self.conversation_key(chat_id)
-        key = (chat_id, thread)
-        if key not in self._histories:
-            self._histories[key] = ConversationHistory(
-                self._history_exchanges, archive=self.archive if chat_id != 0 else None,
-                space=self.conversation_space(chat_id), thread=thread,
+    def _get_history(self, thread: str | None = None) -> ConversationHistory:
+        if thread not in self._histories:
+            self._histories[thread] = ConversationHistory(
+                self._history_exchanges, archive=self.archive if thread is not None else None,
+                space=SPACE, thread=thread,
             )
-        return self._histories[key]
+        return self._histories[thread]
 
-    def _thread_of(self, chat_id: int, message_id: str | None) -> str | None:
-        """The thread an archived message belongs to; None outside the archive (chat 0, tests)."""
-        if self.archive is None or chat_id == 0 or message_id is None:
-            return None
-        return self.archive.thread_of(message_id)
-
-    def conversation_key(self, chat_id: int) -> int:
-        """The canonical conversation: the pinned Telegram home chat is the web chat."""
-        if self._home_chat_fn and (home := self._home_chat_fn()) is not None:
-            self._home_chat_aliases.add(home)
-        if chat_id != 0 and chat_id in self._home_chat_aliases:
-            return WEB_CHAT_ID
-        return chat_id
-
-    def conversation_space(self, chat_id: int) -> str:
-        return conversation_space(self.conversation_key(chat_id))
-
-    async def reset_conversation(self, chat_id: int):
-        """Forget a chat's in-memory histories and start a new archive generation.
+    async def reset_conversation(self) -> None:
+        """Forget the in-memory histories and start a new archive generation.
 
         Threads already running keep their own history object and finish;
         the archive refuses to complete a message from the old generation, so
-        callers wait for in-flight work first (the bot awaits the open batch,
-        the web app refuses while a message is queued or running).
+        callers wait for in-flight work first (the web app refuses a reset
+        while a message is queued or running).
         """
-        self.clear_history(chat_id)
+        self.clear_history()
 
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def _ambient_context(self, space: str, thread: str) -> str | None:
-        """The last few threads of this chat, as background for the live turn only.
+    def _ambient_context(self, thread: str) -> str | None:
+        """The last few threads, as background for the live turn only.
 
         A thread's own context is just its messages, so a new root like
         "done" or "pastilla tomada" would otherwise arrive cold. The newest
@@ -323,7 +300,7 @@ class Agent:
         """
         assert self.archive is not None
         threads = self.archive.recent_threads(
-            space, generation=self.archive.generation(space),
+            SPACE, generation=self.archive.generation(SPACE),
             since=time.time() - _AMBIENT_WINDOW_SECONDS, limit=_AMBIENT_THREADS, exclude=thread,
         )
         if not threads:
@@ -342,9 +319,10 @@ class Agent:
         """Current content of the vault pages a job prompt names.
 
         Injected into the run's live turn only (never stored in history —
-        chat 0 would otherwise re-pay every old snapshot on every job run).
-        A missing page inlines the not-found sentinel: a broken premise is
-        itself something the run should see rather than guess around.
+        the jobs history would otherwise re-pay every old snapshot on every
+        job run). A missing page inlines the not-found sentinel: a broken
+        premise is itself something the run should see rather than guess
+        around.
         """
         paths = _extract_vault_paths(prompt)
         if not paths:
@@ -360,13 +338,11 @@ class Agent:
             blocks.append(f"--- {path} ---\n{content}")
         return "\n\n".join(blocks)
 
-    def clear_history(self, chat_id: int) -> None:
-        """Forget one chat's threads in memory and open a new archive generation."""
-        chat_id = self.conversation_key(chat_id)
-        for key in [key for key in self._histories if key[0] == chat_id]:
-            self._histories.pop(key, None)
+    def clear_history(self) -> None:
+        """Forget every history in memory and open a new archive generation."""
+        self._histories.clear()
         if self.archive:
-            self.archive.reset(self.conversation_space(chat_id))
+            self.archive.reset(SPACE)
 
     def _base_prompt(self) -> str:
         """Embedded capability prompt: ships with the code, sections gated by enabled features."""
@@ -421,7 +397,7 @@ class Agent:
                 "function": {
                     "name": "send_message",
                     "description": (
-                        "Send a message to the user's Telegram chat. "
+                        "Send a message to the user. "
                         "Use this when scheduled jobs need to deliver output."
                     ),
                     "parameters": {
@@ -556,17 +532,13 @@ class Agent:
 
     async def run(
         self,
-        chat_id: int,
         user_message: str,
-        extra_context: str | None = None,
+        *,
         image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
         send_message_fn: SendMessageFn | None = None,
-        response_format: dict[str, Any] | None = None,
-        unwind_on_unavailable: bool = False,
         message_id: str | None = None,
-        source: str = "telegram",
         reply_to: str | None = None,
     ) -> str:
         """Run the agent loop for a user message. Returns the final text reply.
@@ -580,56 +552,60 @@ class Agent:
         exchanges; anything else starts a new thread and sees only the
         ambient background of recent threads. Runs on one thread are
         serialized on a lock — interleaved appends into one history would
-        produce orphaned tool messages the API rejects — while other threads,
-        chats and scheduled jobs proceed in parallel; the lock queue is FIFO,
-        so replies within a thread are handled in arrival order.
+        produce orphaned tool messages the API rejects — while other threads
+        and scheduled jobs proceed in parallel; the lock queue is FIFO, so
+        replies within a thread are handled in arrival order.
 
         ``on_research`` is awaited once, best-effort, the first time this run
-        dispatches the ``research`` tool (e.g. to react to the Telegram message).
+        dispatches the ``research`` tool (the web app shows it on the message).
         ``send_message_fn`` overrides the constructor-injected sender for this
         run only (used by ``run_job`` to observe deliveries).
         """
-        chat_id = self.conversation_key(chat_id)  # Freeze identity before lock waits or network calls.
-        if self.archive and chat_id != 0:
-            message_id = self.archive.insert(self.conversation_space(chat_id), "user", user_message, "queued",
-                                             message_id=message_id, source=source,
-                                             reply_to=reply_to) if message_id is None else message_id
-        thread = self._thread_of(chat_id, message_id)
-        lock = self._run_locks.setdefault((chat_id, thread), asyncio.Lock())
+        thread = None
+        if self.archive:
+            if message_id is None:
+                message_id = self.archive.insert(SPACE, "user", user_message, "queued", reply_to=reply_to)
+            thread = self.archive.thread_of(message_id)
+        return await self._run(
+            thread, user_message, message_id=message_id, image_data_urls=image_data_urls,
+            transient_context=transient_context, on_research=on_research,
+            send_message_fn=send_message_fn,
+        )
+
+    async def _run(
+        self,
+        thread: str | None,
+        user_message: str,
+        *,
+        message_id: str | None = None,
+        response_format: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Run under the thread's lock, keeping the archived row's status in step."""
+        lock = self._run_locks.setdefault(thread, asyncio.Lock())
         async with lock:
             if self.archive and message_id:
                 row = self.archive.get(message_id)
                 if row is None or row["status"] in ("dismissed", "deleted"):
                     return ""
-                if row["space"] != self.conversation_space(chat_id):
-                    raise ValueError("Message belongs to a different conversation")
                 if row["status"] == "done":
                     return self.archive.reply(message_id) or ""
                 self.archive.status(message_id, "running")
-                self._get_history(chat_id, thread).request_ids.add(message_id)
-                self._get_history(chat_id, thread).active_request_id = message_id
+                history = self._get_history(thread)
+                history.request_ids.add(message_id)
+                history.active_request_id = message_id
             try:
                 reply, touched = await self._run_locked(
-                    chat_id,
-                    user_message,
-                    thread=thread,
-                    extra_context=extra_context,
-                    image_data_urls=image_data_urls,
-                    transient_context=transient_context,
-                    on_research=on_research,
-                    send_message_fn=send_message_fn,
-                    response_format=response_format,
-                    unwind_on_unavailable=unwind_on_unavailable,
+                    thread, user_message, response_format=response_format, **kwargs,
                 )
             except BaseException as exc:
                 if self.archive and message_id:
-                    status = "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed"
-                    self._mark_unfinished(message_id, status, "Run did not finish; some work may have completed.")
+                    self._mark_unfinished(message_id, _failure_status(exc),
+                                          "Run did not finish; some work may have completed.")
                 raise
-            if self.archive and message_id:
-                if reply == MAX_ITERATIONS_REPLY:
-                    self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
-            self._release_thread(chat_id, thread)
+            if self.archive and message_id and reply == MAX_ITERATIONS_REPLY:
+                self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+            self._release_thread(thread)
         # One commit per interaction, in the background: the reply is not
         # delayed by git, and the commit message carries the full exchange.
         if self._backup is not None and touched:
@@ -648,24 +624,21 @@ class Agent:
         if row is not None and row["status"] not in ("dismissed", "deleted"):
             self.archive.status(message_id, status, error)
 
-    def _release_thread(self, chat_id: int, thread: str | None) -> None:
+    def _release_thread(self, thread: str | None) -> None:
         """Drop a thread's history once nothing unfinished remains in it.
 
         Its completed exchanges are in the archive, and a later reply
         restores them; keeping every thread ever run would grow without
         bound. Unfinished work (a failed or iteration-capped run) stays for
-        the hot retry that resumes it.
+        the resume that picks it up.
         """
-        key = (chat_id, thread)
-        if thread is not None and key in self._histories and self._histories[key].is_settled():
-            del self._histories[key]
+        if thread is not None and thread in self._histories and self._histories[thread].is_settled():
+            del self._histories[thread]
 
     async def _run_locked(
         self,
-        chat_id: int,
+        thread: str | None,
         user_message: str,
-        thread: str | None = None,
-        extra_context: str | None = None,
         image_data_urls: list[str] | None = None,
         transient_context: str | None = None,
         on_research: Callable[[], Coroutine[Any, Any, None]] | None = None,
@@ -675,29 +648,26 @@ class Agent:
     ) -> tuple[str, set[str]]:
         """Returns the final text reply and the vault paths this run touched.
 
-        With ``unwind_on_unavailable`` (outage-replay attempts), a
+        With ``unwind_on_unavailable`` (outage-resume attempts), a
         CopilotUnavailableError removes the just-appended user message from
-        history before propagating — the drain loop re-invokes the replay on
-        every backoff cycle, and without the unwind each failed attempt would
-        grow the pending request with a redundant note. Only the newest entry
-        is ever removed: anything newer
-        means the run made progress (completed tool calls) that the next
-        resume must see. Completed exchanges are projected separately; this
-        unwind touches only the unfinished work block.
+        history before propagating — a repeated resume would otherwise grow
+        the pending request with a redundant note on every attempt. Only the
+        newest entry is ever removed: anything newer means the run made
+        progress (completed tool calls) that the next resume must see.
+        Completed exchanges are projected separately; this unwind touches
+        only the unfinished work block.
         """
         t_start = time.monotonic()
-        history = self._get_history(chat_id, thread)
+        history = self._get_history(thread)
         history.begin_run()
         touched: set[str] = set()
 
-        if history.archive and thread is not None:
-            ambient = self._ambient_context(history.space, thread)
+        if thread is not None:
+            ambient = self._ambient_context(thread)
             if ambient:
                 transient_context = f"{transient_context}\n\n{ambient}" if transient_context else ambient
 
         system_prompt = self._load_system_prompt()
-        if extra_context:
-            system_prompt = f"{system_prompt}\n\n{extra_context}"
 
         # The send-time stamp is how the model knows the current time; it is
         # stored with the message so past turns never change retroactively.
@@ -764,12 +734,7 @@ class Agent:
 
             # Log turn
             usage_dict = response.get("usage", {})
-            usage.record(
-                "agent",
-                response.get("model", ""),
-                usage_dict,
-                chat_id=chat_id,
-            )
+            usage.record("agent", response.get("model", ""), usage_dict)
             tool_calls_in_turn = extract_tool_calls(msg)
             tool_names = ",".join(tc["function"]["name"] for tc in tool_calls_in_turn)
             logger.info(
@@ -851,94 +816,70 @@ class Agent:
                 })
 
         # Hit iteration cap
-        logger.warning("Agent hit max iterations (%d) for chat_id=%d", _MAX_ITERATIONS, chat_id)
+        logger.warning("Agent hit max iterations (%d) for thread=%s", _MAX_ITERATIONS, thread)
         return MAX_ITERATIONS_REPLY, touched
 
-    async def retry_message(
+    async def resume(
         self,
-        chat_id: int,
-        text: str,
-        queued_at: str,
-        hot: bool,
-        send_message_fn: SendMessageFn | None = None,
-        extra_context: str | None = None,
         message_id: str | None = None,
-        image_data_urls: list[str] | None = None,
+        *,
+        send_message_fn: SendMessageFn | None = None,
     ) -> str | None:
-        """Replay a user message that failed during a Copilot outage.
+        """Resume a run that failed during a Copilot outage, in place.
 
-        *Hot* items were queued in this process: the failed turn — the user
-        message, possibly followed by completed tool calls — still sits in
-        this conversation's history, so the replay appends only a resume note
-        and lets the model pick the turn up in place. Re-appending the text
-        would double it, and re-running a mid-run failure from scratch could
-        redo vault writes the first attempt already made. Two hot cases stand
-        down instead: an empty history (/clear during the outage — the
-        conversation was deliberately forgotten) and a history whose last
-        entry is a plain assistant reply (a later successful run saw the
-        pending message in context and already covered it).
+        The failed turn — the user message, possibly followed by completed
+        tool calls — still sits in the thread's history, so the resume appends
+        only a note and lets the model pick the turn up where it stopped.
+        Re-appending the text would double it, and re-running a mid-run
+        failure from scratch could redo vault writes the first attempt already
+        made. Two cases stand down instead: an empty history (a context reset
+        during the outage — the conversation was deliberately forgotten) and
+        a history whose last entry is a plain assistant reply (a later
+        successful run saw the pending message in context and already covered
+        it).
 
-        *Cold* items were reloaded from disk after a restart: the history is
-        gone, so the original text is replayed with a provenance note carrying
-        when it was sent and that it may have been partially processed —
-        the model re-reads pages before writing, per its normal recipe.
-
-        Returns the reply to deliver, or None when the item was superseded.
-        Raises CopilotUnavailableError while the outage lasts, so the retry
-        queue keeps the item.
+        Returns the reply to deliver, or None when the work was superseded.
+        Raises CopilotUnavailableError while the outage lasts.
         """
-        chat_id = self.conversation_key(chat_id)
-        thread = self._thread_of(chat_id, message_id)
-        lock = self._run_locks.setdefault((chat_id, thread), asyncio.Lock())
+        thread = self.archive.thread_of(message_id) if self.archive and message_id else None
+        lock = self._run_locks.setdefault(thread, asyncio.Lock())
         async with lock:
             if self.archive and message_id:
                 row = self.archive.get(message_id)
                 if row is None or row["status"] in ("dismissed", "deleted", "done"):
                     return None
-                if row["space"] != self.conversation_space(chat_id):
-                    raise ValueError("Retry belongs to a different conversation")
-                self._get_history(chat_id, thread).request_ids.add(message_id)
-                self._get_history(chat_id, thread).active_request_id = message_id
-            if hot:
-                msgs = self._get_history(chat_id, thread).messages()
-                if not msgs:
-                    return None  # /clear deliberately supersedes queued work
-                last = msgs[-1]
-                if last.get("role") == "assistant" and not extract_tool_calls(last):
-                    return None  # a completed run saw all pending work
-                note = (
-                    "[Copilot went down mid-conversation and is back now — review the "
-                    "messages above and finish handling anything still unanswered or "
-                    "incomplete]"
-                )
-            else:
-                note = (
-                    f"[this message was originally sent {queued_at} and delayed by a Copilot "
-                    f"outage; it may have been partially processed before the failure] {text}"
-                )
+                history = self._get_history(thread)
+                history.request_ids.add(message_id)
+                history.active_request_id = message_id
+            msgs = self._get_history(thread).messages()
+            if not msgs:
+                return None  # a reset deliberately supersedes pending work
+            last = msgs[-1]
+            if last.get("role") == "assistant" and not extract_tool_calls(last):
+                return None  # a completed run saw all pending work
+            note = (
+                "[Copilot went down mid-conversation and is back now — review the "
+                "messages above and finish handling anything still unanswered or "
+                "incomplete]"
+            )
             try:
                 reply, touched = await self._run_locked(
-                    chat_id, note, thread=thread, unwind_on_unavailable=True,
-                    send_message_fn=send_message_fn, extra_context=extra_context,
-                    # A cold replay shows the pictures again; a hot one's turn
-                    # already carried them.
-                    image_data_urls=None if hot else image_data_urls,
+                    thread, note, unwind_on_unavailable=True, send_message_fn=send_message_fn,
                 )
             except BaseException as exc:
                 if self.archive and message_id:
-                    self._mark_unfinished(message_id,
-                                          "unavailable" if isinstance(exc, copilot.CopilotUnavailableError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed",
+                    self._mark_unfinished(message_id, _failure_status(exc),
                                           "Retry did not finish; some work may have completed.")
                 raise
             if self.archive and message_id and reply == MAX_ITERATIONS_REPLY:
                 self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
-            self._release_thread(chat_id, thread)
+            self._release_thread(thread)
         if self._backup is not None and touched:
             self._backup.schedule_commit(touched, trigger=note, response=reply)
         return reply
 
     async def run_job(self, prompt: str) -> str:
-        """Run a scheduled-job prompt (chat_id 0).
+        """Run a scheduled-job prompt on the unthreaded jobs history.
 
         The prompt reaches the model tagged ``[scheduled run]``, and the run
         closes with a JSON object matching ``_JOB_CLOSE_SCHEMA`` (the contract
@@ -956,17 +897,15 @@ class Agent:
         base_send = self._send_message_fn
         delivered = 0
 
-        async def counting_send(text: str) -> int | None:
+        async def counting_send(text: str) -> None:
             nonlocal delivered
-            target_chat = None
             if base_send:
-                target_chat = await base_send(text)
+                await base_send(text)
             delivered += 1
-            return target_chat
 
-        reply = await self.run(
-            chat_id=0,
-            user_message=f"[scheduled run] {prompt}",
+        reply = await self._run(
+            None,
+            f"[scheduled run] {prompt}",
             transient_context=self._job_state_snapshot(prompt),
             send_message_fn=counting_send,
             response_format=_JOB_CLOSE_RESPONSE_FORMAT,
@@ -983,3 +922,11 @@ class Agent:
             logger.warning("Scheduled run closed without job-close JSON; delivering raw reply")
             await counting_send(reply)
         return reply
+
+
+def _failure_status(exc: BaseException) -> str:
+    if isinstance(exc, copilot.CopilotUnavailableError):
+        return "unavailable"
+    if isinstance(exc, asyncio.CancelledError):
+        return "interrupted"
+    return "failed"

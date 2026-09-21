@@ -7,8 +7,8 @@ that doesn't.
 
 ## What this project is
 
-- **Single user, self-hosted.** No multi-tenancy or application accounts. An
-  optional private-network PWA runs alongside Telegram.
+- **Single user, self-hosted.** No multi-tenancy or application accounts. The
+  only interface is a private-network web app.
 - **The vault is the memory.** Plain markdown on disk, readable and useful
   without this bot. Conversation text is archived separately in private SQLite;
   it is evidence, not a replacement for the vault's current knowledge.
@@ -33,10 +33,10 @@ mise exec uv -- uv run ruff check src/ tests/
 `mise exec uv -- uv run pytest tests/test_agent.py -k test_name` runs a single test. Tests use
 `asyncio_mode = "auto"`, so async tests need no decorator, and HTTP is mocked
 with `respx`; companion/browser tests use disposable local servers. Tests must
-not contact real Telegram, Copilot, push providers, or other external services.
+not contact real Copilot, push providers, or other external services.
 
-Running the bot for real needs a Telegram bot token, a Copilot licence and a
-one-time `assistant auth` — see [docs/development.md](docs/development.md).
+Running the assistant for real needs a Copilot licence and a one-time
+`assistant auth` — see [docs/development.md](docs/development.md).
 
 ## Making a change
 

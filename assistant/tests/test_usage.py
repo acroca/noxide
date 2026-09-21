@@ -46,7 +46,6 @@ async def test_drain_appends_one_line_per_event_to_monthly_file(
             "completion_tokens": 402,
             "prompt_tokens_details": {"cached_tokens": 7000},
         },
-        chat_id=12345,
     )
     tracker.record("research", "claude-sonnet-4.6", {"prompt_tokens": 900, "completion_tokens": 80})
 
@@ -60,13 +59,11 @@ async def test_drain_appends_one_line_per_event_to_monthly_file(
         "ts": "2026-07-23T14:05:12+02:00",
         "feature": "agent",
         "model": "claude-sonnet-4.6",
-        "chat_id": 12345,
         "prompt_tokens": 8123,
         "cached_tokens": 7000,
         "completion_tokens": 402,
     }
     second = json.loads(lines[1])
-    assert second["chat_id"] is None
     assert second["cached_tokens"] == 0
 
 
@@ -118,7 +115,7 @@ def test_module_record_delegates_to_singleton(
 ) -> None:
     tracker = usage.init(tmp_path / "state", tmp_path / "vault", _TZ)
     assert usage.get_tracker() is tracker
-    usage.record("agent", "m", {"prompt_tokens": 5, "completion_tokens": 3}, chat_id=1)
+    usage.record("agent", "m", {"prompt_tokens": 5, "completion_tokens": 3})
     assert tracker._queue.qsize() == 1
     monkeypatch.setattr(usage, "_tracker", None)  # don't leak into other tests
 
@@ -139,7 +136,6 @@ def _event(ts: str, feature: str = "agent", model: str = "m1",
            prompt: int = 100, completion: int = 10, cached: int = 0) -> dict:
     return {
         "ts": ts, "feature": feature, "model": model,
-        "chat_id": 1,
         "prompt_tokens": prompt, "cached_tokens": cached,
         "completion_tokens": completion,
     }

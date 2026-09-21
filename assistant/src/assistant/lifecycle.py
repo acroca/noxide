@@ -6,11 +6,11 @@ first signal starts a drain that lets in-flight work finish; a second one
 abandons the drain, so an impatient manual restart is never hostage to a
 wedged run.
 
-The drain matters more than it looks. ``Updater.stop()`` makes one final
-``getUpdates`` with the advanced offset, which confirms to Telegram every
-update already fetched into the local queue — those messages will never be
-redelivered. Dying between that ack and the handler that processes them loses
-them for good, so the shutdown path exists to close that window.
+The drain lets web messages already accepted finish their run and lets a
+mid-run scheduled job deliver its reminder. A message cut short is marked
+interrupted and can be retried from the app; a job's work may have partially
+completed, and its recurring row keeps a past ``next`` so the next start
+retries it.
 """
 
 from __future__ import annotations
@@ -22,16 +22,16 @@ import signal
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .companion import Companion
     from .schedule import Scheduler
-    from .telegram_bot import TelegramBot
 
 logger = logging.getLogger(__name__)
 
 # How long in-flight work may take before we stop waiting. Must stay under
 # whatever grace period the supervisor allows between SIGTERM and SIGKILL, so
 # the process exits on its own terms — and can report what it dropped —
-# instead of being killed mid-sentence. See the README for the value a
-# deployment has to configure.
+# instead of being killed mid-sentence. See docs/deployment.md for the value
+# a deployment has to configure.
 DRAIN_BUDGET = 270.0
 # How long an important lifecycle push may hold the exit after a failed drain.
 _IMPORTANT_PUSH_WAIT = 15.0
@@ -73,21 +73,13 @@ class Lifecycle:
             await self.stop.wait()
 
 
-async def _notify(
-    bot: TelegramBot | Any, text: str, companion: Any = None, *, important: bool = False
-) -> None:
+async def _notify(companion: Companion | Any, text: str, *, important: bool = False) -> None:
     """Lifecycle chatter must never be able to wedge the exit.
 
-    The web companion pushes the same text to devices that asked for restart
-    notices; an important one (work dropped) goes to every device and is
-    waited for briefly, since the drain it follows has already been given up.
+    The companion pushes the text to devices that asked for restart notices;
+    an important one (work cut short) goes to every device and is waited for
+    briefly, since the drain it follows has already been given up.
     """
-    try:
-        await bot.notify_lifecycle(text)
-    except Exception:
-        logger.warning("Could not send lifecycle message %r", text, exc_info=True)
-    if companion is None:
-        return
     try:
         task = companion.notify_lifecycle(text, important=important)
         if important and task is not None:
@@ -98,29 +90,24 @@ async def _notify(
 
 async def graceful_shutdown(
     *,
-    bot: TelegramBot | Any,
+    companion: Companion | Any,
     scheduler: Scheduler | Any,
     force: asyncio.Event,
     budget: float = DRAIN_BUDGET,
-    companion: Any = None,
 ) -> None:
-    """Stop accepting work, let what is in flight finish, then tear down.
+    """Stop accepting work, let what is in flight finish, then return.
 
-    Telegram and scheduler drains run concurrently — both are just awaiting
+    The web and scheduler drains run concurrently — both are just awaiting
     in-flight agent runs, so serialising them would double the worst case for
     no benefit. Returns once the process is safe to exit, whether the drain
     completed, timed out, or was abandoned by a second signal.
     """
-    queued = bot.pending_updates()
-    note = f" Finishing {queued} queued message(s) first." if queued else ""
-    await _notify(bot, f"Restarting...{note}", companion)
+    companion.accepting = False
+    running = companion.pending()
+    note = f" Finishing {running} message(s) in progress first." if running else ""
+    await _notify(companion, f"Restarting...{note}")
 
-    # The ack point: everything already fetched is confirmed to Telegram here,
-    # so from now on the only copy of those messages is the local queue.
-    with contextlib.suppress(Exception):
-        await bot.stop_polling()
-
-    drain = asyncio.create_task(_drain_all(bot, scheduler, budget, companion))
+    drain = asyncio.create_task(_drain_all(companion, scheduler, budget))
     abandoned = asyncio.create_task(force.wait())
     try:
         done, _ = await asyncio.wait(
@@ -133,37 +120,26 @@ async def graceful_shutdown(
         drain.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await drain
-        dropped = bot.pending_updates()
+        cut_short = companion.pending()
         reason = "abandoned" if force.is_set() else f"deadline ({budget:.0f}s)"
-        logger.error(
-            "Shutdown drain %s with %d update(s) unprocessed — already acked to "
-            "Telegram, so they are lost",
-            reason,
-            dropped,
-        )
-        if dropped:
+        logger.error("Shutdown drain %s with %d message(s) still running", reason, cut_short)
+        if cut_short:
             await _notify(
-                bot,
-                f"Restart cut short — {dropped} queued message(s) were dropped, "
-                "please resend.",
                 companion,
+                f"Restart cut short — {cut_short} message(s) in progress were interrupted; "
+                "retry them from the app.",
                 important=True,
             )
 
-    with contextlib.suppress(Exception):
-        await bot.close()
 
-
-async def _drain_all(bot: TelegramBot | Any, scheduler: Scheduler | Any, budget: float,
-                     companion: Any = None) -> None:
-    """Await the Telegram queue and any in-flight scheduled jobs."""
+async def _drain_all(companion: Companion | Any, scheduler: Scheduler | Any, budget: float) -> None:
+    """Await in-flight web runs, their pushes, and any in-flight scheduled jobs."""
     results = await asyncio.gather(
-        bot.drain(), scheduler.drain(timeout=budget),
-        *([companion.drain()] if companion is not None else []), return_exceptions=True
+        companion.drain(), scheduler.drain(timeout=budget), return_exceptions=True
     )
     for result in results:
         if isinstance(result, BaseException):
             logger.warning("Drain step failed during shutdown", exc_info=result)
-    unfinished = next((r for r in results[1:] if isinstance(r, int)), 0)
+    unfinished = results[1] if isinstance(results[1], int) else 0
     if unfinished:
         logger.warning("%d scheduled job(s) did not finish before shutdown", unfinished)

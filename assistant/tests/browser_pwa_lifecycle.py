@@ -63,6 +63,9 @@ async def main():
                 return web.json_response({"ok": True})
             if request.path == "/api/now":
                 return web.json_response({"content": "# Now\n\n## Today\n- [ ] A read-only page"})
+            if request.path == "/api/models":
+                return web.json_response({"current": "sonnet", "default": "sonnet", "models": [
+                    {"alias": "sonnet", "label": "Claude Sonnet 5", "id": "claude-sonnet-5"}]})
             if request.path != "/api/messages" or "space" in request.query:
                 raise web.HTTPNotFound()  # one chat: no topic routes, no space parameter
             return web.json_response({"threads": thread_page(), "before": state["before"],

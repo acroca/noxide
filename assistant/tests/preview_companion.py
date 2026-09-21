@@ -49,7 +49,7 @@ async def main():
             return "Your note is here.\n\nThis is the **preview assistant**, so no model was called and no vault changes were made. In the real service, this conversation uses your existing assistant and vault tools."
 
         archive = ConversationArchive(root)
-        agent = Agent(vault, archive=archive, home_chat_fn=lambda: 123)
+        agent = Agent(vault, archive=archive)
 
         async def chat(*args, **kwargs):
             text = await reply()
@@ -58,10 +58,8 @@ async def main():
         copilot._client = MagicMock(chat=AsyncMock(side_effect=chat))
         # The chat is threads: a root and its replies. Most are two messages;
         # a longer one shows the marked, indented form.
-        captured = archive.insert("general", "user", "A message captured in Telegram: watered the balcony plants.", "done",
-                                  source="telegram")
-        archive.insert("general", "assistant", "Noted — the herbs will be glad of it.", "done", reply_to=captured,
-                       source="telegram")
+        captured = archive.insert("general", "user", "Watered the balcony plants.", "done")
+        archive.insert("general", "assistant", "Noted — the herbs will be glad of it.", "done", reply_to=captured)
         opener = archive.insert("general", "user", "Can we plan the mountain walk?", "done")
         question = archive.insert("general", "assistant", "Of course. Saturday or Sunday?", "done", reply_to=opener)
         answer = archive.insert("general", "user", "Saturday, leaving early.", "done", reply_to=question)

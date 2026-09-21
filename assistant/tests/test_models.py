@@ -357,3 +357,63 @@ def test_resolve_startup_retains_default_when_its_catalog_slug_is_shadowed() -> 
     assert options["opus-5"].id == "pinned"
     assert options[alias].id == "claude-opus-5"
     assert model_id is None
+
+
+# ------------------------------------------------------------------
+# ModelPicker: the runtime switch behind the web app's Preferences
+# ------------------------------------------------------------------
+
+
+def _picker(refresh=None, **kwargs):
+    from unittest.mock import MagicMock
+
+    from assistant.models import ModelPicker
+
+    options = {
+        "sonnet": ModelOption(id="claude-sonnet-5", label="Claude Sonnet 5"),
+        "opus": ModelOption(id="claude-opus-5", label="Claude Opus 5"),
+    }
+    set_model = MagicMock()
+    picker = ModelPicker(options, "sonnet", set_model_fn=set_model, refresh_fn=refresh, **kwargs)
+    return picker, set_model
+
+
+def test_picker_lists_choices_with_the_current_and_default_marked() -> None:
+    picker, _ = _picker()
+    assert picker.choices() == {
+        "current": "sonnet", "default": "sonnet",
+        "models": [{"alias": "sonnet", "label": "Claude Sonnet 5", "id": "claude-sonnet-5"},
+                   {"alias": "opus", "label": "Claude Opus 5", "id": "claude-opus-5"}],
+    }
+
+
+def test_picker_select_switches_the_client_and_rejects_unknown_aliases() -> None:
+    picker, set_model = _picker()
+    assert picker.select("opus") == ModelOption(id="claude-opus-5", label="Claude Opus 5")
+    set_model.assert_called_once_with("claude-opus-5")
+    assert picker.choices()["current"] == "opus"
+    with pytest.raises(KeyError):
+        picker.select("gemini")
+    assert picker.choices()["current"] == "opus"
+
+
+async def test_picker_refresh_replaces_the_list_but_keeps_current_and_default() -> None:
+    from unittest.mock import AsyncMock
+
+    fresh = {"fable": ModelOption(id="claude-fable-5", label="Claude Fable 5")}
+    picker, _ = _picker(refresh=AsyncMock(return_value=fresh))
+    picker.select("opus")
+    await picker.refresh()
+    assert [m["alias"] for m in picker.choices()["models"]] == ["fable", "opus", "sonnet"]
+    assert picker.choices()["current"] == "opus"
+
+
+async def test_picker_refresh_failure_keeps_the_cached_list() -> None:
+    from unittest.mock import AsyncMock
+
+    picker, _ = _picker(refresh=AsyncMock(side_effect=RuntimeError("catalog down")))
+    await picker.refresh()
+    assert [m["alias"] for m in picker.choices()["models"]] == ["sonnet", "opus"]
+    picker, _ = _picker()  # no refresh function at all
+    await picker.refresh()
+    assert [m["alias"] for m in picker.choices()["models"]] == ["sonnet", "opus"]

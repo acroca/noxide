@@ -15,17 +15,19 @@ from assistant import __main__ as main
 from assistant import (
     agent,
     backup,
+    companion,
     config,
     copilot,
     inbox,
     lifecycle,
     retry_queue,
     schedule,
-    telegram_bot,
     usage,
 )
 from assistant.agent import MAX_ITERATIONS_REPLY
 from assistant.maintenance import COMPILE_ID, COMPILE_PROMPT, STATE_FILENAME, MaintenanceState
+from assistant.models import ModelPicker
+from assistant.retry_queue import PendingItem
 from assistant.schedule import Scheduler
 
 
@@ -34,9 +36,18 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     cfg = config.Config.model_construct(
         vault_path=tmp_path / "vault",
         state_dir=tmp_path / "private-state",
-        telegram_bot_token="test-token",
-        allowed_user_ids=[123],
         backup_enabled=True,
+        models={"sonnet": "claude-sonnet-5"},
+        default_model="sonnet",
+        default_family="",
+        model_vendors=[],
+        timezone="UTC",
+        agent_name="Noxide",
+        history_exchanges=5,
+        elevenlabs_api_key="",
+        fourget_url="",
+        maintenance_compile="0 3 * * *",
+        maintenance_lint="0 4 * * SUN",
     )
     monkeypatch.setattr(config, "load_config", MagicMock(return_value=cfg))
     monkeypatch.setattr(config.Config, "validate_for_run", MagicMock())
@@ -111,32 +122,25 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     )
     monkeypatch.setattr(backup, "VaultBackup", MagicMock(return_value=vault_backup))
 
-    start_entered = asyncio.Event()
-    start_release = asyncio.Event()
-    start_release.set()
-
-    async def start(*, abort: asyncio.Event) -> None:
+    async def start() -> None:
         assert installed
-        assert abort is lc.stop
-        events.append("bot.start")
-        start_entered.set()
-        await start_release.wait()
-        events.append("bot.ready")
+        events.append("app.start")
 
-    async def drain_bot() -> None:
-        await drain("bot")
+    async def drain_app() -> None:
+        await drain("app")
 
-    bot = MagicMock(
+    app = MagicMock(
         start=AsyncMock(side_effect=start),
-        pending_updates=MagicMock(return_value=0),
-        notify_lifecycle=AsyncMock(),
-        send_message=AsyncMock(),
-        stop_polling=AsyncMock(side_effect=lambda: events.append("bot.stop_polling")),
-        drain=AsyncMock(side_effect=drain_bot),
-        close=AsyncMock(side_effect=lambda: events.append("bot.close")),
+        pending=MagicMock(return_value=0),
+        notify_lifecycle=MagicMock(return_value=None),
+        startup_message=MagicMock(return_value="Started"),
+        deliver=AsyncMock(),
+        drain=AsyncMock(side_effect=drain_app),
+        close=AsyncMock(side_effect=lambda: events.append("app.close")),
     )
-    monkeypatch.setattr(telegram_bot, "TelegramBot", MagicMock(return_value=bot))
-    runner = MagicMock(run_job=AsyncMock(return_value="completed"), retry_message=AsyncMock())
+    app_factory = MagicMock(return_value=app)
+    monkeypatch.setattr(companion, "Companion", app_factory)
+    runner = MagicMock(run_job=AsyncMock(return_value="completed"))
     monkeypatch.setattr(agent, "Agent", MagicMock(return_value=runner))
 
     async def drain_scheduler(*, timeout: float) -> int:
@@ -173,43 +177,25 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     monkeypatch.setattr(inbox, "ingest", ingest_mock)
 
     return SimpleNamespace(
-        cfg=cfg, events=events, workers=workers, started=started, lc=lc,
-        tracker=tracker, backup=vault_backup, bot=bot, agent=runner,
+        cfg=cfg, events=events, workers=workers, started=started, lc=lc, client=client,
+        tracker=tracker, backup=vault_backup, app=app, app_factory=app_factory, agent=runner,
         scheduler=scheduler, scheduler_factory=scheduler_factory,
         queue=queue, queue_factory=queue_factory, ingest=ingest_mock,
-        start_entered=start_entered, start_release=start_release,
     )
 
 
-async def test_run_waits_for_telegram_readiness_before_starting_jobs(runtime) -> None:
-    runtime.start_release.clear()
-    task = asyncio.create_task(main._run(None))
-    try:
-        await asyncio.wait_for(runtime.start_entered.wait(), timeout=2)
-        runtime.scheduler.start.assert_not_called()
-        runtime.scheduler.reload.assert_not_called()
-        runtime.scheduler.catch_up.assert_not_called()
-        runtime.queue.run.assert_not_called()
-        runtime.ingest.assert_not_called()
-        assert not runtime.started["poll"].is_set()
-        runtime.start_release.set()
-        await asyncio.wait_for(task, timeout=2)
-    finally:
-        runtime.start_release.set()
-        runtime.lc.stop.set()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+async def test_run_starts_the_app_before_jobs_and_tears_down_in_order(runtime) -> None:
+    await asyncio.wait_for(main._run(None), timeout=2)
 
     events = runtime.events
-    ordered = ["backup.init", "install", "bot.start", "bot.ready",
+    ordered = ["backup.init", "install", "app.start",
                "scheduler.start", "scheduler.reload", "scheduler.catch_up"]
     assert [events.index(name) for name in ordered] == sorted(events.index(name) for name in ordered)
     for name in ("poll", "retry", "inbox"):
         assert events.index("scheduler.catch_up") < events.index(f"{name}.run")
-        assert events.index(f"{name}.cancel") < events.index("bot.stop_polling")
+        assert events.index(f"{name}.cancel") < events.index("app.drain")
+    assert events.index("app.drain") < events.index("app.close") < events.index("remove")
     assert all(task.cancelled() for task in runtime.workers.values())
-    assert runtime.bot._agent is runtime.agent
     runtime.ingest.assert_awaited_once_with(
         runtime.cfg.vault_path, runtime.agent.run_job,
         backup=runtime.backup, state_dir=runtime.cfg.state_dir,
@@ -218,10 +204,12 @@ async def test_run_waits_for_telegram_readiness_before_starting_jobs(runtime) ->
     assert events[-1] == "remove"
     runtime.tracker.drain.assert_awaited_once()
     runtime.backup.drain.assert_awaited_once()
+    runtime.app.notify_lifecycle.assert_any_call("Started")
+    assert runtime.app.accepting is False
 
 
-async def test_web_companion_starts_drains_and_archives_proactive_sends(runtime, monkeypatch):
-    from assistant import companion, conversations
+async def test_app_is_wired_with_the_shared_archive_and_the_model_picker(runtime, monkeypatch):
+    from assistant import conversations
 
     class OpenArchive(conversations.ConversationArchive):
         """Keeps the database open after _run's teardown so the rows can be inspected."""
@@ -230,50 +218,42 @@ async def test_web_companion_starts_drains_and_archives_proactive_sends(runtime,
             self.closed = True
 
     monkeypatch.setattr(conversations, "ConversationArchive", OpenArchive)
-    runtime.cfg.pwa_enabled = True
-    service = MagicMock(start=AsyncMock(), drain=AsyncMock(), close=AsyncMock(),
-                        observe_delivery=AsyncMock())
-    factory = MagicMock(return_value=service)
-    monkeypatch.setattr(companion, "Companion", factory)
     await main._run(None)
     archive = agent.Agent.call_args.kwargs["archive"]
     try:
         assert isinstance(archive, OpenArchive) and archive.closed
-        factory.assert_called_once_with(runtime.cfg, runtime.agent, ANY, archive=archive, transcriber=ANY)
-        service.start.assert_awaited_once()
-        service.drain.assert_awaited_once()
-        service.close.assert_awaited_once()
-        assert not service.accepting
-        sender = agent.Agent.call_args.kwargs["send_message_fn"]
-        runtime.agent.conversation_space = MagicMock(return_value="general")
-        # Before the bot knows its home chat, a send is just forwarded.
-        runtime.bot.home_chat_id = None
-        runtime.bot.send_message.return_value = 5
-        assert await sender("Early") == 5
-        runtime.bot.send_message.assert_awaited_once_with("Early")
-        assert archive.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
-        service.observe_delivery.assert_not_awaited()
-        # A delivery is archived first, as a thread root, then sent against its row.
-        runtime.bot.home_chat_id = 123
-        runtime.bot.send_message.reset_mock()
-        runtime.bot.send_message.return_value = 123
-        assert await sender("A reminder") == 123
-        runtime.agent.conversation_space.assert_called_with(123)
-        row = archive.db.execute("SELECT * FROM messages").fetchone()
-        assert (row["space"], row["role"], row["text"], row["status"], row["source"]) == (
-            "general", "assistant", "A reminder", "done", "telegram")
-        assert row["delivery"] == "delivered" and row["reply_to"] is None and row["thread"] == row["id"]
-        runtime.bot.send_message.assert_awaited_once_with("A reminder", archive_id=row["id"])
-        service.observe_delivery.assert_awaited_once_with("A reminder", thread=row["id"])
-        # A dropped delivery keeps its row, marked failed, and is not mirrored.
-        runtime.bot.send_message.return_value = None
-        assert await sender("Dropped") is None
-        dropped = archive.db.execute("SELECT * FROM messages WHERE text='Dropped'").fetchone()
-        assert dropped["delivery"] == "failed" and dropped["status"] == "done" and dropped["thread"] == dropped["id"]
-        assert archive.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
-        service.observe_delivery.assert_awaited_once()
+        runtime.app_factory.assert_called_once_with(
+            runtime.cfg, runtime.agent, ANY, archive=archive, transcriber=None, models=ANY)
+        models = runtime.app_factory.call_args.kwargs["models"]
+        assert isinstance(models, ModelPicker)
+        assert models.choices()["current"] == "sonnet"
+        models.select("sonnet")
+        runtime.client.set_model.assert_called_once_with("claude-sonnet-5")
+        runtime.app.start.assert_awaited_once()
+        runtime.app.drain.assert_awaited_once()
+        runtime.app.close.assert_awaited_once()
     finally:
         archive.db.close()
+
+
+async def test_proactive_sends_are_the_apps_to_deliver(runtime) -> None:
+    await asyncio.wait_for(main._run(None), timeout=2)
+    sender = agent.Agent.call_args.kwargs["send_message_fn"]
+
+    assert await sender("A reminder") is None
+
+    runtime.app.deliver.assert_awaited_once_with("A reminder")
+
+
+async def test_dropped_queued_job_pushes_an_important_notice(runtime) -> None:
+    await asyncio.wait_for(main._run(None), timeout=2)
+    notify_drop = runtime.queue_factory.call_args.kwargs["notify_drop_fn"]
+    runtime.app.notify_lifecycle.reset_mock()
+
+    await notify_drop(PendingItem(text="Remind me about the dentist", queued_at="earlier"), RuntimeError("boom"))
+
+    text, kwargs = runtime.app.notify_lifecycle.call_args.args[0], runtime.app.notify_lifecycle.call_args.kwargs
+    assert "dentist" in text and "dropped" in text and kwargs == {"important": True}
 
 
 async def test_second_signal_can_force_the_actual_graceful_drain(runtime) -> None:
@@ -289,13 +269,13 @@ async def test_second_signal_can_force_the_actual_graceful_drain(runtime) -> Non
         runtime.lc._on_signal(signal.SIGTERM)
         await asyncio.Event().wait()
 
-    runtime.bot.drain.side_effect = blocked_drain
+    runtime.app.drain.side_effect = blocked_drain
     runtime.tracker.drain.side_effect = blocked_flush
     runtime.backup.drain.side_effect = blocked_flush
     await asyncio.wait_for(main._run(None), timeout=2)
 
     assert runtime.lc.force.is_set()
-    runtime.bot.close.assert_awaited_once()
+    runtime.app.close.assert_awaited_once()
     runtime.scheduler.drain.assert_awaited_once()
     runtime.lc.remove.assert_called_once()
     assert runtime.events[-1] == "remove"
@@ -379,7 +359,7 @@ async def test_final_flush_failure_does_not_skip_other_cleanup(runtime, componen
 
 
 async def test_final_flush_failure_does_not_mask_startup_error(runtime, caplog) -> None:
-    runtime.bot.start.side_effect = RuntimeError("startup broke")
+    runtime.app.start.side_effect = RuntimeError("startup broke")
     runtime.tracker.drain.side_effect = RuntimeError("flush broke")
 
     with pytest.raises(RuntimeError, match="startup broke"):
@@ -421,25 +401,18 @@ async def test_cancelling_final_flush_joins_cleanup_before_removing_handlers(run
     runtime.lc.remove.assert_called_once()
 
 
-@pytest.mark.parametrize("outcome", ["abort", "failure"])
-async def test_startup_abort_or_failure_skips_background_and_cleans_up(runtime, outcome) -> None:
-    error = RuntimeError("Telegram startup failed")
+async def test_startup_failure_skips_background_and_cleans_up(runtime) -> None:
+    error = RuntimeError("port in use")
 
-    async def start(*, abort: asyncio.Event) -> None:
-        assert abort is runtime.lc.stop
+    async def start() -> None:
         runtime.lc.remove.assert_not_called()
         await asyncio.gather(runtime.started["usage"].wait(), runtime.started["backup"].wait())
-        if outcome == "failure":
-            raise error
-        abort.set()
+        raise error
 
-    runtime.bot.start.side_effect = start
-    if outcome == "failure":
-        with pytest.raises(RuntimeError) as caught:
-            await asyncio.wait_for(main._run(None), timeout=2)
-        assert caught.value is error
-    else:
+    runtime.app.start.side_effect = start
+    with pytest.raises(RuntimeError) as caught:
         await asyncio.wait_for(main._run(None), timeout=2)
+    assert caught.value is error
 
     runtime.scheduler.start.assert_not_called()
     runtime.scheduler.reload.assert_not_called()
@@ -447,10 +420,9 @@ async def test_startup_abort_or_failure_skips_background_and_cleans_up(runtime, 
     runtime.queue.run.assert_not_called()
     runtime.ingest.assert_not_called()
     assert not runtime.started["poll"].is_set()
-    runtime.bot.stop_polling.assert_awaited_once()
-    runtime.bot.drain.assert_awaited_once()
+    runtime.app.drain.assert_awaited_once()
     runtime.scheduler.drain.assert_awaited_once()
-    runtime.bot.close.assert_awaited_once()
+    runtime.app.close.assert_awaited_once()
     runtime.tracker.drain.assert_awaited_once()
     runtime.backup.drain.assert_awaited_once()
     assert all(task.cancelled() for task in runtime.workers.values())
@@ -461,6 +433,7 @@ async def test_shutdown_failure_still_flushes_and_removes_handlers(runtime, monk
     async def fail_shutdown(**kwargs: object) -> None:
         runtime.lc.remove.assert_not_called()
         assert kwargs["force"] is runtime.lc.force
+        assert kwargs["companion"] is runtime.app
         raise RuntimeError("shutdown failed")
 
     monkeypatch.setattr(lifecycle, "graceful_shutdown", fail_shutdown)
@@ -469,6 +442,7 @@ async def test_shutdown_failure_still_flushes_and_removes_handlers(runtime, monk
 
     runtime.tracker.drain.assert_awaited_once()
     runtime.backup.drain.assert_awaited_once()
+    runtime.app.close.assert_awaited_once()
     assert all(task.cancelled() for task in runtime.workers.values())
     runtime.lc.remove.assert_called_once()
 
@@ -483,7 +457,7 @@ async def test_scheduler_startup_failure_still_cleans_up(runtime, step) -> None:
     runtime.queue.run.assert_not_called()
     runtime.ingest.assert_not_called()
     assert not runtime.started["poll"].is_set()
-    runtime.bot.close.assert_awaited_once()
+    runtime.app.close.assert_awaited_once()
     runtime.scheduler.drain.assert_awaited_once()
     runtime.tracker.drain.assert_awaited_once()
     runtime.backup.drain.assert_awaited_once()
@@ -508,35 +482,6 @@ async def test_job_callbacks_reject_only_iteration_capped_outcomes(runtime, sour
     else:
         assert await callback("check the vault") is None
     runtime.agent.run_job.assert_awaited_once_with("check the vault")
-
-
-@pytest.mark.parametrize("reply", [MAX_ITERATIONS_REPLY, None, "completed", ""])
-async def test_retry_message_callback_outcomes(runtime, reply) -> None:
-    await asyncio.wait_for(main._run(None), timeout=2)
-    callback = runtime.queue_factory.call_args.kwargs["replay_message_fn"]
-    runtime.agent.retry_message.return_value = reply
-    args = (123, "original message", "2026-09-08 10:00 local", True)
-
-    if reply == MAX_ITERATIONS_REPLY:
-        with pytest.raises(RuntimeError, match="iteration limit"):
-            await callback(*args)
-    else:
-        assert await callback(*args) is None
-    runtime.agent.retry_message.assert_awaited_once_with(*args[:3], hot=True)
-    if reply in (MAX_ITERATIONS_REPLY, None):
-        runtime.bot.send_message.assert_not_awaited()
-    else:
-        runtime.bot.send_message.assert_awaited_once_with(reply or "(no reply)", chat_id=123)
-
-
-async def test_retry_message_delivery_failure_does_not_fail_completed_run(runtime) -> None:
-    await asyncio.wait_for(main._run(None), timeout=2)
-    runtime.agent.retry_message.return_value = "completed"
-    runtime.bot.send_message.side_effect = RuntimeError("Telegram unavailable")
-    callback = runtime.queue_factory.call_args.kwargs["replay_message_fn"]
-
-    assert await callback(123, "original", "2026-09-08 10:00 local", False) is None
-    runtime.bot.send_message.assert_awaited_once_with("completed", chat_id=123)
 
 
 @pytest.mark.parametrize("capped", [True, False])

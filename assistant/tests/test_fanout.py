@@ -362,7 +362,7 @@ async def test_agent_dispatches_fan_out_tool(vault: VaultTools) -> None:
     ])
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        reply = await agent.run(chat_id=1, user_message="grade my list")
+        reply = await agent.run("grade my list")
 
     assert calls == [("grade", ["a"])]
     assert reply == "All graded."

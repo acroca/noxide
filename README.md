@@ -1,11 +1,12 @@
-# Noxide — Personal Assistant Bot
+# Noxide — Personal Assistant
 
-A self-hosted personal assistant: **Telegram / optional PWA → GitHub Copilot → markdown vault**.
+A self-hosted personal assistant: **private web app → GitHub Copilot → markdown vault**.
 
-You talk to it in Telegram or its private-network web companion. It remembers what
-you tell it by writing plain markdown files, sets reminders, does the web
-research you'd otherwise open ten tabs for, reads the PDF you forwarded, and
-helps you see what today looks like.
+You talk to it in a small web app on your own network, installed on your phone
+like any other app. It remembers what you tell it by writing plain markdown
+files, sets reminders, does the web research you'd otherwise open ten tabs
+for, reads the PDF you dropped in the vault, and helps you see what today
+looks like.
 
 ```
 you  ›  had a great catch-up with Marco, he's moving to Lisbon in March
@@ -26,12 +27,12 @@ bot  ›  • Dentist at 16:30
   read it in twenty years. Delete the bot tomorrow and your notes are intact.
 - **It runs on a Copilot licence you probably already pay for.** No per-token
   API billing, no second AI subscription. One GitHub Copilot seat covers it,
-  and `/model` switches between Sonnet, Opus and anything else your plan
-  exposes.
-- **Self-hosted storage, restricted access.** Notes and chat archives live on
-  your machine. Telegram access is allowlisted; the optional PWA requires private
-  networking. Model requests go to GitHub Copilot; optional voice transcription
-  goes to ElevenLabs. Web research workers cannot read your vault.
+  and the Model picker in Preferences switches between Sonnet, Opus and
+  anything else your plan exposes.
+- **Self-hosted storage, private access.** Notes and chat archives live on
+  your machine, and the app is reachable only on your private network. Model
+  requests go to GitHub Copilot; optional voice transcription goes to
+  ElevenLabs. Web research workers cannot read your vault.
 - **Memory that compiles, not accumulates.** Rather than a growing pile of
   notes, it keeps an append-only journal of what happened plus a wiki of
   current state, and reconciles the two nightly. Asking "what's the status of
@@ -40,27 +41,27 @@ bot  ›  • Dentist at 16:30
   agent framework. If it does
   something you don't like, you can find it and change it.
 
-It is deliberately **single-user** — a personal bot for you (or your household),
-not a multi-tenant service. The optional PWA runs alongside Telegram, not instead of it.
+It is deliberately **single-user** — a personal assistant for you (or your
+household), not a multi-tenant service. There is no sign-in: whoever can reach
+the app is you.
 
 ## What it can do
 
 | | |
 |---|---|
 | **Notes & memory** | Writes what you tell it into a raw journal + compiled wiki; searches before creating; never edits history |
-| **Reminders & jobs** | One-off (`"in 10 minutes"`, `"tomorrow at 9am"`) and recurring cron jobs, in a markdown table you can hand-edit |
+| **Reminders & jobs** | One-off (`"in 10 minutes"`, `"tomorrow at 9am"`) and recurring cron jobs, in a markdown table you can hand-edit; reminders arrive as push notifications you can reply to |
 | **Web research** | Optional, via a self-hosted [4get](https://git.lolcat.ca/lolcat/4get); runs in an isolated sub-agent with no vault access |
-| **Voice notes** | Transcribed via ElevenLabs Scribe; optional, needs an API key |
-| **Photos** | Sent to the vision model and filed in the vault, driven by your caption |
-| **Documents** | PDFs, scans and text files stored and read on demand — digital PDFs parsed locally, scans transcribed via vision |
-| **Bursts** | Messages that arrive within a second of each other — a WhatsApp share, a few quick lines — are handled as one turn with one reply |
+| **Voice notes** | The app's microphone button records and transcribes via ElevenLabs Scribe; optional, needs an API key |
+| **Photos** | Paste, drop or attach images; sent to the vision model and filed in the vault, driven by your caption |
+| **Documents** | Files already in the vault's `attachments/` folder are read on demand — digital PDFs parsed locally, scans and images transcribed via vision |
 | **One conversation** | No rooms or channels to pick: say what happened and the bot works out which project or area it concerns |
-| **Web companion** | Chat with pasted or attached images, voice notes, a raw read-only Now page, saved drafts and opt-in push; private-network access only |
-| **Threads** | Every message starts a thread; a reply (Telegram reply-to, or Reply in the web app) continues it. The model sees the thread plus the day's recent threads as background |
-| **Conversation archive** | Shared home Telegram/PWA history in SQLite; older text retrieved on demand |
+| **Threads** | Every message starts a thread; Reply continues it. The model sees the thread plus the day's recent threads as background |
+| **Conversation archive** | Private history in SQLite; older text retrieved on demand |
+| **Now page** | `wiki/now.md` shown read-only in the app: today, upcoming, waiting |
 | **Skills** | Stored procedures in markdown that the bot consults — and refines — as it works |
 | **Bulk fan-out** | One instruction over up to 50 items, processed in parallel by read-only worker sub-agents |
-| **Model switching** | `/model` picker, with the active model shown in the group title |
+| **Model switching** | Live Copilot catalog in Preferences; resets to the configured default on restart |
 | **Usage tracking** | Rolling 7-day token report written to `system/usage.md` |
 | **Vault backup** | Optional local git history: one commit per interaction that changed the vault, with the exchange as the commit message. Never pushes |
 | **Offline inbox** | Bot down? Write into `inbox.md` in the vault; at the next startup every entry is processed as if you had texted it |
@@ -69,22 +70,22 @@ not a multi-tenant service. The optional PWA runs alongside Telegram, not instea
 
 ## Quick start
 
-You need a GitHub account with a Copilot licence, a Telegram account, and
-somewhere to run a container.
+You need a GitHub account with a Copilot licence and somewhere to run a
+container. For phone access you also want [Tailscale](https://tailscale.com)
+on the host and your devices.
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) and note the token;
-   get your own user id from [@userinfobot](https://t.me/userinfobot).
-2. Make a directory with a `compose.yml` and `.env` —
-   **[copy them from docs/deployment.md](docs/deployment.md#2-create-the-compose-setup)**.
-3. Authenticate against Copilot once:
+1. Make a directory with a `compose.yml` and `.env` —
+   **[copy them from docs/deployment.md](docs/deployment.md#1-create-the-compose-setup)**.
+2. Authenticate against Copilot once:
    ```bash
    docker compose run --rm assistant auth
    ```
-4. Start it:
+3. Start it:
    ```bash
    docker compose up -d
    ```
-5. Say `/start` to your bot in Telegram, then ask it to **"set up my vault"**.
+4. Open the app (`http://localhost:8080` on the host, or the Tailscale Serve
+   URL from your phone), install it, and ask it to **"set up my vault"**.
 
 Full walkthrough, optional features and operational notes:
 **[docs/deployment.md](docs/deployment.md)**.
@@ -113,25 +114,29 @@ instead of hunting for them.
 The design, the conventions and how to start a vault:
 **[docs/vault.md](docs/vault.md)**.
 
-Conversation text lives separately in `state_dir/companion.sqlite3`, even with
-the PWA disabled. The archive restores completed model context after restart;
-it is evidence of past discussion, not a substitute for current vault knowledge.
+Conversation text lives separately in `state_dir/companion.sqlite3`. The
+archive restores completed model context after restart; it is evidence of
+past discussion, not a substitute for current vault knowledge.
 
-## Commands
+## The app
 
-Most interactions are natural language; Telegram has three commands.
+Chat is the home screen: one conversation, organised in threads. A separate
+Now tab shows `wiki/now.md` as read-only text. Preferences holds the theme,
+notifications, the model picker, Reset context and the install hint. It takes
+pasted or attached images and voice notes, keeps drafts on the device, and
+supports opt-in push notifications for replies, reminders and restarts.
 
-| Command | What it does |
-|---------|--------------|
-| `/start` | A short hello listing what the bot can accept |
-| `/model` | Live Copilot model picker, with configured fallback/custom entries. The group title shows the active one. Resets to the resolved startup default on restart |
-| `/clear` | Resets automatic context and dismisses pending conversation work, retaining searchable archived text and vault notes. The home chat shares this reset with the web chat |
+There is no app password: keep it behind Tailscale Serve or another restricted
+private network. Anyone who can reach it can use the assistant and read its chats.
+
+Noxide is the project; `AGENT_NAME` / `[assistant] name` sets your instance's
+name. It appears in the app, in model identity and as the push title.
 
 ## Web research
 
 Optional and off by default. When enabled, the bot gains a `research` tool for
 anything needing current information — prices, opening hours, news, facts it
-isn't sure of. It reacts 👀 to the message that triggered a search.
+isn't sure of. The message shows "Searching the web…" while it runs.
 
 **How it's isolated.** Research runs in a separate sub-agent with a fresh
 context per call and exactly two tools: search and fetch. It has no vault, no
@@ -152,35 +157,22 @@ Setup: **[docs/deployment.md](docs/deployment.md#web-research)**.
 |---|---|
 | [deployment.md](docs/deployment.md) | Full setup, optional features, upgrades, backups, logs. The Compose files to copy live here |
 | [configuration.md](docs/configuration.md) | Every config key and env var, precedence, startup validation |
-| [vault.md](docs/vault.md) | The vault design, conventions, operations, scheduling, skills, rooms |
+| [vault.md](docs/vault.md) | The vault design, conventions, operations, scheduling, skills |
 | [development.md](docs/development.md) | Dev setup, running locally, layout, adding a tool |
 | [ideas/](docs/ideas/) | Feature backlog, and what was considered and rejected |
 | [AGENTS.md](AGENTS.md) | Detailed architecture reference — what each module does and why |
 
 ## Stack
 
-Python 3.12+ (container: 3.14) with [uv](https://docs.astral.sh/uv/) · `python-telegram-bot`
-(async, long polling) · `httpx` · `APScheduler` · `pydantic-settings` ·
-`dateparser` · `aiohttp` · SQLite · packaged JavaScript/CSS PWA. No LangChain or
-other LLM frameworks.
+Python 3.12+ (container: 3.14) with [uv](https://docs.astral.sh/uv/) · `httpx`
+· `APScheduler` · `pydantic-settings` · `dateparser` · `aiohttp` · SQLite ·
+packaged JavaScript/CSS PWA. No LangChain or other LLM frameworks.
 
 ## Design decisions & notes
 
-The optional [web companion](docs/deployment.md#web-companion-pwa) opens straight
-into Chat, the same conversation as your Telegram home chat. A separate Now
-tab shows `wiki/now.md` as read-only text. It shares the vault and assistant,
-keeps Telegram working, takes pasted or attached images and voice notes, and
-supports opt-in push notifications. No separate frontend deployment.
-
-Noxide is the project; `AGENT_NAME` / `[assistant] name` sets your instance's
-name. It appears in the app, in model identity and as the push title.
-
-The PWA has no app password: keep it behind Tailscale Serve or another restricted
-private network. Anyone who can reach it can use the assistant and read its chats.
-
-- **Small context, durable history.** The home Telegram chat and the web chat share a private SQLite archive organised in threads. A reply runs with its thread's earlier messages; a new message runs with only the newest few threads of the past day as background; earlier text is searchable on demand. Reset context (`/clear`) keeps the archive, clears that background and marks the cut with a divider in the web chat. Current knowledge still belongs in the vault. See [configuration](docs/configuration.md).
-- **Allowlisted users.** `allowed_user_ids` lists the Telegram user ids that may talk to the bot; everyone else is silently ignored. Multiple ids are supported (a household sharing one assistant), but they all share one vault and one conversation per chat — this is not multi-tenancy.
-- **Graceful restarts.** SIGTERM starts a drain: the bot stops fetching, finishes the in-flight run plus everything already queued, waits for any mid-run scheduled job, and only then exits. This is not politeness — stopping the updater acks every fetched update to Telegram, so a container killed mid-drain loses those messages for good. A second signal abandons the drain. The budget is 270s, which is why the Compose service must set `stop_grace_period: 5m`.
+- **Small context, durable history.** The conversation is a private SQLite archive organised in threads. A reply runs with its thread's earlier messages; a new message runs with only the newest few threads of the past day as background; earlier text is searchable on demand. Reset context keeps the archive, clears that background and marks the cut with a divider in the chat. Current knowledge still belongs in the vault. See [configuration](docs/configuration.md).
+- **No accounts.** Access control is the network's job. A household can share one instance, but it is one vault and one conversation — this is not multi-tenancy.
+- **Graceful restarts.** SIGTERM starts a drain: the app stops accepting messages, finishes the runs in flight, waits for any mid-run scheduled job, and only then exits. A second signal abandons the drain. The budget is 270s, which is why the Compose service must set `stop_grace_period: 5m`; a drain cut short tells you which messages were interrupted so you can retry them from the app.
 - **schedule.md as source of truth.** APScheduler uses an in-memory job store only. The markdown file is re-parsed on startup and every 60 seconds, so hand edits take effect within a minute. Rows that don't parse are logged, not silently dropped. On restart, one-off jobs overdue by less than 12 hours fire once; older ones are dropped.
 - **Path jail.** All file tool calls resolve relative to the vault root. Any path escaping it raises a `PermissionError`, reported back to the agent as an error string.
 - **Deployment is documented, not shipped.** There are no Compose files in this repo — they live in [docs/deployment.md](docs/deployment.md) for you to copy. The code has no container paths baked in either: paths default to the working directory, and the image declares its own layout via `VAULT_PATH`/`STATE_DIR`.

@@ -13,9 +13,9 @@ rather not be.
 ## Threat model
 
 Noxide is a single-user, self-hosted assistant holding a private journal. By
-default it makes outbound connections only. The optional PWA companion opens
-a network-protected HTTP listener with **no application authentication**; see
-[deployment](docs/deployment.md#web-companion-pwa) before enabling it. Anyone who
+default it makes outbound connections only, plus one HTTP listener for its
+web app, with **no application authentication**; see
+[deployment](docs/deployment.md#4-open-the-app) before exposing it. Anyone who
 can reach the listener can read conversations and use the assistant. Restrict
 access through Tailscale Serve and tailnet rules (never Funnel), or equivalent
 private-network controls. Keep the backend port bound to localhost. This is not
@@ -37,15 +37,14 @@ the lock screen. Control preview visibility in device notification settings.
 Web drafts and uncertain-submission records are stored unencrypted in browser
 local storage. Uncertain-submission records contain both a client ID and full
 message text and can remain after Clear local drafts to deduplicate uncertain
-sends. Clear the site's browser data to remove all local records. Telegram and web messages, completed model
-context, replies and push subscriptions persist in private SQLite,
-even with the PWA disabled. Protect the
+sends. Clear the site's browser data to remove all local records. Messages, completed model
+context, replies and push subscriptions persist in private SQLite. Protect the
 device, state directory and backups accordingly. Clearing local drafts is not a
 remote device wipe. Reset context retains the archive and starts a new automatic window;
-Delete chat removes saved conversation text, not vault facts, Telegram-side
-messages, pending queue payloads, logs or backups. Non-content tombstones retain
-IDs, conversation keys, timestamps, source, role, reply linkage, generation and
-delivery state to prevent old retries resurrecting deleted messages. SQLite secure_delete is
+nothing in the app deletes saved conversation text, and removing the
+database by hand does not touch vault facts, pending queue payloads, logs or
+backups. Dismissed requests keep their row so old retries cannot resurrect
+reset work. SQLite secure_delete is
 enabled, but this is not a guarantee of forensic erasure on the host or backups.
 Push delivery is best effort, not an acknowledgment.
 
@@ -78,20 +77,13 @@ absolute path. `list_files` re-checks each glob match for the same reason.
 Model-supplied skill slugs are validated against `[a-z0-9-]+` before any path
 join.
 
-**Unauthorized users.** User-generated Telegram updates from ids outside
-`allowed_user_ids` are dropped before processing, including callback queries
-from inline keyboards. The configured or first-learned home chat is pinned, so
-messages in another chat cannot redirect scheduled or proactive output.
-Telegram-declared group migration events are accepted only when they migrate
-that pinned chat.
-
 **Credential exposure in logs.** `httpx` request logging is turned down to
-WARNING at startup, because at INFO it logs full URLs — which for Telegram
-includes the bot token. The OAuth token is written `0600`.
+WARNING at startup, because at INFO it logs full URLs. The OAuth token is
+written `0600`.
 
-**Losing your messages on restart.** SIGTERM starts a drain rather than an
-exit, because stopping the Telegram updater acknowledges every already-fetched
-update. This is a data-integrity property, not just politeness — see
+**Losing work on restart.** SIGTERM starts a drain rather than an exit: runs
+in flight and a mid-run scheduled job get to finish, and anything cut short is
+marked in the chat and pushed to every device — see
 [Graceful restarts](docs/deployment.md#graceful-restarts).
 
 ### What it does not defend against
@@ -104,9 +96,9 @@ forwarding an untrusted document to the bot as you would opening it: probably
 fine, occasionally not. The exfiltration channel this could reach is the
 400-character research question, and every one of those is logged.
 
-**A compromised GitHub or Telegram account.** Whoever holds your Copilot OAuth
-token can spend your Copilot quota; whoever controls an allowlisted Telegram
-account is, as far as the bot is concerned, you.
+**A compromised GitHub account or device.** Whoever holds your Copilot OAuth
+token can spend your Copilot quota; whoever can reach the app on your private
+network is, as far as the assistant is concerned, you.
 
 **The model's judgment.** The agent can create, rewrite, edit, append and move
 files inside the vault; there is no delete tool. The file tools enforce
@@ -121,10 +113,10 @@ markdown and `state/oauth_token` is a plaintext credential at `0600`. The state
 directory also holds private queued messages and the exact consumed inbox
 snapshot. These are as safe as the machine they sit on.
 
-**Denial of service and quota exhaustion.** Telegram's allowlist and private
-network controls are trust gates, not quotas. At most four web runs are admitted
-at once, one unfinished web message per space. Anyone who can reach the web
-service can still consume Copilot quota or fill storage. Use a
+**Denial of service and quota exhaustion.** Private network controls are
+trust gates, not quotas. At most sixteen web messages are in flight at once.
+Anyone who can reach the web service can still consume Copilot quota or fill
+storage. Use a
 private network and reverse-proxy limits rather than treating this personal
 service as hardened public multi-user hosting.
 

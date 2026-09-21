@@ -448,9 +448,8 @@ function renderChat(pageVersion) {
     // with the day only when it differs from the thread's day.
     const article = (m, day) => `
       <article class="message message-${escape(m.role)}" data-message="${escape(m.id)}">
-        <div class="message-body">${m.role === 'user' ? thumbnails(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}" title="${escape(m.source === 'telegram' ? 'Telegram' : 'Web')}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
-        ${m.role === 'assistant' && ['failed', 'partial', 'pending'].includes(m.delivery) ? `<div class="message-status"><span>Telegram delivery: ${escape(m.delivery)}</span></div>` : ''}
-        ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${m.source !== 'telegram' && ['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
+        <div class="message-body">${m.role === 'user' ? thumbnails(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
+        ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
       </article>`;
     const dayOfThread = t => dayOf(t.messages[0].created);
     // The load-earlier button scrolls with the timeline, so it is reached by
@@ -630,10 +629,28 @@ function connectivity() {
 }
 window.addEventListener('online', () => { connectivity(); if (session) route(); else boot(); });
 window.addEventListener('offline', connectivity);
+async function loadModels() {
+  const select = $('#model-select');
+  select.disabled = true;
+  try {
+    const data = await api('models');
+    select.innerHTML = data.models.map(m => `<option value="${escape(m.alias)}">${escape(m.label)}${m.alias === data.default ? ' (default)' : ''}</option>`).join('');
+    select.value = data.current;
+    $('#model-status').textContent = '';
+    select.disabled = false;
+  } catch (e) { $('#model-status').textContent = e.message; }
+}
+$('#model-select').addEventListener('change', async () => {
+  const select = $('#model-select'); select.disabled = true;
+  try { const data = await api('model', { alias: select.value }); toast(`Switched to ${select.options[select.selectedIndex].text.replace(' (default)', '')}.`); $('#model-status').textContent = data.id; }
+  catch (e) { toast(e.message); await loadModels(); }
+  finally { select.disabled = false; }
+});
 async function openSettings() {
   if (!$('#settings').open) $('#settings').showModal();
   const theme = themePreference();
   $$('input[name="theme"]').forEach(input => { input.checked = input.value === theme; });
+  loadModels();
   const supported = 'serviceWorker' in navigator && 'PushManager' in window;
   $('#push-toggle').disabled = !supported || !session?.push_key;
   $('#push-status').textContent = !session?.push_key ? 'Push is not configured. Set pwa.push_contact on your server.' : !supported ? 'Install this app on your Home Screen, or use a browser that supports web push.' : 'Notifications are optional and controlled by this device.';
@@ -685,7 +702,7 @@ $('#push-toggle').addEventListener('click', async () => {
 });
 $('#push-test').addEventListener('click', async () => { try { await api('push/test', {}); toast('Test notification requested.'); } catch (e) { toast(e.message); } });
 $('#reset-context').addEventListener('click', async () => {
-  if (!confirm('Start fresh? The shared Telegram/web context will reset. Saved messages remain visible and can still be retrieved through history tools.')) return;
+  if (!confirm('Start fresh? The assistant will stop seeing earlier messages. Saved messages remain visible and can still be retrieved through history tools.')) return;
   try { await api('reset', {}); $('#settings').close(); await route(); toast('Context reset. Saved conversation kept.'); }
   catch (e) { toast(e.message); }
 });

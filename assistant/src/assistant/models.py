@@ -1,16 +1,20 @@
 """Dynamic model catalog: parse Copilot's /models into picker options.
 
-The /model picker is built from two sources — the static ``[copilot.models]``
+The model picker is built from two sources — the static ``[copilot.models]``
 alias map in config (kept as the offline fallback and for pinned custom ids)
-and the live catalog fetched from the API. Everything here is a pure function
-over already-fetched data; the HTTP call lives in ``copilot.CopilotClient``.
+and the live catalog fetched from the API. The parsing here is pure functions over
+already-fetched data; the HTTP call lives in ``copilot.CopilotClient``, and
+``ModelPicker`` holds the runtime selection.
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # Vendors offered by default. "Azure OpenAI" is mostly legacy models, which
 # the picker flag filters out, but it also hosts current ones (gpt-5-mini).
@@ -31,7 +35,7 @@ class FetchedModel:
 
 @dataclass(frozen=True)
 class ModelOption:
-    """One /model picker entry: the id sent to the API and the button label."""
+    """One picker entry: the id sent to the API and the label shown."""
 
     id: str
     label: str
@@ -98,7 +102,7 @@ def parse_models(payload: dict, vendors: Sequence[str]) -> list[FetchedModel]:
 
 
 def slug_for(model_id: str) -> str:
-    """Short alias for a model id, used in the picker and the group-title suffix."""
+    """Short alias for a model id, used in the picker."""
     return model_id.removeprefix("claude-")
 
 
@@ -170,3 +174,54 @@ def resolve_startup(
         options[default_alias] = ModelOption(id=default_id, label=default_alias)
         alias = default_alias
     return options, alias, None
+
+
+class ModelPicker:
+    """The runtime model switch behind the web app's Preferences.
+
+    Holds the picker options and the selected alias; ``select`` switches the
+    Copilot client. ``refresh`` re-fetches the catalog best-effort, keeping
+    the current and default aliases available even when the catalog no
+    longer lists them, and keeping the cached list when the fetch fails.
+    """
+
+    def __init__(
+        self,
+        options: dict[str, ModelOption],
+        current: str,
+        *,
+        set_model_fn: Callable[[str], None],
+        refresh_fn: Callable[[], Awaitable[dict[str, ModelOption]]] | None = None,
+    ) -> None:
+        self._options = dict(options)
+        self._current = current
+        self._default = current
+        self._set_model = set_model_fn
+        self._refresh = refresh_fn
+
+    def choices(self) -> dict:
+        return {
+            "current": self._current,
+            "default": self._default,
+            "models": [{"alias": alias, "label": option.label, "id": option.id}
+                       for alias, option in self._options.items()],
+        }
+
+    def select(self, alias: str) -> ModelOption:
+        option = self._options[alias]
+        self._set_model(option.id)
+        self._current = alias
+        return option
+
+    async def refresh(self) -> None:
+        if self._refresh is None:
+            return
+        try:
+            fresh = await self._refresh()
+        except Exception:
+            logger.warning("Model catalog refresh failed; keeping the cached list", exc_info=True)
+            return
+        for alias in (self._current, self._default):
+            if alias not in fresh and alias in self._options:
+                fresh[alias] = self._options[alias]
+        self._options = fresh

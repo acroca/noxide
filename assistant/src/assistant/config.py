@@ -23,12 +23,6 @@ class ConfigError(RuntimeError):
 class Config(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
-    # Telegram
-    telegram_bot_token: str = ""
-    allowed_user_ids: list[int] = Field(default_factory=list)
-    # Fallback chat for proactive sends until one is learned from an incoming message
-    default_chat_id: int | None = None
-
     # Copilot — alias → model id map, and the alias used by default
     default_model: str = "sonnet"
     models: dict[str, str] = Field(default_factory=lambda: {"sonnet": "claude-sonnet-5"})
@@ -36,7 +30,7 @@ class Config(BaseSettings):
     # the startup catalog fetch succeeds, the newest model of that family
     # becomes the default instead of default_model (which stays the fallback).
     default_family: str = ""
-    # Vendors offered by the dynamic /model picker
+    # Vendors offered by the model picker
     model_vendors: list[str] = Field(default_factory=lambda: list(DEFAULT_VENDORS))
 
     # ElevenLabs (voice transcription) — optional; an API key from
@@ -56,8 +50,7 @@ class Config(BaseSettings):
     state_dir: Path = Path("state")
     history_exchanges: int = Field(default=5, ge=1)
 
-    # Optional same-process web companion. Public access requires HTTPS.
-    pwa_enabled: bool = False
+    # The web app, served by the same process. Public access requires HTTPS.
     pwa_host: str = "127.0.0.1"
     pwa_port: int = Field(default=8080, ge=1, le=65535)
     pwa_origin: str = "http://localhost:8080"
@@ -113,16 +106,6 @@ class Config(BaseSettings):
         """Check everything the service needs before starting; raise ConfigError listing all problems."""
         problems: list[str] = []
 
-        if not self.telegram_bot_token.strip():
-            problems.append(
-                "telegram.bot_token is not set — create a bot with https://t.me/BotFather "
-                "and set it in config.toml or via TELEGRAM_BOT_TOKEN"
-            )
-        if not self.allowed_user_ids:
-            problems.append(
-                "telegram.allowed_user_ids is empty — add your Telegram user id "
-                "in config.toml or via ALLOWED_USER_IDS, otherwise the bot ignores everyone"
-            )
         try:
             ZoneInfo(self.timezone)
         except Exception:
@@ -159,15 +142,14 @@ class Config(BaseSettings):
                 )
 
         problems.extend(self._maintenance_problems())
-        if self.pwa_enabled:
-            origin = urlsplit(self.pwa_origin)
-            if (origin.scheme not in ("http", "https") or not origin.hostname
-                    or origin.path or origin.query or origin.fragment or origin.username
-                    or origin.password or (origin.scheme == "http"
-                    and origin.hostname not in ("localhost", "127.0.0.1", "::1"))):
-                problems.append("pwa.origin must be an HTTPS origin without a path (HTTP only on localhost)")
-            if self.pwa_push_contact and not self.pwa_push_contact.startswith("mailto:"):
-                problems.append("pwa.push_contact must be a mailto: address, or empty to disable push")
+        origin = urlsplit(self.pwa_origin)
+        if (origin.scheme not in ("http", "https") or not origin.hostname
+                or origin.path or origin.query or origin.fragment or origin.username
+                or origin.password or (origin.scheme == "http"
+                and origin.hostname not in ("localhost", "127.0.0.1", "::1"))):
+            problems.append("pwa.origin must be an HTTPS origin without a path (HTTP only on localhost)")
+        if self.pwa_push_contact and not self.pwa_push_contact.startswith("mailto:"):
+            problems.append("pwa.push_contact must be a mailto: address, or empty to disable push")
 
         if problems:
             raise ConfigError(
@@ -177,9 +159,6 @@ class Config(BaseSettings):
 
 # (TOML section, key) → Config field name.
 _TOML_FIELDS = (
-    ("telegram", "bot_token", "telegram_bot_token"),
-    ("telegram", "allowed_user_ids", "allowed_user_ids"),
-    ("telegram", "default_chat_id", "default_chat_id"),
     ("copilot", "default_model", "default_model"),
     ("copilot", "models", "models"),
     ("copilot", "default_family", "default_family"),
@@ -190,7 +169,6 @@ _TOML_FIELDS = (
     ("assistant", "vault_path", "vault_path"),
     ("assistant", "state_dir", "state_dir"),
     ("assistant", "history_exchanges", "history_exchanges"),
-    ("pwa", "enabled", "pwa_enabled"),
     ("pwa", "host", "pwa_host"),
     ("pwa", "port", "pwa_port"),
     ("pwa", "origin", "pwa_origin"),
@@ -203,8 +181,6 @@ _TOML_FIELDS = (
 
 # Env var → Config field name. Applied after the TOML file so env always wins.
 _ENV_FIELDS = {
-    "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
-    "DEFAULT_CHAT_ID": "default_chat_id",
     "DEFAULT_MODEL": "default_model",
     "DEFAULT_FAMILY": "default_family",
     "FOURGET_URL": "fourget_url",
@@ -213,7 +189,6 @@ _ENV_FIELDS = {
     "VAULT_PATH": "vault_path",
     "STATE_DIR": "state_dir",
     "HISTORY_EXCHANGES": "history_exchanges",
-    "PWA_ENABLED": "pwa_enabled",
     "PWA_HOST": "pwa_host",
     "PWA_PORT": "pwa_port",
     "PWA_ORIGIN": "pwa_origin",
@@ -257,19 +232,6 @@ def load_config(config_path: Path | None = None) -> Config:
         val = os.environ.get(env_key)
         if val is not None:
             data[field_name] = val
-
-    # ALLOWED_USER_IDS is a comma-separated list of integers, e.g. "123456,789012"
-    allowed_ids_env = os.environ.get("ALLOWED_USER_IDS")
-    if allowed_ids_env is not None:
-        try:
-            data["allowed_user_ids"] = [
-                int(uid.strip()) for uid in allowed_ids_env.split(",") if uid.strip()
-            ]
-        except ValueError:
-            raise ConfigError(
-                f"ALLOWED_USER_IDS must be a comma-separated list of numeric Telegram "
-                f"user ids, got {allowed_ids_env!r}"
-            ) from None
 
     if legacy_history:
         logging.getLogger(__name__).warning(

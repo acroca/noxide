@@ -6,7 +6,7 @@ The raw-journal + compiled-wiki design and its operations (ingest/query/compile/
 
 <!-- Reply language, vault-content language, system-file language.
      Delete this section if everything is English. Example:
-     **Always communicate in Spanish** — replies, Telegram messages, scheduled job
+     **Always communicate in Spanish** — replies, reminders, scheduled job
      messages. Vault content stays in the language the user used. System files
      (`AGENTS.md`, skills) are written in English. -->
 

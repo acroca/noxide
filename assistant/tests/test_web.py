@@ -580,7 +580,7 @@ async def test_agent_dispatches_research_tool(vault: VaultTools) -> None:
     ])
 
     with patch("assistant.copilot.get_client", return_value=mock_client):
-        reply = await agent.run(chat_id=1, user_message="what is the answer?")
+        reply = await agent.run("what is the answer?")
 
     assert questions == ["answer to everything?"]
     assert reply == "It's 42."

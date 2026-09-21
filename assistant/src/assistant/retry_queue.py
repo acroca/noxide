@@ -1,21 +1,19 @@
-"""Durable retry queue for work that failed while Copilot was unreachable.
+"""Durable retry queue for one-off scheduled jobs that failed while Copilot was unreachable.
 
-When a user message or a one-off scheduled job fails with a
-``CopilotUnavailableError`` (5xx or network failure after retries), it is
-queued here instead of being lost. A background drain loop retries the head
-of the queue with exponential backoff — the retry itself is the health probe,
-so there is no separate health check that could pass while chat still fails.
+When a one-off job's run fails with a ``CopilotUnavailableError`` (5xx or
+network failure after retries), it is queued here instead of being lost — its
+row has already left ``schedule.md``, so nothing else would fire it again. A
+background drain loop retries the head of the queue with exponential backoff;
+the retry itself is the health probe, so there is no separate health check
+that could pass while chat still fails.
 
 The queue is persisted to ``state_dir/pending_runs.jsonl`` and reloaded at
 startup, so a restart mid-outage loses nothing. An item is removed only after
-its replay fully succeeds: a crash mid-replay reprocesses (the replay prompts
-warn the model the work may have been partially done) rather than loses.
+its replay fully succeeds: a crash mid-replay reprocesses (the replay prompt
+warns the model the work may have been partially done) rather than loses.
 
-Items enqueued in this process are *hot* — the failed turn still sits in the
-conversation's in-memory history, so replay can resume it in place. Items
-loaded from disk are *cold* — history is gone and the original text must be
-replayed from scratch. The distinction is passed to the message replay
-callback; how to act on it is the agent's business (see Agent.retry_message).
+Web messages never queue here: the app marks them unavailable and the user
+retries them by hand.
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ import json
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,9 +38,6 @@ QUEUE_FILENAME = "pending_runs.jsonl"
 _BACKOFF_INITIAL = 30.0
 _BACKOFF_MAX = 300.0
 
-# Replays a queued user message: (chat_id, text, queued_at, hot).
-# Raises CopilotUnavailableError while the outage lasts.
-ReplayMessageFn = Callable[..., Awaitable[None]]
 # Replays a queued one-off job prompt (already carrying its catch-up prefix).
 ReplayJobFn = Callable[[str], Awaitable[None]]
 # Notifies about an item dropped after a non-outage replay failure.
@@ -55,21 +50,12 @@ def _next_backoff(delay: float) -> float:
 
 @dataclass(frozen=True)
 class PendingItem:
-    kind: str  # "message" | "job"
-    text: str  # message text, or the job's raw prompt
+    text: str  # the job's raw prompt
     queued_at: str  # local stamp, e.g. "2026-08-17 15:08 local"
-    chat_id: int | None = None
-    # In-memory only, never serialized: items reloaded from disk are cold.
-    hot: bool = False
-    message_id: str | None = None
 
     def to_json(self) -> str:
-        record = {"kind": self.kind, "text": self.text, "queued_at": self.queued_at}
-        if self.kind == "message":
-            record["chat_id"] = self.chat_id
-            if self.message_id is not None:
-                record["message_id"] = self.message_id
-        return json.dumps(record, ensure_ascii=False)
+        return json.dumps({"kind": "job", "text": self.text, "queued_at": self.queued_at},
+                          ensure_ascii=False)
 
 
 def _parse_item(line: str) -> PendingItem | None:
@@ -77,38 +63,26 @@ def _parse_item(line: str) -> PendingItem | None:
         record = json.loads(line)
     except json.JSONDecodeError:
         return None
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or record.get("kind") != "job":
+        # "message" records queued Telegram messages; that transport is gone.
         return None
-    kind, text, queued_at = record.get("kind"), record.get("text"), record.get("queued_at")
+    text, queued_at = record.get("text"), record.get("queued_at")
     if not isinstance(text, str) or not isinstance(queued_at, str):
         return None
-    if kind == "job":
-        return PendingItem(kind="job", text=text, queued_at=queued_at)
-    if kind == "message" and isinstance(record.get("chat_id"), int):
-        # Records from before topics were removed also carry a thread_id; it is ignored.
-        return PendingItem(
-            kind="message",
-            text=text,
-            queued_at=queued_at,
-            chat_id=record["chat_id"],
-            message_id=record.get("message_id") if isinstance(record.get("message_id"), str) else None,
-        )
-    return None
+    return PendingItem(text=text, queued_at=queued_at)
 
 
 class RetryQueue:
-    """FIFO of outage-failed work, drained with backoff once Copilot answers."""
+    """FIFO of outage-failed jobs, drained with backoff once Copilot answers."""
 
     def __init__(
         self,
         state_dir: Path,
-        replay_message_fn: ReplayMessageFn,
         replay_job_fn: ReplayJobFn,
         notify_drop_fn: NotifyDropFn | None = None,
         tz_name: str = "UTC",
     ) -> None:
         self._path = state_dir / QUEUE_FILENAME
-        self._replay_message_fn = replay_message_fn
         self._replay_job_fn = replay_job_fn
         self._notify_drop_fn = notify_drop_fn
         self._tz = ZoneInfo(tz_name)
@@ -119,35 +93,11 @@ class RetryQueue:
     def pending(self) -> int:
         return len(self._items)
 
-    def attach_archive(self, archive, space_fn) -> None:
-        """Give pre-upgrade queue entries durable identities before accepting resets."""
-        migrated = deque()
-        for item in self._items:
-            if item.kind == "message" and item.message_id is None:
-                message_id = archive.insert(space_fn(item.chat_id), "user", item.text,
-                                            "unavailable", source="telegram")
-                item = replace(item, message_id=message_id)
-            migrated.append(item)
-        self._items = migrated
-        self._persist()
-
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def enqueue_message(self, chat_id: int, text: str, message_id: str | None = None) -> None:
-        item = PendingItem(
-            kind="message",
-            text=text,
-            queued_at=self._local_stamp(),
-            chat_id=chat_id,
-            hot=True,
-            message_id=message_id,
-        )
-        self._append(item)
-        logger.info("Queued message for retry (chat_id=%d, %d pending)", chat_id, len(self._items))
-
     def enqueue_job(self, prompt: str) -> None:
-        item = PendingItem(kind="job", text=prompt, queued_at=self._local_stamp(), hot=True)
+        item = PendingItem(text=prompt, queued_at=self._local_stamp())
         self._append(item)
         logger.info("Queued one-off job for retry (%d pending): %.80r", len(self._items), prompt)
 
@@ -174,7 +124,7 @@ class RetryQueue:
                 raise
             except Exception as exc:
                 # A poison item must not wedge the queue behind it.
-                logger.exception("Dropping queued %s after non-outage replay failure", item.kind)
+                logger.exception("Dropping queued job after non-outage replay failure")
                 self._pop_head()
                 if self._notify_drop_fn is not None:
                     try:
@@ -184,23 +134,14 @@ class RetryQueue:
                 continue
             delay = _BACKOFF_INITIAL
             self._pop_head()
-            logger.info("Replayed queued %s from %s (%d left)", item.kind, item.queued_at, len(self._items))
+            logger.info("Replayed queued job from %s (%d left)", item.queued_at, len(self._items))
 
     async def _replay(self, item: PendingItem) -> None:
-        if item.kind == "message":
-            await self._replay_message_fn(
-                chat_id=item.chat_id,
-                text=item.text,
-                queued_at=item.queued_at,
-                hot=item.hot,
-                **({"message_id": item.message_id} if item.message_id is not None else {}),
-            )
-        else:
-            # queued_at is when the run failed, not the row's due time — the
-            # row may already have fired late under the misfire grace.
-            await self._replay_job_fn(
-                f"[catch-up: failed at {item.queued_at} during a Copilot outage] {item.text}"
-            )
+        # queued_at is when the run failed, not the row's due time — the row
+        # may already have fired late under the misfire grace.
+        await self._replay_job_fn(
+            f"[catch-up: failed at {item.queued_at} during a Copilot outage] {item.text}"
+        )
 
     # ------------------------------------------------------------------
     # Persistence: whole-file atomic rewrite, items are few and small
@@ -216,11 +157,11 @@ class RetryQueue:
                 continue
             item = _parse_item(line)
             if item is None:
-                logger.warning("Skipping malformed retry-queue line: %.200r", line)
+                logger.warning("Skipping unusable retry-queue line: %.200r", line)
                 continue
             self._items.append(item)
         if self._items:
-            logger.info("Loaded %d pending item(s) from %s", len(self._items), self._path.name)
+            logger.info("Loaded %d pending job(s) from %s", len(self._items), self._path.name)
             self._wake.set()
 
     def _append(self, item: PendingItem) -> None:
@@ -233,10 +174,9 @@ class RetryQueue:
         self._persist()
 
     def _persist(self) -> None:
-        # Never raises: a disk error mid-enqueue would rob the user of any
-        # reply, and mid-drain it would kill the drain task. The file is
-        # rewritten from memory every time, so the next successful persist
-        # heals; until then the queue lives in memory only.
+        # Never raises: a disk error mid-drain would kill the drain task. The
+        # file is rewritten from memory every time, so the next successful
+        # persist heals; until then the queue lives in memory only.
         try:
             atomic_write_text(
                 self._path, "".join(item.to_json() + "\n" for item in self._items)

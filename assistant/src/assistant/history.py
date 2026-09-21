@@ -175,7 +175,7 @@ class ConversationHistory:
         first = self._exchanges[-self._window:][0][0]["id"] if self._exchanges else None
         return (f"[conversation history: {omitted} older exchanges omitted; "
                 f"get_history before_id={first} or search_history can retrieve them. "
-                "History is available only since restart or /clear.]")
+                "History is available only since restart or a context reset.]")
 
     def compact_tool_results(self) -> None:
         for i, msg in enumerate(self._history):

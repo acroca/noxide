@@ -2,7 +2,7 @@
 
 The Copilot chat API has no audio modality, so voice notes go through the
 ElevenLabs speech-to-text API instead (auth: an API key from elevenlabs.io,
-read from ELEVENLABS_API_KEY). Scribe accepts Telegram's OGG/Opus voice
+read from ELEVENLABS_API_KEY). Scribe accepts browser recordings and OGG/Opus voice
 notes — and every other common audio format — directly, so no local
 conversion or chunking is needed.
 """

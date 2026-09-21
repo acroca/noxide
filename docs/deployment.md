@@ -4,8 +4,9 @@ The full setup, start to finish. For the short version see the
 [quick start](../README.md#quick-start); for every config key see
 [configuration.md](configuration.md).
 
-**You need:** a GitHub account with a Copilot licence, a Telegram account, and
-somewhere to run a container.
+**You need:** a GitHub account with a Copilot licence and somewhere to run a
+container. For phone access, [Tailscale](https://tailscale.com) on the host
+and your devices.
 
 > **The Compose files live here, not in the repo.** Copy them out of this page
 > into your own deployment directory. Nothing to clone, nothing to keep in sync
@@ -14,14 +15,7 @@ somewhere to run a container.
 
 ---
 
-## 1. Create a Telegram bot
-
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot` and follow the prompts
-3. Copy the **bot token** (looks like `123456:ABC-DEF...`)
-4. Find your own Telegram user ID: message [@userinfobot](https://t.me/userinfobot)
-
-## 2. Create the Compose setup
+## 1. Create the Compose setup
 
 ```bash
 mkdir noxide && cd noxide
@@ -36,18 +30,23 @@ services:
     image: ghcr.io/acroca/noxide:latest
     restart: unless-stopped
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
-      DEFAULT_MODEL: ${DEFAULT_MODEL:-sonnet}
+      AGENT_NAME: ${AGENT_NAME:-Noxide}
       TIMEZONE: ${TIMEZONE:-UTC}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-sonnet}
+      PWA_HOST: "0.0.0.0"
+      PWA_ORIGIN: ${PWA_ORIGIN}
+      PWA_PUSH_CONTACT: ${PWA_PUSH_CONTACT:-}
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       FOURGET_URL: ${FOURGET_URL:-}
+    ports:
+      # Host localhost only; phones reach it through Tailscale Serve (below).
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./vault:/data/vault
       - ./state:/data/state
     # Required — see "Graceful restarts" below. Without it Docker's 10s
-    # default kills the bot mid-drain and loses messages it already
-    # acknowledged to Telegram.
+    # default kills the assistant mid-run: in-flight replies and scheduled
+    # jobs get to finish, and the app tells you what was cut short.
     stop_grace_period: 5m
 ```
 
@@ -57,24 +56,28 @@ two volumes are all a basic setup needs — no config file.
 `.env`:
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-ALLOWED_USER_IDS=123456789
 TIMEZONE=Europe/Madrid
+# The exact origin you will open the app at: http://localhost:8080 on the
+# host, or the HTTPS URL Tailscale Serve prints (no trailing slash).
+PWA_ORIGIN=http://localhost:8080
+# AGENT_NAME=Juniper
 # DEFAULT_MODEL=sonnet
-# Optional — enables voice messages, see below
+# Optional — enables push notifications
+# PWA_PUSH_CONTACT=mailto:you@example.com
+# Optional — enables voice notes, see below
 # ELEVENLABS_API_KEY=...
 # Optional — enables web research with the service below
 # FOURGET_URL=http://fourget
 ```
 
-Multiple users go in `ALLOWED_USER_IDS` separated by commas. Then:
+Then:
 
 ```bash
 chmod 600 .env
 docker compose pull
 ```
 
-## 3. Copilot device-flow auth (one-time)
+## 2. Copilot device-flow auth (one-time)
 
 ```bash
 docker compose run --rm assistant auth
@@ -88,7 +91,7 @@ docker compose run --rm assistant auth
 The token persists across restarts and upgrades. You only redo this if you
 revoke it or lose the state directory.
 
-## 4. Start
+## 3. Start
 
 ```bash
 docker compose up -d
@@ -97,9 +100,27 @@ docker compose logs -f
 
 `Ctrl+C` stops following the logs; the container keeps running.
 
-## 5. First message
+## 4. Open the app
 
-Open Telegram, find your bot, send `/start`. Then try:
+On the host, open `http://localhost:8080`. There is no sign-in: the app relies
+entirely on your network for access control. **Anyone who can reach it has
+full access to the assistant and conversations.** Do not expose it to the
+internet or an untrusted LAN.
+
+For phones, run `tailscale serve --bg http://127.0.0.1:8080` on the host, set
+`PWA_ORIGIN` in `.env` to the HTTPS URL it prints (without a trailing slash)
+and restart. Use Serve, not public Funnel, and restrict permitted devices and
+users in your tailnet rules. If you use a different host port, point Serve at
+that port instead.
+
+A different private HTTPS proxy is also possible; preserve the browser's Host
+header when forwarding. HTTPS alone does not restrict access. The app rejects
+unexpected Host and mutation Origin headers and does not enable CORS, but a
+direct client can set those headers: they are not an authentication boundary.
+The app is served at the origin root, not under a URL prefix. HTTPS is
+required for phone PWA features and push notifications.
+
+Then try:
 
 ```
 What time is it?
@@ -107,76 +128,22 @@ Note that I had a great meeting with Alice today.
 Remind me to call Marco in 30 minutes.
 ```
 
-If the bot ignores you entirely, your user ID is not in `ALLOWED_USER_IDS` —
-that is the designed behaviour for strangers, and the log line
-`Ignoring update from user_id=...` confirms it.
-
 Next: set up your vault — see [vault.md](vault.md#starting-a-vault).
 
 ---
 
-## Optional features
+## The app
 
-### Web companion (PWA)
-
-The companion runs beside Telegram in the same Python process. Chat is the
-home screen: one conversation, the same one as the pinned Telegram home chat,
-sharing its archive and threads. Other Telegram chats remain isolated. Now is a read-only,
-plain-text display of `wiki/now.md`, preserving all sections and Markdown as
-written. Opening Now never calls the model. There are no dashboard cards,
-project navigation, or task/reminder buttons; make changes through chat.
-Conversations from the earlier project-based and topic-based web chats are
-merged into the one chat on the first start after the upgrade.
+Chat is the home screen: one conversation, organised in threads. Now is a
+read-only, plain-text display of `wiki/now.md`, preserving all sections and
+Markdown as written. Opening Now never calls the model. There are no
+dashboard cards, project navigation, or task/reminder buttons; make changes
+through chat.
 
 On desktop, Enter sends and Shift+Enter inserts a newline. On touch-first mobile
 devices, Return inserts a newline and the adjacent send button submits. Bottom
 safe-area padding is reduced while the composer is focused; iOS's own keyboard
 accessory toolbar is outside the PWA's control.
-
-For a native local run, set these environment variables before starting the
-usual `assistant run` command:
-
-```dotenv
-PWA_ENABLED=true
-AGENT_NAME=Juniper
-PWA_ORIGIN=http://localhost:8080
-# Optional, enables push registration:
-PWA_PUSH_CONTACT=mailto:you@example.com
-```
-
-Open `http://localhost:8080` directly; there is no sign-in. The PWA relies entirely
-on your network for access control. **Anyone who can reach it has full access to
-the assistant and conversations.** Do not expose it to the internet or an
-untrusted LAN. Remove `PWA_PASSWORD` from older Compose/.env configurations; it
-is no longer used, and obsolete stored sessions are removed on startup.
-
-For the Compose service above, add:
-
-```yaml
-    environment:
-      # Keep the existing Telegram, timezone, and other environment entries.
-      PWA_ENABLED: "true"
-      AGENT_NAME: ${AGENT_NAME:-Noxide}
-      PWA_HOST: "0.0.0.0"
-      PWA_ORIGIN: ${PWA_ORIGIN}
-      PWA_PUSH_CONTACT: ${PWA_PUSH_CONTACT:-}
-    ports:
-      - "127.0.0.1:8080:8080"
-```
-
-Merge these entries into the existing `environment` mapping, not a second
-mapping. Keep the published port bound to host localhost. For phone access,
-run `mise exec -- tailscale serve --bg http://127.0.0.1:8080` on the host and set
-`PWA_ORIGIN` to the HTTPS URL it prints, without a trailing slash. Use Serve,
-not public Funnel, and restrict permitted devices/users in your tailnet rules.
-If you use a different host port, point Serve at that port instead.
-
-A different private HTTPS proxy is also possible; preserve the browser's Host
-header when forwarding. HTTPS alone does not restrict access. The app rejects
-unexpected Host and mutation Origin headers and does not enable CORS, but a
-direct client can set those headers: they are not an authentication boundary.
-The app is served at the origin root, not under a URL prefix. HTTPS remains
-required for phone PWA features and push notifications.
 
 **Install and notifications.** Use the browser's Install action. On iPhone,
 use Share → Add to Home Screen; supported iOS versions require installation
@@ -186,23 +153,33 @@ automatically generated VAPID key; keep `state_dir/webpush.pem` backed up.
 The supported push hosts are Chrome/FCM, Firefox, Apple and Windows browser
 push services. Unsupported endpoints are rejected, and redirects are disabled.
 Notifications use the instance name as their title and include the reply or
-reminder text (up to 500 characters). Content can appear on your lock screen; control previews
-in your device notification settings. Ordinary Telegram replies still notify
-only through Telegram. A reply or reminder waits five seconds before any push
-goes out; if a focused device that you have used in the last few minutes is
-showing that conversation scrolled to the end by then, no device is notified. Being on the Now tab, unfocused, or scrolled up
-reading older messages does not count, and a device that starts showing the
-reply after the window still gets the push. Opening one opens the chat.
-Delivery depends on the OS, browser permissions and network; Telegram remains
-the primary reminder delivery channel, and successful agent-originated Telegram
-sends are archived and shown in the web chat too.
+reminder text (up to 500 characters). Content can appear on your lock screen;
+control previews in your device notification settings. A reply or reminder
+waits five seconds before any push goes out; if a focused device that you
+have used in the last few minutes is showing that conversation scrolled to the
+end by then, no device is notified. Being on the Now tab, unfocused, or
+scrolled up reading older messages does not count, and a device that starts
+showing the reply after the window still gets the push. Opening one opens
+the chat, in reply mode on that thread. Delivery depends on the OS, browser
+permissions and network. Push is the only channel for reminders: without it,
+a scheduled run's message waits in the chat until you open the app.
 
-**Restart notices.** The bot tells Telegram when it is restarting and when it
-is back. The web app can hear the same: under Notifications, "Tell this device
-when … restarts" turns restart notices on for that device only, since a bot
-restarted on every deploy would otherwise notify every phone. A start that
-follows an app update says so, and opening the app then offers the reload. A
-restart that had to drop queued messages, or a reminder dropped after a Copilot
+**Reminders are threads.** A scheduled run's message is archived as its own
+thread in the chat. Reply to it (or swipe it on a phone) and the assistant
+answers with the reminder in front of it; a message typed on its own after a
+reminder still sees it as background.
+
+**Model.** Preferences has a Model dropdown listing the live Copilot catalog,
+refreshed each time Preferences opens, with the configured aliases as fallback
+or pinned entries. The selection lasts until the assistant restarts, when it
+returns to the configured default. See
+[configuration.md](configuration.md#model-selection).
+
+**Restart notices.** Under Notifications, "Tell this device when … restarts"
+turns restart notices on for that device only, since an assistant restarted
+on every deploy would otherwise notify every phone. A start that follows an
+app update says so, and opening the app then offers the reload. A restart that
+had to interrupt messages in progress, or a reminder dropped after a Copilot
 outage, notifies every registered device regardless. Restart notices keep their
 own notification slot, never replace an unread reply and never change the badge.
 
@@ -218,8 +195,9 @@ deduplication if a response was lost. Clear the site's browser data to remove
 all local records; this also affects installation caches and device preferences.
 On restart, unfinished messages are marked interrupted; they are not blindly
 replayed because they may have performed writes. Copilot outages leave a saved
-message with an explicit Retry action. The same-process retry preserves active
-agent work; after restart it carries a partial-processing warning.
+message with an explicit Retry action. The same-process retry resumes the
+active agent work in place; after a restart it carries a partial-processing
+warning.
 
 After the first successful service-worker installation, opening without a
 server connection loads the cached interface and shows **[assistant name] is unavailable**
@@ -242,41 +220,36 @@ and freshly fetched UI files. The cache version is a hash of the packaged UI
 files stamped by the server, so any release that changes them is a new
 version; unfinished downloads do not replace the currently installed worker.
 
-Telegram inputs (including combined bursts, voice transcripts and attachment
-references) and final assistant replies are archived alongside web messages in
-`state_dir/companion.sqlite3`, even when the PWA is disabled. The web timeline
-labels each message Telegram or Web. Existing web exchanges are migrated once;
-Telegram recording starts with this version, without downloading old backlog.
-The chat is organised in threads: sending a message starts one, and Reply (or a
-Telegram reply) continues it. The model sees the whole thread it is answering in,
-plus the newest few threads of the past day as background, so a reminder answered
-with a bare "done" is still understood. Older completed text
-remains available through `get_history` and literal `search_history`; raw tool
-protocol and reasoning are not persisted. The vault remains the authority for
-current knowledge, not the chat archive.
+**The archive.** Messages, final assistant replies and scheduled-run
+deliveries are archived in `state_dir/companion.sqlite3`. The chat is
+organised in threads: sending a message starts one, and Reply continues it.
+The model sees the whole thread it is answering in, plus the newest few
+threads of the past day as background, so a reminder answered with a bare
+"done" is still understood. Older completed text remains available through
+`get_history` and literal `search_history`; raw tool protocol and reasoning
+are not persisted. The vault remains the authority for current knowledge, not
+the chat archive.
 
-**Reset context** (in Preferences; also Telegram `/clear`) clears the background of recent threads
+**Reset context** (in Preferences) clears the background of recent threads
 without deleting saved messages; a thread replied to afterwards still carries
 its own earlier messages. Older text is still retrievable explicitly.
 It dismisses pending conversation work, but does not cancel
-independent scheduled jobs. The web chat draws a "Context reset" divider at
+independent scheduled jobs. The chat draws a "Context reset" divider at
 the cut, so you can see which messages the model no longer has in front of it.
-It does not change messages in Telegram itself, vault files, or backups.
+It does not change vault files or backups.
 
 There is no way to delete archived text from the app. If you need a
 conversation gone from disk, stop the service and remove or edit
 `state_dir/companion.sqlite3`; backups and pending queue files can still hold
 copies. There is no automatic retention cutoff.
 Stop the service before copying its SQLite database for a consistent backup.
-Generated replies remain readable in the web timeline if Telegram delivery fails;
-the delivery status is recorded separately, without rerunning completed writes.
 
 **Images and voice.** The composer takes images three ways: the attach
 button, drag and drop, and pasting a screenshot or copied picture straight into
 the text field. Up to four per message; each is decoded on the device and
 re-encoded as JPEG within 2000px (so iPhone HEIC photos and multi-megabyte
 originals arrive as ordinary JPEGs), stored in the vault's `attachments/`
-folder exactly like a Telegram photo, shown to the model for that turn only,
+folder, shown to the model for that turn only,
 and rendered as a thumbnail in the timeline. The server accepts only JPEG,
 PNG, WebP and GIF bodies up to 20 MB and checks the bytes match the declared
 type. When `ELEVENLABS_API_KEY` is set, a microphone button records a voice
@@ -284,29 +257,32 @@ note in the browser (tap to start, tap to stop, up to five minutes) and puts
 the transcript into the text field for you to review and send; nothing is
 sent automatically. Recording needs microphone permission and, on iPhone, an
 installed app on a supported iOS version. Without the key the button is
-hidden. Token streaming, automatic background retries and replacing Telegram
-entirely are not part of this version. Built-in maintenance schedules are
-configured server-side.
+hidden. Token streaming and automatic background retries are not part of
+this version. Built-in maintenance schedules are configured server-side.
 
-### Voice messages
+---
+
+## Optional features
+
+### Voice notes
 
 The Copilot API has no audio modality, so voice notes go through the
 [ElevenLabs](https://elevenlabs.io) speech-to-text API (Scribe), which takes
-Telegram's OGG/Opus voice notes directly and auto-detects the language:
+the browser's recording directly and auto-detects the language:
 
 1. Create an API key at <https://elevenlabs.io/app/settings/api-keys>
 2. Set it as `ELEVENLABS_API_KEY` in `.env` and restart
 
-The bot replies to the transcript directly, without echoing it back. Without
-the key, voice messages get a setup hint instead.
+The transcript lands in the text field for you to review before sending.
+Without the key, the microphone button is hidden.
 
 The ElevenLabs free tier includes some transcription hours per month — fine
-for personal voice notes, and the bot tells you when it hits the limit.
+for personal voice notes, and the app tells you when it hits the limit.
 
 ### Web research
 
 Needs a [4get](https://git.lolcat.ca/lolcat/4get) instance. Run one alongside
-the bot, on the same Compose network and with no published ports.
+the assistant, on the same Compose network and with no published ports.
 
 **1.** Add the service to your `compose.yml`. The `research` profile keeps it
 out of a plain `docker compose up`:
@@ -327,8 +303,8 @@ No config file or secret is needed. Leave `FOURGET_BOT_PROTECTION` unset: it
 gates the API behind a captcha the assistant cannot solve, and the service is
 only reachable from the Compose network anyway.
 
-**2.** Start it, then point the bot at it — `FOURGET_URL=http://fourget` in
-`.env`, or `[web] fourget_url` in `config.toml` — and restart the assistant:
+**2.** Start it, then point the assistant at it — `FOURGET_URL=http://fourget`
+in `.env`, or `[web] fourget_url` in `config.toml` — and restart the assistant:
 
 ```bash
 docker compose --profile research up -d
@@ -361,34 +337,46 @@ docker compose pull && docker compose up -d
 `latest` tracks `main`. For deployments you want to reason about, pin a release
 tag instead: `ghcr.io/acroca/noxide:v1.0.0`.
 
+#### Upgrading from a Telegram-era deployment
+
+Telegram support was removed. Delete the `[telegram]` section and the
+`TELEGRAM_BOT_TOKEN` / `ALLOWED_USER_IDS` / `DEFAULT_CHAT_ID` / `PWA_ENABLED`
+entries from your config and Compose files (they are ignored if left), add
+the `PWA_*` entries and the port mapping shown above, and stop the bot at
+BotFather if you like. The conversation archive keeps working: Telegram-era
+rows stay in the database untouched but are never shown, the Telegram lookup
+tables are dropped on the first start, and `state/chat_id` is unused and can
+be deleted. Any Telegram messages still in the outage retry queue are dropped
+with a log line.
+
 ### Backups
 
 Everything that matters is in two directories:
 
 - `vault/` — your notes. Plain markdown. The built-in backup below gives it a
   full git history — and an undo for anything the model gets wrong.
-- `state/` — the OAuth token, remembered chat id, usage JSONL, pending outage
-  retries, maintenance bookkeeping, and the consumed inbox snapshot. With
-  backup enabled, it also holds `vault.git` by default. Losing it can lose
-  queued work and backup history or replay already-processed captures, not
-  just require re-authentication.
+- `state/` — the OAuth token, usage JSONL, pending outage retries of
+  scheduled jobs, maintenance bookkeeping, and the consumed inbox snapshot.
+  With backup enabled, it also holds `vault.git` by default. Losing it can
+  lose queued work and backup history or replay already-processed captures,
+  not just require re-authentication.
 
-`state/companion.sqlite3` is the shared Telegram/web conversation archive,
-including completed context, delivery status and subscriptions.
-It exists even with the PWA disabled. Back it up as private data. Only unfinished
-tool protocol remains in memory; interrupted work is never restored as completed.
+`state/companion.sqlite3` is the conversation archive, including completed
+context and push subscriptions. Back it up as private data. Only unfinished
+tool protocol remains in memory; interrupted work is never restored as
+completed.
 
 #### Vault git backup
 
-Set `[backup] enabled = true` (or `BACKUP_ENABLED=true`) and the bot keeps a
-**local-only** git history of the vault:
+Set `[backup] enabled = true` (or `BACKUP_ENABLED=true`) and the assistant
+keeps a **local-only** git history of the vault:
 
 - Every interaction that changes the vault becomes one commit. The commit
-  message carries the exchange — your message and the bot's reply (or the job
+  message carries the exchange — your message and the reply (or the job
   prompt and its close, for scheduled runs) — so `git log` doubles as a record
-  of what happened and how it affected the vault. (One known blur: two rooms
+  of what happened and how it affected the vault. (One known blur: two threads
   writing the *same file* at nearly the same moment can land both edits in
-  the first room's commit — content is never lost, only the attribution; see
+  the first thread's commit — content is never lost, only the attribution; see
   [ideas/backup-attribution-race.md](ideas/backup-attribution-race.md).)
 - A sweep every few minutes (and one at startup) commits changes no run made:
   edits synced in from other devices, or writes orphaned by a crash.
@@ -427,21 +415,21 @@ vgit config core.worktree "$HOME/path/to/vault"
 To keep noisy files out of history (say, Obsidian's ever-churning workspace
 state), add patterns to `vault.git/info/exclude` — same syntax as
 `.gitignore`, but it lives in the git dir so the vault stays free of git
-artifacts. The bot appends its own entries there and preserves yours across
-restarts:
+artifacts. The assistant appends its own entries there and preserves yours
+across restarts:
 
 ```text
 .obsidian/workspace*
 ```
 
-Avoid running your own `git commit` against this repo while the bot is up; a
-held `index.lock` makes the bot skip that backup cycle (the next sweep picks
+Avoid running your own `git commit` against this repo while the assistant is
+up; a held `index.lock` makes it skip that backup cycle (the next sweep picks
 the changes up).
 
 #### Restoring
 
-To roll back a single file, write the old version back and let the bot's next
-sweep commit the revert:
+To roll back a single file, write the old version back and let the next sweep
+commit the revert:
 
 ```bash
 vgit show HEAD~2:wiki/now.md > /path/to/vault/wiki/now.md
@@ -453,25 +441,24 @@ For a full restore into a fresh or emptied vault directory:
 git --git-dir=/path/to/state/vault.git --work-tree=/path/to/vault checkout -f main
 ```
 
-Then restart the bot. Restore `state/` deliberately: an older retry queue or
-inbox checkpoint can replay work already processed, while omitting the state
-can lose queued work. Protect both directories in your backups.
+Then restart the assistant. Restore `state/` deliberately: an older retry
+queue or inbox checkpoint can replay work already processed, while omitting
+the state can lose queued work. Protect both directories in your backups.
 
 ### Graceful restarts
 
 `stop_grace_period: 5m` on the service is required, not advisory.
 
-On SIGTERM the bot drains: it stops fetching, finishes the in-flight run plus
-everything already queued, waits for any mid-run scheduled job, then exits.
-This is a data-integrity property. Stopping the Telegram updater performs a
-final `getUpdates` that **acknowledges every update already fetched**, so those
-messages will never be redelivered — killing the process between that ack and
-the handler loses them permanently.
+On SIGTERM the assistant drains: it stops accepting new messages, finishes the
+runs in flight, waits for any mid-run scheduled job, then exits. A run cut off
+halfway may have written to the vault already, and a reminder mid-delivery
+would be lost, so the drain is a data-integrity property.
 
 The drain budget is 270s, deliberately under the 5m grace period. If it runs
-out the bot tells you how many messages it dropped so you can resend. A second
-SIGTERM abandons the drain immediately, so an impatient restart is never
-hostage to a wedged run.
+out, the app tells every device how many messages in progress were
+interrupted; they are marked in the chat and can be retried. A second SIGTERM
+abandons the drain immediately, so an impatient restart is never hostage to a
+wedged run.
 
 ### Logs
 
@@ -479,11 +466,10 @@ hostage to a wedged run.
 
 | Line | Meaning |
 |---|---|
-| `Ignoring update from user_id=...` | Someone not on the allowlist messaged the bot |
+| `Web app listening at ...` | The app is up at that origin |
 | `Copilot API error 4xx` | Usually a bad model id — the response body is logged |
 | `Ignoring unparseable row in system/schedule.md` | A hand-edited job row is malformed and will not run |
 | `Registered job <id>` | A scheduled job was picked up from `schedule.md` |
 | `Dropping stale job <id>` | A one-off job was more than 12h overdue at startup |
 
-`httpx` is pinned to WARNING on purpose: at INFO it logs full request URLs,
-which for Telegram includes the bot token.
+`httpx` is pinned to WARNING on purpose: at INFO it logs full request URLs.

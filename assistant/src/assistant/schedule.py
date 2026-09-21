@@ -196,7 +196,7 @@ class Scheduler:
         self._maintenance = maintenance_state
         for job in self._builtins.values():
             self._add_cron_job(job.id, job.cron, job.prompt)
-        # Jobs run outside the Telegram update queue, so shutdown has to wait
+        # Jobs run outside the web app's request tasks, so shutdown has to wait
         # on them separately or a mid-run reminder dies with the process.
         self._inflight: set[asyncio.Task[None]] = set()
         # Ids with a run in flight. A one-off's row is deleted only once its run

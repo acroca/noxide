@@ -1,8 +1,9 @@
-"""Private-network PWA companion, sharing the running agent and markdown vault.
+"""Private-network web app: the assistant's one interface.
 
-SQLite is a delivery ledger, not a second knowledge base. Accepted messages
-survive disconnects; interrupted work needs explicit retry to avoid replaying
-side effects silently after a crash.
+Serves the packaged PWA and its API in the bot's own process. SQLite is a
+delivery ledger, not a second knowledge base. Accepted messages survive
+disconnects; interrupted work needs explicit retry to avoid replaying side
+effects silently after a crash.
 """
 
 from __future__ import annotations
@@ -26,8 +27,9 @@ from aiohttp import web
 from .agent import MAX_ITERATIONS_REPLY, Agent
 from .atomic import atomic_write_text
 from .config import Config
-from .conversations import WEB_CHAT_ID, ConversationArchive, conversation_space
+from .conversations import SPACE, ConversationArchive
 from .copilot import CopilotUnavailableError
+from .models import ModelPicker
 from .tools import VaultTools
 from .transcribe import Transcriber, TranscriptionError
 
@@ -41,13 +43,11 @@ PUSH_GRACE_SECONDS = 5
 # threads are two messages; a long one is capped rather than paged.
 MESSAGE_PAGE = 20
 THREAD_MESSAGES = 100
-# Web runs in flight, queued ones included; they still run one at a time
-# behind the agent's conversation lock.
+# Web runs in flight, queued ones included; replies within one thread still
+# run one at a time behind the agent's thread lock.
 MAX_IN_FLIGHT = 16
-# The web chat is the home conversation, shared with the pinned Telegram chat.
-SPACE = conversation_space(WEB_CHAT_ID)
-# Uploads match Telegram's 20 MB download cap; bodies are read from the
-# stream in chunks, so the app-wide JSON body limit does not apply to them.
+# Upload bodies are read from the stream in chunks, so the app-wide JSON body
+# limit does not apply to them.
 UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENTS = 4
 # Declared type → (magic prefixes, stored extension). Sniffing keeps an
@@ -89,31 +89,19 @@ def shell_revision(agent_name, root=None):
 
 _MIMES = {".html": "text/html", ".js": "application/javascript", ".css": "text/css",
           ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml"}
-_WEB_CONTEXT = (
-    "This conversation is in the Noxide web companion, not Telegram. Reply directly here. "
-    "It shares its archived conversation history with the Telegram home chat. "
-    "Durable knowledge still belongs in the vault. "
-    "Recent completed exchanges are restored after restart; older messages are available via history tools."
-)
 
 
 class Companion:
-    def __init__(self, cfg: Config, agent: Agent, vault: VaultTools,
-                 archive: ConversationArchive | None = None, transcriber: Transcriber | None = None):
+    def __init__(self, cfg: Config, agent: Agent, vault: VaultTools, archive: ConversationArchive,
+                 transcriber: Transcriber | None = None, models: ModelPicker | None = None):
         self.cfg, self.agent, self.vault = cfg, agent, vault
         self.transcriber = transcriber
-        self._owns_archive = archive is None
-        self.archive = archive or ConversationArchive(cfg.state_dir)
+        self.models = models
+        self.archive = archive
         self.db = self.archive.db
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
             DROP TABLE IF EXISTS sessions;
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY, space TEXT NOT NULL, role TEXT NOT NULL,
-                text TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL,
-                reply_to TEXT, error TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS message_space ON messages(space, created);
             CREATE TABLE IF NOT EXISTS subscriptions (endpoint TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS seen (space TEXT PRIMARY KEY, through REAL NOT NULL);
             -- Replies from before a space had any seen mark start out read, so
@@ -169,6 +157,8 @@ class Companion:
         self.app.router.add_post("/api/retry", self.retry)
         self.app.router.add_post("/api/reset", self.reset)
         self.app.router.add_post("/api/seen", self.mark_seen)
+        self.app.router.add_get("/api/models", self.list_models)
+        self.app.router.add_post("/api/model", self.select_model)
         self.app.router.add_post("/api/attachments", self.upload)
         self.app.router.add_get("/api/attachment", self.attachment)
         self.app.router.add_post("/api/transcribe", self.transcribe)
@@ -244,6 +234,26 @@ class Companion:
 
     async def now(self, request):
         return web.json_response({"content": self._page("wiki/now.md")})
+
+    async def list_models(self, request):
+        """The model picker's choices, refreshed from the catalog when it answers."""
+        if self.models is None:
+            raise web.HTTPConflict(text="Model switching is not available")
+        await self.models.refresh()
+        return web.json_response(self.models.choices())
+
+    async def select_model(self, request):
+        if self.models is None:
+            raise web.HTTPConflict(text="Model switching is not available")
+        alias = (await request.json()).get("alias")
+        if not isinstance(alias, str):
+            raise web.HTTPBadRequest(text="A model alias is required")
+        try:
+            option = self.models.select(alias)
+        except KeyError:
+            raise web.HTTPBadRequest(text=f"Unknown model {alias!r}") from None
+        logger.info("Model switched to %s (%s)", alias, option.id)
+        return web.json_response({"ok": True, "current": alias, "id": option.id})
 
     def _page(self, path):
         content = self.vault.read_file(path)
@@ -359,19 +369,15 @@ class Companion:
 
         async def send(text):
             self._insert(SPACE, "assistant", text, "done", reply_to=message_id)
-            return WEB_CHAT_ID
 
         try:
-            archive_kwargs = {"message_id": message_id} if getattr(self.agent, "archive", None) is self.archive else {}
             text, image_data_urls = self._image_turn(row)
-            if image_data_urls:
-                archive_kwargs["image_data_urls"] = image_data_urls
             if message_id in self.hot:
+                # The failed turn is still in the agent's history: resume it
+                # in place rather than replaying the message (and its writes).
                 self.db.execute("UPDATE messages SET status='running' WHERE id=?", (message_id,))
                 self.db.commit()
-                reply = await self.agent.retry_message(WEB_CHAT_ID, text,
-                                                       str(row["created"]), hot=True,
-                                                       send_message_fn=send, extra_context=_WEB_CONTEXT, **archive_kwargs)
+                reply = await self.agent.resume(message_id, send_message_fn=send)
             else:
                 self.hot.add(message_id)
                 if row["error"]:
@@ -381,14 +387,11 @@ class Companion:
                     self.activity[message_id] = "Searching the web…"
 
                 reply = await self.agent.run(
-                    WEB_CHAT_ID, text, send_message_fn=send,
-                    extra_context=_WEB_CONTEXT, on_research=researching,
-                    source="web", **archive_kwargs,
+                    text, message_id=message_id, image_data_urls=image_data_urls,
+                    send_message_fn=send, on_research=researching,
                 )
             if reply == MAX_ITERATIONS_REPLY:
                 raise RuntimeError("Iteration limit reached. Some work may have completed; retry to continue.")
-            if reply and not archive_kwargs:
-                self._insert(SPACE, "assistant", reply, "done", reply_to=message_id)
             self.db.execute("UPDATE messages SET status='done', error='' WHERE id=? AND status NOT IN ('deleted','dismissed')", (message_id,))
             self.hot.discard(message_id)
             self.notify_push(reply or "", thread=row["thread"])
@@ -411,7 +414,7 @@ class Companion:
         data = await request.json()
         message_id = data.get("id")
         row = self.db.execute("SELECT * FROM messages WHERE id=? AND role='user'", (message_id,)).fetchone()
-        if not row or row["source"] != "web":
+        if not row:
             raise web.HTTPNotFound(text="Message not found")
         if not self.accepting or len(self.tasks) >= MAX_IN_FLIGHT:
             raise web.HTTPServiceUnavailable(text="Service busy; try shortly")
@@ -425,18 +428,17 @@ class Companion:
     async def reset(self, request):
         if self.db.execute("SELECT 1 FROM messages WHERE space=? AND status IN ('running','queued')", (SPACE,)).fetchone():
             raise web.HTTPConflict(text="Wait for the current run to finish")
-        await self.agent.reset_conversation(WEB_CHAT_ID)
+        await self.agent.reset_conversation()
         self.hot.difference_update(row["id"] for row in self.db.execute("SELECT id FROM messages WHERE space=?", (SPACE,)))
         return web.json_response({"ok": True})
 
-    async def observe_delivery(self, text, thread=None):
-        """A scheduled run delivered to the home chat: show it here and notify devices.
+    async def deliver(self, text):
+        """A proactive message (a scheduled run's reminder): archive it as a thread root and notify.
 
-        The main path archives the delivery as a thread root and passes its
-        id; a companion on its own archive records it itself.
+        A reply to it continues its thread with the reminder in context; a
+        message typed on its own sees it through the ambient block.
         """
-        if getattr(self.agent, "archive", None) is not self.archive:
-            thread = self._insert(SPACE, "assistant", text, "done")
+        thread = self._insert(SPACE, "assistant", text, "done")
         self.notify_push(text, thread=thread)
 
     async def subscribe(self, request):
@@ -502,7 +504,7 @@ class Companion:
         return data
 
     async def upload(self, request):
-        """Store one image in the vault's attachments folder, as Telegram photos are."""
+        """Store one image in the vault's attachments folder."""
         declared = request.content_type
         if declared not in _IMAGE_TYPES:
             raise web.HTTPBadRequest(text="Only JPEG, PNG, WebP and GIF images can be attached")
@@ -642,11 +644,15 @@ class Companion:
             except Exception:
                 logger.warning("Web push delivery failed")
 
+    def pending(self):
+        """Web runs in flight, queued ones included."""
+        return len(self.tasks)
+
     async def start(self):
         self.runner = web.AppRunner(self.app, access_log=None)
         await self.runner.setup()
         await web.TCPSite(self.runner, self.cfg.pwa_host, self.cfg.pwa_port).start()
-        logger.info("Web companion listening at %s", self.cfg.pwa_origin)
+        logger.info("Web app listening at %s", self.cfg.pwa_origin)
 
     async def drain(self):
         self.accepting = False
@@ -663,5 +669,3 @@ class Companion:
         await asyncio.gather(*tasks, return_exceptions=True)
         if self.runner:
             await self.runner.cleanup()
-        if self._owns_archive:
-            self.archive.close()

@@ -18,7 +18,7 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stdout,
     )
-    # httpx logs full request URLs at INFO — for Telegram that includes the bot token
+    # httpx logs full request URLs at INFO
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -28,7 +28,6 @@ async def _run(config_path: Path | None) -> None:
     from .config import load_config
     from .lifecycle import Lifecycle, graceful_shutdown
     from .schedule import Scheduler
-    from .telegram_bot import TelegramBot
     from .tools import VaultTools
     from .transcribe import Transcriber
 
@@ -43,10 +42,10 @@ async def _run(config_path: Path | None) -> None:
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
 
     # Init Copilot client with the configured default, then try the live model
-    # catalog: it feeds the /model picker and, when default_family is set,
+    # catalog: it feeds the model picker and, when default_family is set,
     # promotes the newest model of that family to default. Best-effort — a
     # failed fetch leaves the configured models in charge.
-    from .models import ModelOption, merge_options, resolve_startup
+    from .models import ModelOption, ModelPicker, merge_options, resolve_startup
 
     copilot.init(cfg.state_dir, cfg.models[cfg.default_model])
     model_options = merge_options(cfg.models, [])
@@ -70,6 +69,9 @@ async def _run(config_path: Path | None) -> None:
         return merge_options(
             cfg.models, await copilot.get_client().list_models(cfg.model_vendors)
         )
+
+    models = ModelPicker(model_options, default_alias,
+                         set_model_fn=copilot.get_client().set_model, refresh_fn=refresh_models)
 
     # Init usage tracking (JSONL store + vault view, flushed off the critical path)
     from . import usage
@@ -116,83 +118,26 @@ async def _run(config_path: Path | None) -> None:
             "ELEVENLABS_API_KEY not set — voice messages disabled"
         )
 
-    # Outage retry queue: messages and one-off jobs that failed because
-    # Copilot was unreachable are persisted and replayed once it answers
-    # again. The closures resolve `agent` and `bot` late — both are
-    # constructed below.
+    # Outage retry queue: one-off jobs whose run failed because Copilot was
+    # unreachable are persisted and replayed once it answers again. The
+    # closures resolve `agent` and `companion` late — both are constructed
+    # below.
     from .retry_queue import PendingItem, RetryQueue
 
-    async def replay_message(
-        chat_id: int, text: str, queued_at: str, hot: bool, message_id: str | None = None,
-    ) -> None:
-        context_chat = chat_id
-        if message_id and (record := archive.get(message_id)) is not None:
-            from .conversations import WEB_CHAT_ID
-
-            if record["space"] == "general":
-                context_chat = WEB_CHAT_ID
-        reply = await agent.retry_message(context_chat, text, queued_at, hot=hot,
-                                          **({"message_id": message_id} if message_id else {}))
-        if reply is None:
-            return  # superseded — correctly silent
-        _require_completed(reply)
-        try:
-            target = await bot.send_message(reply or "(no reply)", chat_id=chat_id)
-            if message_id:
-                archive.delivery(message_id, "delivered" if target is not None else "failed")
-        except Exception:
-            if message_id:
-                archive.delivery(message_id, "failed")
-            # The run itself succeeded (vault writes happened); a Telegram
-            # delivery hiccup — likely when several items drain back-to-back —
-            # must not classify the item as poison and tell the user their
-            # message failed.
-            logging.getLogger(__name__).warning(
-                "Could not deliver replayed reply for chat_id=%d", chat_id, exc_info=True
-            )
-
     async def notify_drop(item: PendingItem, exc: Exception) -> None:
-        if item.kind == "message" and item.chat_id is not None:
-            await bot.send_message(
-                f"Sorry — I couldn't process your message from {item.queued_at} "
-                f"even after Copilot came back: {exc}",
-                chat_id=item.chat_id,
-            )
-        else:
-            dropped = (
-                f"A reminder queued during a Copilot outage failed and was "
-                f"dropped: {item.text[:200]}"
-            )
-            await bot.notify_lifecycle(dropped)
-            if companion is not None:
-                companion.notify_lifecycle(dropped, important=True)
+        companion.notify_lifecycle(
+            f"A reminder queued during a Copilot outage failed and was dropped: {item.text[:200]}",
+            important=True,
+        )
 
     async def run_job(prompt: str) -> None:
         _require_completed(await agent.run_job(prompt))
 
     retry_queue = RetryQueue(
         cfg.state_dir,
-        replay_message_fn=replay_message,
         replay_job_fn=run_job,
         notify_drop_fn=notify_drop,
         tz_name=cfg.timezone,
-    )
-
-    # Init Telegram bot (we need send_message before building agent)
-    bot = TelegramBot(
-        token=cfg.telegram_bot_token,
-        allowed_user_ids=cfg.allowed_user_ids,
-        agent=None,  # type: ignore[arg-type]  — set below
-        transcriber=transcriber,
-        save_attachment_fn=vault.save_attachment,
-        models=model_options,
-        default_model=default_alias,
-        set_model_fn=copilot.get_client().set_model,
-        refresh_models_fn=refresh_models,
-        state_dir=cfg.state_dir,
-        default_chat_id=cfg.default_chat_id,
-        queue_message_fn=retry_queue.enqueue_message,
-        archive=archive,
     )
 
     # Web research is optional — enabled when a 4get URL is configured
@@ -236,28 +181,11 @@ async def _run(config_path: Path | None) -> None:
         maintenance_state=MaintenanceState(cfg.state_dir / STATE_FILENAME),
     )
 
-    companion = None
-
-    async def send_message(text: str) -> int | None:
-        # A proactive delivery is a thread root: archived first, so the
-        # Telegram messages that carry it map back to it and a reply to any
-        # of them continues its thread.
-        home = bot.home_chat_id
-        if home is None:
-            return await bot.send_message(text)
-        row_id = archive.insert(agent.conversation_space(home), "assistant", text, "done",
-                                source="telegram", delivery="pending")
-        target = await bot.send_message(text, archive_id=row_id)
-        archive.status(row_id, "done")
-        archive.db.execute("UPDATE messages SET delivery=? WHERE id=?",
-                           ("delivered" if target is not None else "failed", row_id))
-        archive.db.commit()
-        if companion is not None and target is not None:
-            try:
-                await companion.observe_delivery(text, thread=row_id)
-            except Exception:
-                logging.getLogger(__name__).exception("Could not mirror delivery into web companion")
-        return target
+    # A proactive delivery (a scheduled run's reminder) is the web app's to
+    # archive and push; the app is built after the agent, which needs the
+    # sender at construction, hence the closure.
+    async def send_message(text: str) -> None:
+        await companion.deliver(text)
 
     # Init agent
     agent = Agent(
@@ -273,55 +201,44 @@ async def _run(config_path: Path | None) -> None:
         history_exchanges=cfg.history_exchanges,
         tz_name=cfg.timezone,
         archive=archive,
-        home_chat_fn=lambda: bot.home_chat_id,
         agent_name=cfg.agent_name,
     )
-    bot._agent = agent  # wire back
-    retry_queue.attach_archive(archive, agent.conversation_space)
-    if cfg.pwa_enabled:
-        from .companion import Companion
+    from .companion import Companion
 
-        companion = Companion(cfg, agent, vault, archive=archive, transcriber=transcriber)
+    companion = Companion(cfg, agent, vault, archive=archive, transcriber=transcriber, models=models)
 
     usage_task = asyncio.create_task(tracker.run())
     lifecycle = Lifecycle()
     lifecycle.install()
     background: list[asyncio.Task] = []
     try:
-        await bot.start(abort=lifecycle.stop)
-        if not lifecycle.stop.is_set():
-            if companion is not None:
-                await companion.start()
-                companion.notify_lifecycle(companion.startup_message())
-            # Even overdue date jobs must wait for Telegram readiness, not
-            # just recurring catch-up: a failed delivery consumes a one-off.
-            scheduler.start()
-            scheduler.reload()
-            scheduler.catch_up()
-            background.append(asyncio.create_task(_poll_schedule(scheduler)))
-            background.append(asyncio.create_task(retry_queue.run()))
+        await companion.start()
+        companion.notify_lifecycle(companion.startup_message())
+        # Even overdue date jobs wait for the app to be up: a failed
+        # delivery consumes a one-off.
+        scheduler.start()
+        scheduler.reload()
+        scheduler.catch_up()
+        background.append(asyncio.create_task(_poll_schedule(scheduler)))
+        background.append(asyncio.create_task(retry_queue.run()))
 
-            from .inbox import ingest as ingest_inbox
+        from .inbox import ingest as ingest_inbox
 
-            # The checkpoint records consumed captures without modifying the
-            # externally edited inbox. Cancelled runs leave it unchanged.
-            background.append(asyncio.create_task(ingest_inbox(
-                cfg.vault_path, agent.run_job, backup=backup, state_dir=cfg.state_dir
-            )))
+        # The checkpoint records consumed captures without modifying the
+        # externally edited inbox. Cancelled runs leave it unchanged.
+        background.append(asyncio.create_task(ingest_inbox(
+            cfg.vault_path, agent.run_job, backup=backup, state_dir=cfg.state_dir
+        )))
         await lifecycle.wait()
     finally:
         try:
             for task in background:
                 task.cancel()
             await asyncio.gather(*background, return_exceptions=True)
-            if companion is not None:
-                companion.accepting = False
-            await graceful_shutdown(bot=bot, scheduler=scheduler, force=lifecycle.force,
-                                    companion=companion)
+            await graceful_shutdown(companion=companion, scheduler=scheduler, force=lifecycle.force)
         finally:
             try:
-                if companion is not None:
-                    await companion.close()
+                await companion.close()
                 await _drain_final(
                     [("usage telemetry", tracker, usage_task)]
                     + ([("vault backup", backup, backup_task)] if backup is not None else []),
@@ -402,7 +319,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(prog="assistant")
-    parser.add_argument("command", choices=["run", "auth"], help="run: start the bot; auth: device flow")
+    parser.add_argument("command", choices=["run", "auth"], help="run: start the assistant; auth: device flow")
     parser.add_argument("--config", type=Path, default=None, help="Path to config.toml")
     args = parser.parse_args()
 

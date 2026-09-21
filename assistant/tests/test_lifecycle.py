@@ -67,14 +67,13 @@ async def test_remove_restores_default_handlers() -> None:
 # ------------------------------------------------------------------
 
 
-def _bot(pending: int = 0) -> MagicMock:
-    bot = MagicMock()
-    bot.pending_updates = MagicMock(return_value=pending)
-    bot.notify_lifecycle = AsyncMock()
-    bot.stop_polling = AsyncMock()
-    bot.drain = AsyncMock()
-    bot.close = AsyncMock()
-    return bot
+def _companion(pending: int = 0) -> MagicMock:
+    companion = MagicMock()
+    companion.accepting = True
+    companion.pending = MagicMock(return_value=pending)
+    companion.notify_lifecycle = MagicMock(return_value=None)
+    companion.drain = AsyncMock()
+    return companion
 
 
 async def _never_finishes() -> None:
@@ -87,78 +86,78 @@ def _scheduler(unfinished: int = 0) -> MagicMock:
     return sched
 
 
-async def test_shutdown_stops_fetching_before_draining() -> None:
-    """updater.stop() is the ack point; it must precede the drain."""
-    order: list[str] = []
-    bot = _bot()
-    bot.stop_polling = AsyncMock(side_effect=lambda: order.append("stop_polling"))
-    bot.drain = AsyncMock(side_effect=lambda: order.append("drain"))
-    bot.close = AsyncMock(side_effect=lambda: order.append("close"))
-
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event())
-
-    assert order == ["stop_polling", "drain", "close"]
-
-
-async def test_shutdown_drains_scheduler_and_bot_together() -> None:
-    bot = _bot()
+async def test_shutdown_stops_accepting_then_drains_web_and_scheduler_together() -> None:
+    companion = _companion()
     sched = _scheduler()
 
-    await graceful_shutdown(bot=bot, scheduler=sched, force=asyncio.Event())
+    async def drain() -> None:
+        assert companion.accepting is False
 
-    bot.drain.assert_awaited_once()
+    companion.drain = AsyncMock(side_effect=drain)
+    await graceful_shutdown(companion=companion, scheduler=sched, force=asyncio.Event())
+
+    companion.drain.assert_awaited_once()
     sched.drain.assert_awaited_once()
+    assert companion.accepting is False
 
 
-async def test_shutdown_reports_queue_depth_in_the_notice() -> None:
-    bot = _bot(pending=3)
+async def test_shutdown_reports_running_messages_in_the_notice() -> None:
+    companion = _companion(pending=3)
 
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event())
+    await graceful_shutdown(companion=companion, scheduler=_scheduler(), force=asyncio.Event())
 
-    text = bot.notify_lifecycle.await_args_list[0].args[0]
-    assert "3" in text
-
-
-async def test_shutdown_notice_is_plain_when_nothing_is_queued() -> None:
-    bot = _bot(pending=0)
-
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event())
-
-    text = bot.notify_lifecycle.await_args_list[0].args[0]
-    assert "queued" not in text
+    text, kwargs = companion.notify_lifecycle.call_args_list[0].args[0], companion.notify_lifecycle.call_args_list[0].kwargs
+    assert text.startswith("Restarting") and "3" in text and kwargs == {"important": False}
 
 
-async def test_shutdown_gives_up_at_the_deadline_and_still_closes() -> None:
-    bot = _bot()
-    bot.drain = AsyncMock(side_effect=_never_finishes)
+async def test_shutdown_notice_is_plain_when_nothing_is_running() -> None:
+    companion = _companion(pending=0)
 
-    await graceful_shutdown(
-        bot=bot, scheduler=_scheduler(), force=asyncio.Event(), budget=0.05
+    await graceful_shutdown(companion=companion, scheduler=_scheduler(), force=asyncio.Event())
+
+    text = companion.notify_lifecycle.call_args_list[0].args[0]
+    assert "message" not in text
+    companion.notify_lifecycle.assert_called_once()
+
+
+async def test_shutdown_gives_up_at_the_deadline_and_returns() -> None:
+    companion = _companion()
+    companion.drain = AsyncMock(side_effect=_never_finishes)
+
+    await asyncio.wait_for(
+        graceful_shutdown(companion=companion, scheduler=_scheduler(), force=asyncio.Event(), budget=0.05),
+        timeout=5,
     )
 
-    bot.close.assert_awaited_once()
 
-
-async def test_shutdown_reports_dropped_messages_when_truncated(
+async def test_interrupted_messages_push_to_every_device_and_are_waited_for(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Acked-but-undrained updates are gone for good — say so, loudly."""
-    bot = _bot(pending=2)
-    bot.drain = AsyncMock(side_effect=_never_finishes)
+    """The important push runs after the drain was given up, so nothing else awaits it."""
+    delivered = asyncio.Event()
+
+    async def push() -> None:
+        await asyncio.sleep(0.01)
+        delivered.set()
+
+    companion = _companion(pending=2)
+    companion.notify_lifecycle = MagicMock(
+        side_effect=lambda text, important: asyncio.create_task(push()) if important else None)
+    companion.drain = AsyncMock(side_effect=_never_finishes)
 
     with caplog.at_level(logging.ERROR, logger="assistant.lifecycle"):
-        await graceful_shutdown(
-            bot=bot, scheduler=_scheduler(), force=asyncio.Event(), budget=0.05
-        )
+        await graceful_shutdown(companion=companion, scheduler=_scheduler(), force=asyncio.Event(), budget=0.05)
 
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
-    last = bot.notify_lifecycle.await_args_list[-1].args[0]
-    assert "2" in last and "resend" in last.lower()
+    assert delivered.is_set()
+    last = companion.notify_lifecycle.call_args_list[-1]
+    assert "2" in last.args[0] and "retry" in last.args[0].lower()
+    assert last.kwargs == {"important": True}
 
 
 async def test_second_signal_short_circuits_the_drain() -> None:
-    bot = _bot()
-    bot.drain = AsyncMock(side_effect=_never_finishes)
+    companion = _companion()
+    companion.drain = AsyncMock(side_effect=_never_finishes)
     force = asyncio.Event()
 
     async def press_again() -> None:
@@ -167,69 +166,30 @@ async def test_second_signal_short_circuits_the_drain() -> None:
 
     asyncio.create_task(press_again())
     await asyncio.wait_for(
-        graceful_shutdown(bot=bot, scheduler=_scheduler(), force=force, budget=30),
+        graceful_shutdown(companion=companion, scheduler=_scheduler(), force=force, budget=30),
         timeout=5,
     )
 
-    bot.close.assert_awaited_once()
 
-
-async def test_notify_failure_does_not_block_shutdown() -> None:
-    bot = _bot()
-    bot.notify_lifecycle = AsyncMock(side_effect=Exception("network down"))
-
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event())
-
-    bot.close.assert_awaited_once()
-
-
-async def test_drain_failure_does_not_block_close() -> None:
-    bot = _bot()
-    bot.drain = AsyncMock(side_effect=RuntimeError("application not running"))
-
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event())
-
-    bot.close.assert_awaited_once()
-
-
-async def test_shutdown_pushes_the_notice_to_the_web_companion() -> None:
-    companion = MagicMock()
-    companion.notify_lifecycle = MagicMock(return_value=None)
-    companion.drain = AsyncMock()
-
-    await graceful_shutdown(bot=_bot(pending=1), scheduler=_scheduler(), force=asyncio.Event(), companion=companion)
-
-    companion.notify_lifecycle.assert_called_once()
-    text, kwargs = companion.notify_lifecycle.call_args.args[0], companion.notify_lifecycle.call_args.kwargs
-    assert text.startswith("Restarting") and "1" in text and kwargs == {"important": False}
-
-
-async def test_dropped_messages_push_to_every_device_and_are_waited_for() -> None:
-    """The important push runs after the drain was given up, so nothing else awaits it."""
-    delivered = asyncio.Event()
-
-    async def push() -> None:
-        await asyncio.sleep(0.01)
-        delivered.set()
-
-    companion = MagicMock()
-    companion.notify_lifecycle = MagicMock(side_effect=lambda text, important: asyncio.create_task(push()) if important else None)
-    companion.drain = AsyncMock(side_effect=_never_finishes)
-    bot = _bot(pending=2)
-    bot.drain = AsyncMock(side_effect=_never_finishes)
-
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event(), budget=0.05, companion=companion)
-
-    assert delivered.is_set()
-    assert companion.notify_lifecycle.call_args_list[-1].kwargs == {"important": True}
-
-
-async def test_companion_push_failure_does_not_block_shutdown() -> None:
-    companion = MagicMock()
+async def test_push_failure_does_not_block_shutdown() -> None:
+    companion = _companion()
     companion.notify_lifecycle = MagicMock(side_effect=RuntimeError("no key"))
-    companion.drain = AsyncMock()
-    bot = _bot()
+    sched = _scheduler()
 
-    await graceful_shutdown(bot=bot, scheduler=_scheduler(), force=asyncio.Event(), companion=companion)
+    await graceful_shutdown(companion=companion, scheduler=sched, force=asyncio.Event())
 
-    bot.close.assert_awaited_once()
+    companion.drain.assert_awaited_once()
+    sched.drain.assert_awaited_once()
+
+
+async def test_drain_failure_does_not_block_the_other_drain(caplog: pytest.LogCaptureFixture) -> None:
+    companion = _companion()
+    companion.drain = AsyncMock(side_effect=RuntimeError("server not running"))
+    sched = _scheduler(unfinished=1)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.lifecycle"):
+        await graceful_shutdown(companion=companion, scheduler=sched, force=asyncio.Event())
+
+    sched.drain.assert_awaited_once()
+    assert "Drain step failed" in caplog.text
+    assert "1 scheduled job(s) did not finish" in caplog.text

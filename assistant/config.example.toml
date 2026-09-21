@@ -1,24 +1,15 @@
 # config.example.toml — copy to config.toml and fill in your values
 
-[telegram]
-# From BotFather — or set TELEGRAM_BOT_TOKEN env var
-bot_token = "123456:ABC-DEF..."
-allowed_user_ids = [123456789]   # Your Telegram user IDs (find yours by messaging @userinfobot on Telegram)
-# Chat for proactive messages (startup notices, scheduled jobs) before the bot
-# has learned one from an incoming message — or set DEFAULT_CHAT_ID env var.
-# For a direct chat this is your own user ID.
-# default_chat_id = 123456789
-
 [copilot]
 # Alias of the model used by default (a key of [copilot.models]).
-# Switch at runtime from Telegram with /model.
+# Switch at runtime from the app's Preferences; the choice lasts until restart.
 default_model = "sonnet"
 # Optional: always default to the newest model of a family instead. When set,
 # the newest fetched model whose id starts with this prefix wins at startup
 # and default_model is only the offline fallback.
 # default_family = "claude-opus"
 
-# Offline fallback (and pinned custom ids). The /model picker itself is the
+# Offline fallback (and pinned custom ids). The model picker itself is the
 # live Copilot catalog under its own display names; entries here only show
 # by alias when their id is missing from the catalog.
 [copilot.models]
@@ -26,7 +17,7 @@ sonnet = "claude-sonnet-5"
 # opus = "claude-opus-4.8"
 
 # Voice transcription (optional): set ELEVENLABS_API_KEY env var to an
-# ElevenLabs API key to enable Telegram voice messages.
+# ElevenLabs API key to enable the app's microphone button.
 
 [web]
 # Optional: base URL of a 4get instance (docs/deployment.md has a Compose
@@ -35,9 +26,8 @@ sonnet = "claude-sonnet-5"
 # fourget_url = "http://fourget"
 
 [pwa]
-# Optional web companion, served by the same process. Telegram stays enabled.
-# No app authentication: restrict access with Tailscale Serve/private networking.
-# enabled = true
+# The web app, served by the same process. No app authentication: restrict
+# access with Tailscale Serve/private networking.
 # host = "127.0.0.1"
 # port = 8080
 # origin = "http://localhost:8080"  # exact browser origin; HTTPS outside localhost
