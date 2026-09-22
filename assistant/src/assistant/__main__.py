@@ -221,6 +221,10 @@ async def _run(config_path: Path | None) -> None:
         scheduler.catch_up()
         background.append(asyncio.create_task(_poll_schedule(scheduler)))
         background.append(asyncio.create_task(retry_queue.run()))
+        # Web messages that failed on an outage replay from their archived
+        # rows; reminders still unseen after a while are pushed once more.
+        background.append(asyncio.create_task(companion.replay_outages()))
+        background.append(asyncio.create_task(companion.nudge_loop()))
 
         from .inbox import ingest as ingest_inbox
 

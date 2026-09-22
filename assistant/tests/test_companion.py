@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -369,14 +370,14 @@ async def test_push_triggers_include_reply_reminder_and_test_text(companion):
         await service.deliver("Your reminder")
         reminder = service.db.execute("SELECT id, thread FROM messages WHERE text='Your reminder'").fetchone()
         assert reminder["thread"] == reminder["id"]
-        notify.assert_called_with("Your reminder", thread=reminder["id"])
+        notify.assert_called_with("Your reminder", thread=reminder["id"], message_id=reminder["id"])
         await client.post("/api/messages", json={"id": "c" * 32, "text": "Hi"})
         await settle(service)
-        notify.assert_called_with("Recorded.", thread="c" * 32)
+        notify.assert_called_with("Recorded.", thread="c" * 32, message_id="reply:" + "c" * 32)
         # A reply in an existing thread pushes that thread, not its own message id.
         await client.post("/api/messages", json={"id": "d" * 32, "text": "Thanks", "reply_to": "c" * 32})
         await settle(service)
-        notify.assert_called_with("Recorded.", thread="c" * 32)
+        notify.assert_called_with("Recorded.", thread="c" * 32, message_id="reply:" + "d" * 32)
         service.public_key = "configured"
         assert (await client.post("/api/push/test", json={})).status == 200
         notify.assert_called_with("Hello there! This is the test reminder", grace=False)
@@ -400,7 +401,7 @@ async def test_push_waits_a_grace_period_and_skips_replies_seen_on_a_focused_dev
         await settle(service)
         assert not push.called
         await asyncio.gather(*service.push_tasks)
-        push.assert_called_once_with("Recorded.", "e" * 32)
+        push.assert_called_once_with("Recorded.", "e" * 32, message_id="reply:" + "e" * 32)
 
         # A scheduled delivery waits out the same grace and notifies unless seen.
         push.reset_mock()
@@ -408,14 +409,14 @@ async def test_push_waits_a_grace_period_and_skips_replies_seen_on_a_focused_dev
         assert not push.called
         await asyncio.gather(*service.push_tasks)
         reminder = service.db.execute("SELECT id FROM messages WHERE text='Your reminder'").fetchone()["id"]
-        push.assert_called_once_with("Your reminder", reminder)
+        push.assert_called_once_with("Your reminder", reminder, message_id=reminder)
 
         # The test button never waits and is never suppressed.
         push.reset_mock()
         await client.post("/api/seen", json={"through": 1e12})
         assert (await client.post("/api/push/test", json={})).status == 200
         await asyncio.gather(*service.push_tasks)
-        push.assert_called_once_with("Hello there! This is the test reminder", None)
+        push.assert_called_once_with("Hello there! This is the test reminder", None, message_id=None)
 
 
 async def test_unread_count_follows_seen_marks_and_survives_restart(companion):
@@ -463,7 +464,7 @@ async def test_drain_waits_for_delayed_pushes(companion):
         assert not push.called
         await service.drain()
         reminder = service.db.execute("SELECT id FROM messages WHERE text='Your reminder'").fetchone()["id"]
-        push.assert_called_once_with("Your reminder", reminder)
+        push.assert_called_once_with("Your reminder", reminder, message_id=reminder)
 
 
 def test_shell_revision_follows_every_shell_file_and_the_instance_name(tmp_path):
@@ -538,7 +539,7 @@ async def test_deliveries_are_thread_roots_that_push_their_thread(companion):
         await service.deliver("Time for your medication")
     rows = service.db.execute("SELECT id, space, role, text, status, thread, reply_to FROM messages").fetchall()
     assert [tuple(r)[1:] for r in rows] == [(SPACE, "assistant", "Time for your medication", "done", rows[0]["id"], None)]
-    notify.assert_called_once_with("Time for your medication", thread=rows[0]["id"])
+    notify.assert_called_once_with("Time for your medication", thread=rows[0]["id"], message_id=rows[0]["id"])
     # The delivery reaches the model as an archived thread: a reply to it
     # continues the thread, a message on its own sees it as background.
     assert service.archive.recent_threads(SPACE, generation=0, since=0, limit=5)[0]["root_text"] == "Time for your medication"
@@ -711,3 +712,171 @@ async def test_startup_message_names_an_app_update_once(companion):
     assert service.startup_message() == STARTED_WITH_UPDATE
     assert marker.read_text().strip() == shell_revision(service.cfg.agent_name)
     assert service.startup_message() == STARTED
+
+
+PDF = b"%PDF-1.4\n" + b"\0" * 64
+
+
+async def test_document_upload_is_sniffed_stored_served_and_named_for_the_model(companion):
+    service, client = companion
+    response = await client.post("/api/attachments", data=PDF, headers={"Content-Type": "application/pdf"})
+    assert response.status == 200
+    pdf = (await response.json())["path"]
+    assert re.fullmatch(r"attachments/\d{4}-\d{2}-\d{2}-[0-9a-f]{6}\.pdf", pdf)
+    note = (await (await client.post("/api/attachments", data=b"Hola\n", headers={"Content-Type": "text/markdown"})).json())["path"]
+    assert note.endswith(".md")
+    served = await client.get("/api/attachment", params={"path": pdf})
+    assert served.status == 200 and served.content_type == "application/pdf" and await served.read() == PDF
+    # A PDF must start like one; text must be UTF-8 without NUL bytes; other types are refused.
+    assert (await client.post("/api/attachments", data=b"<html>", headers={"Content-Type": "application/pdf"})).status == 400
+    assert (await client.post("/api/attachments", data=b"a\0b", headers={"Content-Type": "text/plain"})).status == 400
+    assert (await client.post("/api/attachments", data=b"\xff\xfe", headers={"Content-Type": "text/plain"})).status == 400
+    assert (await client.post("/api/attachments", data=b"x", headers={"Content-Type": "video/mp4"})).status == 400
+    # Original names are optional, sanitized, and must belong to the message's attachments.
+    assert (await client.post("/api/messages", json={"id": "2" * 32, "text": "", "attachments": [pdf], "names": {"wiki/now.md": "x"}})).status == 400
+    assert (await client.post("/api/messages", json={"id": "2" * 32, "text": "", "attachments": [pdf], "names": [pdf]})).status == 400
+    names = {pdf: "../etc/Invoice 2026\x00.pdf", note: ""}
+    assert (await client.post("/api/messages", json={"id": "2" * 32, "text": "File this", "attachments": [pdf, note], "names": names})).status == 202
+    await settle(service)
+    call = service.agent.run.call_args
+    assert call.kwargs["image_data_urls"] is None
+    assert call.args[0].startswith("File this\n\n")
+    assert f"[attached file 1 of 2: Invoice 2026.pdf (application/pdf) — already stored in the vault at {pdf}" in call.args[0]
+    assert f"[attached file 2 of 2: {note.rsplit('/', 1)[1]} (text/markdown) — already stored in the vault at {note}" in call.args[0]
+    assert "extract_attachment" in call.args[0]
+    rows = flat(await timeline(client))
+    assert json.loads(rows[0]["metadata"]) == {"attachments": [pdf, note], "names": {pdf: "Invoice 2026.pdf"}}
+    # Images and documents mix in one message; without a caption the note says so.
+    png = (await (await client.post("/api/attachments", data=PNG, headers={"Content-Type": "image/png"})).json())["path"]
+    assert (await client.post("/api/messages", json={"id": "3" * 32, "text": "", "attachments": [png, pdf]})).status == 202
+    await settle(service)
+    call = service.agent.run.call_args
+    assert call.args[0].startswith("The user sent this without a caption.\n\n")
+    assert "[attached image — already stored" in call.args[0] and f"[attached file: {pdf.rsplit('/', 1)[1]} (application/pdf)" in call.args[0]
+    assert len(call.kwargs["image_data_urls"]) == 1
+
+
+async def test_push_outcome_is_recorded_on_the_archived_row(companion):
+    from pywebpush import WebPushException
+
+    service, client = companion
+    service.public_key = "configured"
+    keys = {"p256dh": "a" * 87, "auth": "b" * 22}
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/phone", "keys": keys})
+    await client.post("/api/push", json={"endpoint": "https://web.push.apple.com/desk", "keys": keys})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0.05):
+        await service.deliver("Take the pills")
+        await asyncio.gather(*service.push_tasks)
+        reminder = service.db.execute("SELECT * FROM messages WHERE text='Take the pills'").fetchone()
+        outcome = json.loads(reminder["metadata"])["push"]
+        assert (outcome["devices"], outcome["accepted"]) == (2, 2) and outcome["at"] > 0
+        # A provider refusal is not delivery; the row says so and the timeline can show it.
+        send.side_effect = WebPushException("boom", response=MagicMock(status_code=500))
+        await client.post("/api/messages", json={"id": "a" * 32, "text": "Hi"})
+        await settle(service)
+        await asyncio.gather(*service.push_tasks)
+        reply = json.loads(service.archive.get("reply:" + "a" * 32)["metadata"])["push"]
+        assert (reply["devices"], reply["accepted"]) == (2, 0)
+        # No registered device is recorded too, so the timeline can say why nothing arrived.
+        send.side_effect = None
+        service.db.execute("DELETE FROM subscriptions")
+        service.db.commit()
+        await service.deliver("Nobody home")
+        await asyncio.gather(*service.push_tasks)
+        outcome = json.loads(service.db.execute("SELECT metadata FROM messages WHERE text='Nobody home'").fetchone()["metadata"])["push"]
+        assert (outcome["devices"], outcome["accepted"]) == (0, 0)
+        # A reply already displayed on a focused device records that instead of a push.
+        await client.post("/api/messages", json={"id": "b" * 32, "text": "Again"})
+        await settle(service)
+        await client.post("/api/seen", json={"through": 1e12})
+        await asyncio.gather(*service.push_tasks)
+        assert json.loads(service.archive.get("reply:" + "b" * 32)["metadata"])["push"] == {"displayed": True}
+    assert "push" in json.loads(flat(await timeline(client))[0]["metadata"])
+
+
+async def test_unseen_reminders_are_pushed_again_once(companion):
+    from assistant.companion import NUDGE_AFTER_SECONDS
+
+    service, client = companion
+    service.public_key = "configured"
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/phone",
+                                       "keys": {"p256dh": "a" * 87, "auth": "b" * 22}})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0):
+        await service.deliver("Take the pills")
+        await client.post("/api/messages", json={"id": "a" * 32, "text": "Hi"})
+        await settle(service)
+        await asyncio.gather(*service.push_tasks)
+        assert send.call_count == 2
+        await service.nudge_unseen()
+        assert send.call_count == 2  # too recent
+        old = time.time() - NUDGE_AFTER_SECONDS - 1
+        service.db.execute("UPDATE messages SET created=?", (old,))
+        service.db.commit()
+        await service.nudge_unseen()
+        # Only the reminder (a thread the assistant started) is nudged, and only once.
+        assert send.call_count == 3 and json.loads(send.call_args.kwargs["data"])["body"] == "Take the pills"
+        await service.nudge_unseen()
+        assert send.call_count == 3
+        reminder = service.db.execute("SELECT metadata FROM messages WHERE text='Take the pills'").fetchone()
+        assert json.loads(reminder["metadata"])["push"]["nudged"] is True
+        # A reminder displayed in the meantime is left alone.
+        await service.deliver("Another")
+        await asyncio.gather(*service.push_tasks)
+        service.db.execute("UPDATE messages SET created=? WHERE text='Another'", (old,))
+        service.db.commit()
+        await client.post("/api/seen", json={"through": time.time()})
+        await service.nudge_unseen()
+        assert send.call_count == 4
+
+
+async def wait_for(condition, attempts=100):
+    for _ in range(attempts):
+        if condition():
+            return True
+        await asyncio.sleep(0.01)
+    return condition()
+
+
+async def test_outage_failed_messages_replay_by_themselves(companion):
+    from assistant.companion import AUTO_RETRY_PREFIX
+
+    service, client = companion
+    service.agent.run.side_effect = CopilotUnavailableError("offline")
+    service.agent.resume.side_effect = CopilotUnavailableError("still offline")
+    await client.post("/api/messages", json={"id": "a" * 32, "text": "Remember this"})
+    await settle(service)
+    row = flat(await timeline(client))[0]
+    assert row["status"] == "unavailable" and "retried" in row["error"]
+    assert service.outage.is_set()
+    with patch("assistant.companion.BACKOFF_INITIAL", 0.01):
+        loop = asyncio.create_task(service.replay_outages())
+        try:
+            # Resumed in place while the outage lasts, backing off between attempts.
+            assert await wait_for(lambda: service.agent.resume.await_count >= 2)
+            assert flat(await timeline(client))[0]["status"] == "unavailable"
+            service.agent.resume.side_effect = service.agent._resume
+            assert await wait_for(lambda: service.archive.get("a" * 32)["status"] == "done")
+            assert [(m["role"], m["text"], m["status"]) for m in flat(await timeline(client))] == [
+                ("user", "Remember this", "done"), ("assistant", "Recovered.", "done")]
+        finally:
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+    # After a restart the failed turn is gone from memory: the message reruns
+    # with a warning, oldest first; interrupted work still waits for a hand retry.
+    service.agent.run.side_effect = CopilotUnavailableError("offline")
+    await client.post("/api/messages", json={"id": "b" * 32, "text": "And this"})
+    await settle(service)
+    service._insert(SPACE, "user", "Half done", "interrupted", message_id="c" * 32)
+    service.agent.run.side_effect = service.agent._run
+    restarted = Companion(service.cfg, service.agent, service.vault, archive=service.archive)
+    try:
+        assert restarted.outage.is_set()
+        with patch("assistant.companion.BACKOFF_INITIAL", 0.01):
+            loop = asyncio.create_task(restarted.replay_outages())
+            assert await wait_for(lambda: service.archive.get("b" * 32)["status"] == "done")
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+        assert service.agent.run.call_args.args[0] == AUTO_RETRY_PREFIX + "And this"
+        assert service.archive.get("c" * 32)["status"] == "interrupted"
+    finally:
+        await restarted.close()

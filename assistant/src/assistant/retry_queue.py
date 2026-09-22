@@ -12,8 +12,9 @@ startup, so a restart mid-outage loses nothing. An item is removed only after
 its replay fully succeeds: a crash mid-replay reprocesses (the replay prompt
 warns the model the work may have been partially done) rather than loses.
 
-Web messages never queue here: the app marks them unavailable and the user
-retries them by hand.
+Web messages never queue here: their archived rows, marked ``unavailable``,
+are their own durable queue, drained by ``Companion.replay_outages`` with this
+module's backoff.
 """
 
 from __future__ import annotations
@@ -35,8 +36,8 @@ logger = logging.getLogger(__name__)
 
 QUEUE_FILENAME = "pending_runs.jsonl"
 
-_BACKOFF_INITIAL = 30.0
-_BACKOFF_MAX = 300.0
+BACKOFF_INITIAL = 30.0
+BACKOFF_MAX = 300.0
 
 # Replays a queued one-off job prompt (already carrying its catch-up prefix).
 ReplayJobFn = Callable[[str], Awaitable[None]]
@@ -44,8 +45,8 @@ ReplayJobFn = Callable[[str], Awaitable[None]]
 NotifyDropFn = Callable[["PendingItem", Exception], Awaitable[None]]
 
 
-def _next_backoff(delay: float) -> float:
-    return min(delay * 2, _BACKOFF_MAX)
+def next_backoff(delay: float) -> float:
+    return min(delay * 2, BACKOFF_MAX)
 
 
 @dataclass(frozen=True)
@@ -103,7 +104,7 @@ class RetryQueue:
 
     async def run(self) -> None:
         """Drain loop: retry the head item, backing off while Copilot is down."""
-        delay = _BACKOFF_INITIAL
+        delay = BACKOFF_INITIAL
         while True:
             await self._wake.wait()
             if not self._items:
@@ -118,7 +119,7 @@ class RetryQueue:
                     exc, len(self._items), delay,
                 )
                 await asyncio.sleep(delay)
-                delay = _next_backoff(delay)
+                delay = next_backoff(delay)
                 continue
             except asyncio.CancelledError:
                 raise
@@ -132,7 +133,7 @@ class RetryQueue:
                     except Exception:
                         logger.warning("notify_drop_fn failed", exc_info=True)
                 continue
-            delay = _BACKOFF_INITIAL
+            delay = BACKOFF_INITIAL
             self._pop_head()
             logger.info("Replayed queued job from %s (%d left)", item.queued_at, len(self._items))
 

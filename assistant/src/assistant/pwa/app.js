@@ -11,8 +11,11 @@ const paths = {
   mic: 'M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3M8 21h8',
   reply: 'M9 7 4 12l5 5M4 12h9a7 7 0 0 1 7 7',
 };
-const MAX_IMAGES = 4, IMAGE_EDGE = 2000, KEEP_ORIGINAL_BYTES = 4 * 1024 * 1024, MAX_RECORDING_MS = 5 * 60 * 1000;
+const MAX_ATTACHMENTS = 4, IMAGE_EDGE = 2000, KEEP_ORIGINAL_BYTES = 4 * 1024 * 1024, MAX_RECORDING_MS = 5 * 60 * 1000;
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+// Documents go up as they are, typed by extension so the server sees a type it knows.
+const FILE_TYPES = { pdf: 'application/pdf', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', json: 'application/json' };
+const ACCEPT = 'image/*,' + Object.keys(FILE_TYPES).map(ext => '.' + ext).join(',');
 function icon(name) {
   return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name]}"/></svg>`;
 }
@@ -133,13 +136,34 @@ async function prepareImage(file) {
   if (!blob) throw new Error(`Couldn't convert ${file.name || 'that image'}.`);
   return blob;
 }
-function attachmentsOf(message) {
-  try { return JSON.parse(message.metadata || '{}').attachments || []; } catch { return []; }
+async function prepareAttachment(file) {
+  const ext = (file.name || '').split('.').pop().toLowerCase();
+  if (file.type.startsWith('image/') || /^hei[cf]$/.test(ext)) {
+    const blob = await prepareImage(file);
+    return { blob, url: URL.createObjectURL(blob), path: null, name: null };
+  }
+  if (!FILE_TYPES[ext]) throw new Error(`Can't attach ${file.name || 'that file'}: images, PDFs and text files only.`);
+  return { blob: new Blob([file], { type: FILE_TYPES[ext] }), url: null, path: null, name: file.name };
 }
-function thumbnails(message) {
-  const paths = attachmentsOf(message);
+function metadataOf(message) {
+  try { return JSON.parse(message.metadata || '{}'); } catch { return {}; }
+}
+const isImagePath = path => /\.(jpg|png|webp|gif)$/.test(path);
+function attachmentsHtml(message) {
+  const meta = metadataOf(message), paths = meta.attachments || [], names = meta.names || {};
   if (!paths.length) return '';
-  return `<div class="message-images">${paths.map(p => { const src = '/api/attachment?path=' + encodeURIComponent(p); return `<a href="${src}" target="_blank" rel="noopener"><img src="${src}" alt="Attached image" loading="lazy"></a>`; }).join('')}</div>`;
+  const src = p => '/api/attachment?path=' + encodeURIComponent(p);
+  const images = paths.filter(isImagePath).map(p => `<a href="${src(p)}" target="_blank" rel="noopener"><img src="${src(p)}" alt="Attached image" loading="lazy"></a>`);
+  const files = paths.filter(p => !isImagePath(p)).map(p => `<a class="message-file" href="${src(p)}" target="_blank" rel="noopener">${icon('page')}<span>${escape(names[p] || p.split('/').pop())}</span></a>`);
+  return (images.length ? `<div class="message-images">${images.join('')}</div>` : '') + files.join('');
+}
+function pushNote(message) {
+  // The server records each push's outcome on the row; only trouble is shown.
+  const push = metadataOf(message).push;
+  if (!push || !('devices' in push) || push.accepted >= push.devices) return '';
+  const text = !push.devices ? 'Not delivered: no device has notifications enabled'
+    : push.accepted ? `Notified ${push.accepted} of ${push.devices} devices` : 'Notification could not be delivered';
+  return `<div class="message-status"><span>${escape(text)}</span></div>`;
 }
 function inline(text) {
   return escape(text).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -201,8 +225,8 @@ function renderChat(pageVersion) {
       <form id="chat-form" class="chat-composer">
         <div id="reply-chip" class="reply-chip" hidden><span id="reply-excerpt"></span><button id="cancel-reply" type="button" aria-label="Cancel reply">×</button></div>
         <div id="composer-images" class="composer-images" hidden></div>
-        <button id="attach-image" class="tool-button" type="button" aria-label="Attach image">${icon('image')}</button>
-        <input id="image-input" type="file" accept="image/*" multiple hidden>
+        <button id="attach-image" class="tool-button" type="button" aria-label="Attach image or file">${icon('image')}</button>
+        <input id="image-input" type="file" accept="${ACCEPT}" multiple hidden>
         <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft())}</textarea>
         <button id="record-voice" class="tool-button" type="button" aria-label="Record voice message" hidden>${icon('mic')}</button>
         <button class="send-button" type="submit" aria-label="Send message">${icon('send')}</button>
@@ -211,7 +235,7 @@ function renderChat(pageVersion) {
     </section>`;
   const active = () => version === pageVersion && Boolean($('#chat-thread'));
   let signature = '', cursor = null, older = [], sending = false, loaded = false;
-  let latest = [], acked = 0, images = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
+  let latest = [], acked = 0, attachments = [], activity = '', recorder = null, recordStarted = 0, recordTicker = null;
   // The message the next send replies to; null starts a new thread. Most
   // threads are two messages long, so a new thread is the no-gesture default.
   let replyTo = null;
@@ -326,59 +350,56 @@ function renderChat(pageVersion) {
   function updateComposer() {
     if (!active()) return;
     button.disabled = !loaded || sending || !navigator.onLine || Boolean(recorder);
-    $('#attach-image').disabled = sending || images.length >= MAX_IMAGES;
+    $('#attach-image').disabled = sending || attachments.length >= MAX_ATTACHMENTS;
     $('#discard-recording').hidden = !recorder;
     $('#chat-status').firstChild.textContent = (!navigator.onLine ? 'Offline. Your draft stays on this device.'
       : activity ? activity : replyTo ? 'Replying in a thread' : 'Ready') + ' ';
   }
   function setActivity(text) { activity = text; updateComposer(); }
-  function renderImages() {
+  function renderAttachments() {
     const strip = $('#composer-images');
-    strip.hidden = !images.length;
-    strip.innerHTML = images.map((image, i) => `<figure><img src="${image.url}" alt="Image ${i + 1} to attach"><button type="button" data-remove="${i}" aria-label="Remove image ${i + 1}">×</button></figure>`).join('');
+    strip.hidden = !attachments.length;
+    strip.innerHTML = attachments.map((item, i) => `<figure${item.url ? '' : ' class="file"'}>${item.url ? `<img src="${item.url}" alt="Image ${i + 1} to attach">` : `${icon('page')}<span>${escape(item.name)}</span>`}<button type="button" data-remove="${i}" aria-label="Remove attachment ${i + 1}">×</button></figure>`).join('');
     strip.querySelectorAll('[data-remove]').forEach(b => b.addEventListener('mousedown', event => event.preventDefault()));
     strip.querySelectorAll('[data-remove]').forEach(b => b.addEventListener('click', () => {
-      const [removed] = images.splice(Number(b.dataset.remove), 1);
-      URL.revokeObjectURL(removed.url);
-      renderImages(); updateComposer();
+      const [removed] = attachments.splice(Number(b.dataset.remove), 1);
+      if (removed.url) URL.revokeObjectURL(removed.url);
+      renderAttachments(); updateComposer();
     }));
   }
-  async function addImages(files) {
+  async function addFiles(files) {
     for (const file of files) {
       if (!active()) return;
-      if (images.length >= MAX_IMAGES) { toast(`Up to ${MAX_IMAGES} images per message.`); break; }
-      try {
-        const blob = await prepareImage(file);
-        images.push({ blob, url: URL.createObjectURL(blob), path: null });
-      } catch (e) { toast(e.message); }
+      if (attachments.length >= MAX_ATTACHMENTS) { toast(`Up to ${MAX_ATTACHMENTS} attachments per message.`); break; }
+      try { attachments.push(await prepareAttachment(file)); } catch (e) { toast(e.message); }
     }
-    renderImages(); updateComposer();
+    renderAttachments(); updateComposer();
   }
-  function clearImages() {
-    images.forEach(image => URL.revokeObjectURL(image.url));
-    images = []; renderImages();
+  function clearAttachments() {
+    attachments.forEach(item => { if (item.url) URL.revokeObjectURL(item.url); });
+    attachments = []; renderAttachments();
   }
   // Composer buttons leave focus in the textarea: the keyboard stays open
   // across a send, and blurring would shift the layout under the tap.
   form.querySelectorAll('button').forEach(b => b.addEventListener('mousedown', event => event.preventDefault()));
   $('#cancel-reply').addEventListener('click', () => setReply(null));
   $('#attach-image').addEventListener('click', () => $('#image-input').click());
-  $('#image-input').addEventListener('change', event => { addImages([...event.target.files]); event.target.value = ''; });
+  $('#image-input').addEventListener('change', event => { addFiles([...event.target.files]); event.target.value = ''; });
   area.addEventListener('paste', event => {
-    // Screenshots and copied pictures land as files; text pastes stay untouched.
-    const files = [...(event.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'));
+    // Screenshots, copied pictures and copied files land as files; text pastes stay untouched.
+    const files = [...(event.clipboardData?.files || [])];
     if (!files.length) return;
     event.preventDefault();
-    addImages(files);
+    addFiles(files);
   });
   form.addEventListener('dragover', event => { if ([...event.dataTransfer.types].includes('Files')) { event.preventDefault(); form.classList.add('dragover'); } });
   form.addEventListener('dragleave', () => form.classList.remove('dragover'));
   form.addEventListener('drop', event => {
     form.classList.remove('dragover');
-    const files = [...event.dataTransfer.files].filter(f => f.type.startsWith('image/') || /\.hei[cf]$/i.test(f.name));
+    const files = [...event.dataTransfer.files];
     if (!files.length) return;
     event.preventDefault();
-    addImages(files);
+    addFiles(files);
   });
   const voiceSupported = Boolean(session?.voice && window.MediaRecorder && navigator.mediaDevices?.getUserMedia);
   $('#record-voice').hidden = !voiceSupported;
@@ -448,8 +469,9 @@ function renderChat(pageVersion) {
     // with the day only when it differs from the thread's day.
     const article = (m, day) => `
       <article class="message message-${escape(m.role)}" data-message="${escape(m.id)}">
-        <div class="message-body">${m.role === 'user' ? thumbnails(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
+        <div class="message-body">${m.role === 'user' ? attachmentsHtml(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
+        ${m.role === 'assistant' ? pushNote(m) : ''}
       </article>`;
     const dayOfThread = t => dayOf(t.messages[0].created);
     // The load-earlier button scrolls with the timeline, so it is reached by
@@ -493,30 +515,31 @@ function renderChat(pageVersion) {
   $('#chat-form').addEventListener('submit', async event => {
     event.preventDefault();
     if (sending || !loaded || recorder) return;
-    const text = area.value.trim(); if (!text && !images.length) return;
+    const text = area.value.trim(); if (!text && !attachments.length) return;
     if (!navigator.onLine) { toast('You’re offline. Your draft has not been sent.'); return; }
     sending = true; updateComposer();
     try {
-      for (const [i, image] of images.entries()) {
-        // Uploaded paths stick to the image, so a retried send reuses them.
-        if (image.path) continue;
-        setActivity(`Uploading image ${i + 1} of ${images.length}…`);
-        image.path = (await upload('attachments', image.blob)).path;
+      for (const [i, item] of attachments.entries()) {
+        // Uploaded paths stick to the attachment, so a retried send reuses them.
+        if (item.path) continue;
+        setActivity(`Uploading ${i + 1} of ${attachments.length}…`);
+        item.path = (await upload('attachments', item.blob)).path;
       }
       setActivity('');
-      const attachments = images.map(image => image.path);
+      const paths = attachments.map(item => item.path);
+      const names = Object.fromEntries(attachments.filter(item => item.name).map(item => [item.path, item.name]));
       let pending;
       try { pending = JSON.parse(localStorage.getItem(SUBMISSION_KEY)); } catch {}
       const reply_to = replyTo?.id || null;
-      if (pending?.text !== text || pending?.reply_to !== reply_to || JSON.stringify(pending?.attachments || []) !== JSON.stringify(attachments)) pending = { id: crypto.randomUUID(), text, attachments, reply_to };
+      if (pending?.text !== text || pending?.reply_to !== reply_to || JSON.stringify(pending?.attachments || []) !== JSON.stringify(paths)) pending = { id: crypto.randomUUID(), text, attachments: paths, reply_to };
       localStorage.setItem(SUBMISSION_KEY, JSON.stringify(pending));
-      await api('messages', { id: pending.id, text, attachments, reply_to });
+      await api('messages', { id: pending.id, text, attachments: paths, names, reply_to });
       // Do not erase a new draft typed while the request was in flight.
       if (draft().trim() === text) localStorage.removeItem(DRAFT_KEY);
       localStorage.removeItem(SUBMISSION_KEY);
       if (area.value.trim() === text) { area.value = ''; fit(); }
       setReply(null);
-      clearImages();
+      clearAttachments();
       await loadMessages();
     } catch (e) { toast(e.message); } finally { sending = false; setActivity(''); }
   });

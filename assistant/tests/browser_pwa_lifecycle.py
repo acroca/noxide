@@ -159,7 +159,7 @@ async def main():
             await page.evaluate("() => document.querySelector('#chat-thread').lastChild.remove()")
             # One chat: no topic picker, no channel links, and no second header
             # row under the topbar; Reset context lives in Preferences.
-            assert await page.locator('select').count() == 0
+            assert await page.locator('select:not(#model-select)').count() == 0
             assert await page.locator('#topic-links, #topic-picker, #chat-topic, .channel-picker').count() == 0
             assert await page.locator('.chat-header, .chat-title').count() == 0
             await expect(page.locator('#breadcrumb')).to_have_text('Chat')
@@ -361,11 +361,11 @@ async def main():
             # The divider sits between threads, and the timeline ends on the newest thread, not a divider.
             assert await page.evaluate("() => document.querySelector('.context-divider').nextElementSibling.className") == "thread"
             assert await page.evaluate("() => document.querySelector('#chat-thread').lastElementChild.className") == "thread"
-            # No name labels or full date lines: the side says who wrote it, the
-            # time sits small inside the bubble and names the source on hover.
+            # No name labels or full date lines: the side says who wrote it and
+            # the time sits small inside the bubble.
             assert await page.locator(".message-meta").count() == 0
             state["replies"].append({**reply, "id": "r4", "created": 1700000003.5, "generation": 1, "reply_to": "u1"})
-            await expect(page.locator('[data-message="r4"] .message-time')).to_have_attribute("title", "Web")
+            await expect(page.locator('[data-message="r4"] .message-time')).to_have_count(1)
             assert await page.evaluate("() => /^\\d{1,2}:\\d{2}( [AP]M)?$/.test(document.querySelector('[data-message=\"r4\"] .message-time').textContent)")
             # Every day gets its own separator line, like a chat app.
             await expect(page.locator(".day-divider")).to_have_count(1)
@@ -430,7 +430,7 @@ async def main():
             await expect(page.locator("#composer-images img")).to_have_count(1)
             await page.evaluate(paste)
             await expect(page.locator("#composer-images img")).to_have_count(2)
-            await page.get_by_role("button", name="Remove image 2").click()
+            await page.get_by_role("button", name="Remove attachment 2").click()
             await expect(page.locator("#composer-images img")).to_have_count(1)
             await area.fill("What is this?")
             await page.get_by_role("button", name="Send message", exact=True).click()

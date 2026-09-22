@@ -164,6 +164,15 @@ the chat, in reply mode on that thread. Delivery depends on the OS, browser
 permissions and network. Push is the only channel for reminders: without it,
 a scheduled run's message waits in the chat until you open the app.
 
+Each push records its outcome on the message: how many devices were tried and
+how many push services accepted it (acceptance by the service, not display on
+the device, is the only signal there is). The chat shows a line under a reply
+or reminder only when something went wrong: no device registered, the push
+refused everywhere, or accepted for only some devices. A reminder that no
+focused device has displayed half an hour after its push is pushed once more,
+once; a reminder older than a day is left alone, so a device returning after
+a week is not buried.
+
 **Reminders are threads.** A scheduled run's message is archived as its own
 thread in the chat. Reply to it (or swipe it on a phone) and the assistant
 answers with the reminder in front of it; a message typed on its own after a
@@ -194,10 +203,13 @@ storage. Clear local drafts does not remove those records, to preserve
 deduplication if a response was lost. Clear the site's browser data to remove
 all local records; this also affects installation caches and device preferences.
 On restart, unfinished messages are marked interrupted; they are not blindly
-replayed because they may have performed writes. Copilot outages leave a saved
-message with an explicit Retry action. The same-process retry resumes the
-active agent work in place; after a restart it carries a partial-processing
-warning.
+replayed because they may have performed writes: they wait for Retry, which
+carries a partial-processing warning. A message that failed because Copilot
+was unreachable is retried by itself, oldest first, backing off from 30s to
+5 minutes while the outage lasts (the retry is the health check); a message
+retried in the same process resumes the agent's work in place, one retried
+after a restart reruns with an automatic-retry warning. Retry is still there
+to try at once by hand.
 
 After the first successful service-worker installation, opening without a
 server connection loads the cached interface and shows **[assistant name] is unavailable**
@@ -244,15 +256,20 @@ conversation gone from disk, stop the service and remove or edit
 copies. There is no automatic retention cutoff.
 Stop the service before copying its SQLite database for a consistent backup.
 
-**Images and voice.** The composer takes images three ways: the attach
-button, drag and drop, and pasting a screenshot or copied picture straight into
-the text field. Up to four per message; each is decoded on the device and
-re-encoded as JPEG within 2000px (so iPhone HEIC photos and multi-megabyte
-originals arrive as ordinary JPEGs), stored in the vault's `attachments/`
-folder, shown to the model for that turn only,
-and rendered as a thumbnail in the timeline. The server accepts only JPEG,
-PNG, WebP and GIF bodies up to 20 MB and checks the bytes match the declared
-type. When `ELEVENLABS_API_KEY` is set, a microphone button records a voice
+**Attachments and voice.** The composer takes images and documents three
+ways: the attach button, drag and drop, and pasting a screenshot, a copied
+picture or a copied file straight into the text field. Up to four per
+message. Each image is decoded on the device and re-encoded as JPEG within
+2000px (so iPhone HEIC photos and multi-megabyte originals arrive as ordinary
+JPEGs), stored in the vault's `attachments/` folder, shown to the model for
+that turn only, and rendered as a thumbnail in the timeline. A document (PDF,
+plain text, Markdown, CSV or JSON) is stored as it is; the model gets its
+original name, type and stored path, never its contents, and reads it through
+`extract_attachment` when the request depends on it; the timeline shows it as
+a named chip that opens the file. Other types (video, office documents) are
+refused. The server accepts bodies up to 20 MB and checks the bytes match
+the declared type: image and PDF magic bytes, and UTF-8 without NUL bytes
+for text. When `ELEVENLABS_API_KEY` is set, a microphone button records a voice
 note in the browser (tap to start, tap to stop, up to five minutes) and puts
 the transcript into the text field for you to review and send; nothing is
 sent automatically. Recording needs microphone permission and, on iPhone, an

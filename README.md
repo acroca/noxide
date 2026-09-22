@@ -54,7 +54,7 @@ the app is you.
 | **Web research** | Optional, via a self-hosted [4get](https://git.lolcat.ca/lolcat/4get); runs in an isolated sub-agent with no vault access |
 | **Voice notes** | The app's microphone button records and transcribes via ElevenLabs Scribe; optional, needs an API key |
 | **Photos** | Paste, drop or attach images; sent to the vision model and filed in the vault, driven by your caption |
-| **Documents** | Files already in the vault's `attachments/` folder are read on demand — digital PDFs parsed locally, scans and images transcribed via vision |
+| **Documents** | Attach a PDF or text file from the app, or drop it in the vault's `attachments/` folder; read on demand — digital PDFs parsed locally, scans and images transcribed via vision |
 | **One conversation** | No rooms or channels to pick: say what happened and the bot works out which project or area it concerns |
 | **Threads** | Every message starts a thread; Reply continues it. The model sees the thread plus the day's recent threads as background |
 | **Conversation archive** | Private history in SQLite; older text retrieved on demand |
@@ -123,8 +123,9 @@ past discussion, not a substitute for current vault knowledge.
 Chat is the home screen: one conversation, organised in threads. A separate
 Now tab shows `wiki/now.md` as read-only text. Preferences holds the theme,
 notifications, the model picker, Reset context and the install hint. It takes
-pasted or attached images and voice notes, keeps drafts on the device, and
-supports opt-in push notifications for replies, reminders and restarts.
+pasted or attached images and documents and voice notes, keeps drafts on the
+device, retries messages that hit a Copilot outage by itself, and supports
+opt-in push notifications for replies, reminders and restarts.
 
 There is no app password: keep it behind Tailscale Serve or another restricted
 private network. Anyone who can reach it can use the assistant and read its chats.

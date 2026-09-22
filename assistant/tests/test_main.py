@@ -135,6 +135,8 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
         notify_lifecycle=MagicMock(return_value=None),
         startup_message=MagicMock(return_value="Started"),
         deliver=AsyncMock(),
+        replay_outages=AsyncMock(),
+        nudge_loop=AsyncMock(),
         drain=AsyncMock(side_effect=drain_app),
         close=AsyncMock(side_effect=lambda: events.append("app.close")),
     )

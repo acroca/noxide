@@ -26,8 +26,8 @@ def state_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(retry_queue, "_BACKOFF_INITIAL", 0.005)
-    monkeypatch.setattr(retry_queue, "_BACKOFF_MAX", 0.02)
+    monkeypatch.setattr(retry_queue, "BACKOFF_INITIAL", 0.005)
+    monkeypatch.setattr(retry_queue, "BACKOFF_MAX", 0.02)
 
 
 def _queue(
@@ -171,8 +171,8 @@ async def test_cancel_mid_replay_leaves_item_on_disk(state_dir: Path) -> None:
 
 
 def test_backoff_doubles_to_cap() -> None:
-    assert retry_queue._next_backoff(0.005) == 0.01
-    assert retry_queue._next_backoff(1000.0) == retry_queue._BACKOFF_MAX
+    assert retry_queue.next_backoff(0.005) == 0.01
+    assert retry_queue.next_backoff(1000.0) == retry_queue.BACKOFF_MAX
 
 
 # ------------------------------------------------------------------

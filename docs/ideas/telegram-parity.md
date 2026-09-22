@@ -4,10 +4,15 @@
 section of the root `AGENTS.md`). These are the things the Telegram transport
 did that the web app does not, kept here to pick from. None of them should
 bring a transport abstraction back; each is a web-app feature in its own right.
+Items marked *done* were restored on 2026-09-22 and stay here for the record.
 
 ## Real losses
 
-### Any file type as an attachment
+### Any file type as an attachment — done
+
+*Done 2026-09-22:* PDF, plain text, Markdown, CSV and JSON upload through
+the composer, with the original name carried on the message. Video and office
+formats stay refused: the model can do nothing with them.
 
 Telegram accepted documents and videos, stored them in `attachments/` with the
 original file name and MIME type, and the model could read PDFs on demand
@@ -21,7 +26,11 @@ carrying the original name in the message metadata is most of the work. The
 model-facing note for a non-image attachment should give the stored path,
 original name and MIME type, never the bytes, as the Telegram path did.
 
-### Message bursts
+### Message bursts — not yet a problem
+
+*Decision 2026-09-22:* kept noted, not implemented. There is no way to share
+into the app from another app, so bursts do not happen; revisit if a share
+target is added.
 
 Several messages arriving within a second (a WhatsApp share, a few quick
 lines) were combined into one run with one reply and a
@@ -40,7 +49,12 @@ button puts the transcript in the composer for review, which is one more tap.
 Deliberate for the app, but a "send immediately" mode (long-press, or a
 preference) would recover the old flow.
 
-### Automatic outage replay for messages
+### Automatic outage replay for messages — done
+
+*Done 2026-09-22:* `Companion.replay_outages` drains rows marked
+`unavailable` from the archive with the job queue's backoff; in-process it
+resumes the failed turn, after a restart it reruns with an automatic-retry
+warning. Interrupted work (a restart mid-run) still waits for a hand retry.
 
 A message that hit a Copilot outage was queued durably, the user was told at
 once, and it replayed by itself when Copilot answered again, even across a
@@ -58,7 +72,12 @@ must be installed to the Home Screen for push to work. This is a property of
 the design, not a feature to add; noted so it is not forgotten when choosing
 between the options below.
 
-### Guaranteed delivery of reminders
+### Guaranteed delivery of reminders — partly done
+
+*Done 2026-09-22:* every push records devices tried and accepted on the
+archived row, the timeline shows a line when that fell short, and a reminder
+still unseen half an hour after its push is pushed once more. Still open: an
+escalation channel (email) for reminders flagged important.
 
 A Telegram message is delivered and kept. Push is best effort: it carries a
 500-character preview, can be suppressed by the seen mark, and can be missed.
@@ -97,7 +116,8 @@ success is acceptance by the provider, not display).
 
 ## Suggested order
 
-1. Non-image uploads (smallest change, restores PDF ingestion).
-2. Delivery status on pushed reminders.
-3. Client-side burst merging.
-4. Automatic replay of outage-failed web messages.
+1. ~~Non-image uploads (smallest change, restores PDF ingestion).~~ Done.
+2. ~~Delivery status on pushed reminders.~~ Done; email escalation open.
+3. Client-side burst merging — deferred until the app can be shared into.
+4. ~~Automatic replay of outage-failed web messages.~~ Done.
+5. One-tap voice notes (send the transcript without review).

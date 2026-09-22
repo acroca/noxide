@@ -30,6 +30,7 @@ from .config import Config
 from .conversations import SPACE, ConversationArchive
 from .copilot import CopilotUnavailableError
 from .models import ModelPicker
+from .retry_queue import BACKOFF_INITIAL, next_backoff
 from .tools import VaultTools
 from .transcribe import Transcriber, TranscriptionError
 
@@ -58,10 +59,40 @@ _IMAGE_TYPES = {
     "image/webp": ((b"RIFF",), "webp"),
     "image/gif": ((b"GIF87a", b"GIF89a"), "gif"),
 }
-_ATTACHMENT_PATH = re.compile(r"attachments/\d{4}-\d{2}-\d{2}-[0-9a-f]{6}\.(jpg|png|webp|gif)")
+# Documents the composer can attach besides images. The model gets each one's
+# original name, type and stored path, never the bytes; `extract_attachment`
+# reads them on demand. Text types cannot be sniffed by magic: they must decode
+# as UTF-8 without NUL bytes. No video: the model can do nothing with it.
+_FILE_TYPES = {
+    "application/pdf": ((b"%PDF-",), "pdf"),
+    "text/plain": ((), "txt"),
+    "text/markdown": ((), "md"),
+    "text/csv": ((), "csv"),
+    "application/json": ((), "json"),
+}
+_UPLOAD_TYPES = {**_IMAGE_TYPES, **_FILE_TYPES}
+_ATTACHMENT_PATH = re.compile(r"attachments/\d{4}-\d{2}-\d{2}-[0-9a-f]{6}\.("
+                              + "|".join(ext for _, ext in _UPLOAD_TYPES.values()) + ")")
 _IMAGE_NOTE = "[attached image — already stored in the vault at {path}; link it from a note if it is worth keeping, otherwise leave it]"
 _IMAGE_NOTE_N = "[attached image {n} of {total} — already stored in the vault at {path}; link it from a note if it is worth keeping, otherwise leave it]"
-_NO_CAPTION = "The user sent this image without a caption."
+_FILE_NOTE = "[attached file: {name} ({mime}) — already stored in the vault at {path}; you see its name and path, not its contents: use extract_attachment when they matter, never read_file; link it from a note if it is worth keeping, otherwise leave it]"
+_FILE_NOTE_N = "[attached file {n} of {total}: {name} ({mime}) — already stored in the vault at {path}; you see its name and path, not its contents: use extract_attachment when they matter, never read_file; link it from a note if it is worth keeping, otherwise leave it]"
+_NO_CAPTION_IMAGE = "The user sent this image without a caption."
+_NO_CAPTION = "The user sent this without a caption."
+# An original file name as the message shows it: one path component, no
+# control characters, short.
+MAX_NAME = 120
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# A message that failed on a Copilot outage is retried by itself; the text on
+# its status line says so, and the prefix a rerun after a restart carries.
+OUTAGE_ERROR = "Copilot is unavailable. Your message is saved and will be retried when Copilot answers again."
+AUTO_RETRY_PREFIX = "[Automatic retry after a Copilot outage; earlier work may have partially completed. Re-read state before acting.] "
+# A reminder still unseen this long after its push is pushed once more, on
+# the sweep that runs every NUDGE_POLL_SECONDS. Only reminders: a reply to the
+# user's own message is something they asked for and will look for.
+NUDGE_AFTER_SECONDS = 30 * 60
+NUDGE_POLL_SECONDS = 60
+NUDGE_WINDOW_SECONDS = 24 * 3600
 _ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/style.css": "style.css",
            "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
@@ -89,6 +120,28 @@ def shell_revision(agent_name, root=None):
 
 _MIMES = {".html": "text/html", ".js": "application/javascript", ".css": "text/css",
           ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml"}
+
+
+def _mime_of(path):
+    """The declared type a stored attachment was uploaded as, from its extension."""
+    ext = path.rsplit(".", 1)[-1]
+    return next(mime for mime, (_, stored) in _UPLOAD_TYPES.items() if stored == ext)
+
+
+def _is_text(data):
+    if b"\0" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _safe_name(name):
+    """One path component, no control characters, capped; empty when nothing is left."""
+    base = re.split(r"[/\\]", name)[-1]
+    return " ".join(_CONTROL.sub("", base).split())[:MAX_NAME]
 
 
 class Companion:
@@ -125,6 +178,12 @@ class Companion:
         # What a running message is doing right now, shown on its status line;
         # in memory only, since a restart marks the message interrupted anyway.
         self.activity: dict[str, str] = {}
+        # Set whenever a message fails on a Copilot outage: its archived row,
+        # marked unavailable, is the durable queue that `replay_outages`
+        # drains, including rows left by a previous process.
+        self.outage = asyncio.Event()
+        if self.db.execute("SELECT 1 FROM messages WHERE space=? AND role='user' AND status='unavailable'", (SPACE,)).fetchone():
+            self.outage.set()
         self.accepting = True
         self.runner: web.AppRunner | None = None
         self.push_key = cfg.state_dir / "webpush.pem"
@@ -191,7 +250,7 @@ class Companion:
             "Cache-Control": response.headers.get("Cache-Control", "no-store"), "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
             "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+            "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
             "frame-ancestors 'none'; form-action 'self'",
         })
         return response
@@ -307,8 +366,9 @@ class Companion:
             if parent is None or parent["space"] != SPACE or parent["status"] == "deleted":
                 raise web.HTTPBadRequest(text="The message you are replying to is not in this chat")
         attachments = self._attachments(data.get("attachments", []))
+        names = self._names(data.get("names"), attachments)
         if not isinstance(text, str) or len(text) > 20000 or not (text.strip() or attachments):
-            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters or an image")
+            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters or an attachment")
         if not isinstance(message_id, str) or not re.fullmatch(r"[a-f0-9-]{32,36}", message_id):
             raise web.HTTPBadRequest(text="A valid message ID is required")
         existing = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
@@ -321,46 +381,70 @@ class Companion:
         # Several messages may be pending: each is its own thread and its own
         # run, in parallel; replies within one thread are serialized in
         # arrival order by the agent's thread lock.
-        self._insert(SPACE, "user", text, "queued", message_id=message_id, reply_to=reply_to,
-                     metadata={"attachments": attachments} if attachments else None)
+        metadata = {"attachments": attachments, **({"names": names} if names else {})} if attachments else None
+        self._insert(SPACE, "user", text, "queued", message_id=message_id, reply_to=reply_to, metadata=metadata)
         self._launch(message_id)
         return web.json_response({"id": message_id}, status=202)
 
     def _attachments(self, value):
         """Validate stored attachment paths a message refers to."""
         if not isinstance(value, list) or len(value) > MAX_ATTACHMENTS:
-            raise web.HTTPBadRequest(text=f"Attach up to {MAX_ATTACHMENTS} images per message")
+            raise web.HTTPBadRequest(text=f"Attach up to {MAX_ATTACHMENTS} files per message")
         for path in value:
             if not isinstance(path, str) or not _ATTACHMENT_PATH.fullmatch(path) or not self._attachment_file(path).is_file():
                 raise web.HTTPBadRequest(text="Unknown attachment; upload it again")
         return value
+
+    def _names(self, value, attachments):
+        """Original file names by stored path, as the model and the timeline show them."""
+        if value is None:
+            return {}
+        if not isinstance(value, dict) or not set(value) <= set(attachments):
+            raise web.HTTPBadRequest(text="File names must belong to the message's attachments")
+        names = {}
+        for path, name in value.items():
+            if not isinstance(name, str):
+                raise web.HTTPBadRequest(text="File names must be text")
+            if clean := _safe_name(name):
+                names[path] = clean
+        return names
 
     def _attachment_file(self, path):
         if not _ATTACHMENT_PATH.fullmatch(path or ""):
             raise web.HTTPBadRequest(text="Not an attachment path")
         return self.vault.abs_path(path)
 
-    def _image_turn(self, row):
-        """The model-facing text and vision input for a stored web message."""
+    def _attachment_turn(self, row):
+        """The model-facing text and vision input for a stored web message.
+
+        Images ride the turn as vision input with a stored-path note each;
+        other files contribute only a note with their original name, type and
+        path. Both kinds are numbered separately when there are several.
+        """
         text = row["text"]
-        attachments = json.loads(row["metadata"] or "{}").get("attachments", [])
+        metadata = json.loads(row["metadata"] or "{}")
+        attachments, names = metadata.get("attachments", []), metadata.get("names", {})
         if not attachments:
             return text, None
-        notes = [_IMAGE_NOTE.format(path=attachments[0])] if len(attachments) == 1 else [
-            _IMAGE_NOTE_N.format(n=n, total=len(attachments), path=path) for n, path in enumerate(attachments, 1)]
-        urls = []
-        for path in attachments:
-            data = self._attachment_file(path).read_bytes()
-            mime = next((mime for mime, (_, ext) in _IMAGE_TYPES.items() if path.endswith("." + ext)), "image/jpeg")
-            urls.append(f"data:{mime};base64," + base64.b64encode(data).decode())
-        return (text.strip() or _NO_CAPTION) + "\n\n" + "\n".join(notes), urls
+        images = [path for path in attachments if _mime_of(path) in _IMAGE_TYPES]
+        files = [path for path in attachments if path not in images]
+        notes = [_IMAGE_NOTE.format(path=images[0])] if len(images) == 1 else [
+            _IMAGE_NOTE_N.format(n=n, total=len(images), path=path) for n, path in enumerate(images, 1)]
+        for n, path in enumerate(files, 1):
+            fields = {"name": names.get(path) or path.rsplit("/", 1)[-1], "mime": _mime_of(path), "path": path}
+            notes.append(_FILE_NOTE.format(**fields) if len(files) == 1 else _FILE_NOTE_N.format(n=n, total=len(files), **fields))
+        urls = [f"data:{_mime_of(path)};base64," + base64.b64encode(self._attachment_file(path).read_bytes()).decode()
+                for path in images]
+        caption = text.strip() or (_NO_CAPTION_IMAGE if not files else _NO_CAPTION)
+        return caption + "\n\n" + "\n".join(notes), urls or None
 
-    def _launch(self, message_id):
-        task = asyncio.create_task(self._process(message_id))
+    def _launch(self, message_id, *, automatic=False):
+        task = asyncio.create_task(self._process(message_id, automatic=automatic))
         self.tasks[message_id] = task
         task.add_done_callback(lambda _: self.tasks.pop(message_id, None))
 
-    async def _process(self, message_id):
+    async def _process(self, message_id, *, automatic=False):
+        """Run one archived message; ``automatic`` marks a replay after a Copilot outage."""
         row = self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
         # Stays 'queued' while waiting behind earlier messages; Agent.run
         # marks it 'running' once it holds the conversation lock.
@@ -371,7 +455,7 @@ class Companion:
             self._insert(SPACE, "assistant", text, "done", reply_to=message_id)
 
         try:
-            text, image_data_urls = self._image_turn(row)
+            text, image_data_urls = self._attachment_turn(row)
             if message_id in self.hot:
                 # The failed turn is still in the agent's history: resume it
                 # in place rather than replaying the message (and its writes).
@@ -381,7 +465,11 @@ class Companion:
             else:
                 self.hot.add(message_id)
                 if row["error"]:
-                    text = "[Explicit retry after interruption; earlier work may have partially completed. Re-read state before acting.] " + text
+                    # A rerun, not a resume: the failed turn is gone from
+                    # memory (a restart), so the model is told the first
+                    # attempt may have acted already.
+                    text = (AUTO_RETRY_PREFIX if automatic else
+                            "[Explicit retry after interruption; earlier work may have partially completed. Re-read state before acting.] ") + text
 
                 async def researching():
                     self.activity[message_id] = "Searching the web…"
@@ -394,10 +482,10 @@ class Companion:
                 raise RuntimeError("Iteration limit reached. Some work may have completed; retry to continue.")
             self.db.execute("UPDATE messages SET status='done', error='' WHERE id=? AND status NOT IN ('deleted','dismissed')", (message_id,))
             self.hot.discard(message_id)
-            self.notify_push(reply or "", thread=row["thread"])
+            self.notify_push(reply or "", thread=row["thread"], message_id=f"reply:{message_id}")
         except CopilotUnavailableError:
-            self.db.execute("UPDATE messages SET status='unavailable', error=? WHERE id=?",
-                            ("Copilot is unavailable. Your message is saved; retry when ready.", message_id))
+            self.db.execute("UPDATE messages SET status='unavailable', error=? WHERE id=?", (OUTAGE_ERROR, message_id))
+            self.outage.set()
         except asyncio.CancelledError:
             self.db.execute("UPDATE messages SET status='interrupted', error=? WHERE id=?",
                             ("Service stopped. Work may have partially completed; review before retrying.", message_id))
@@ -425,6 +513,42 @@ class Companion:
         self._launch(message_id)
         return web.json_response({"ok": True})
 
+    async def replay_outages(self):
+        """Retry messages that failed on a Copilot outage, oldest first, backing off while it lasts.
+
+        The archived rows marked unavailable are the queue, so a restart
+        mid-outage loses nothing. In this process the failed turn is resumed
+        in place; after a restart the message reruns with a warning. The
+        retry is the health probe: no separate check could pass while chat
+        still fails. A row the user retried by hand meanwhile is skipped, and
+        interrupted work (a restart mid-run) is never replayed: it waits for
+        an explicit retry because it may have written already.
+        """
+        delay = BACKOFF_INITIAL
+        while True:
+            await self.outage.wait()
+            row = self.db.execute(
+                "SELECT id FROM messages WHERE space=? AND role='user' AND status='unavailable' ORDER BY created LIMIT 1",
+                (SPACE,)).fetchone()
+            if row is None or not self.accepting:
+                self.outage.clear()
+                continue
+            message_id = row["id"]
+            if message_id not in self.tasks and len(self.tasks) < MAX_IN_FLIGHT:
+                self.db.execute("UPDATE messages SET status='queued' WHERE id=?", (message_id,))
+                self.db.commit()
+                self._launch(message_id, automatic=True)
+            if task := self.tasks.get(message_id):
+                # Not `await task`: cancelling this loop at shutdown must not
+                # cancel the run, which the app's drain is waiting for.
+                await asyncio.wait({task})
+            if self.archive.get(message_id)["status"] != "unavailable":
+                delay = BACKOFF_INITIAL
+                continue
+            logger.warning("Copilot still unavailable; retrying web message in %.0fs", delay)
+            await asyncio.sleep(delay)
+            delay = next_backoff(delay)
+
     async def reset(self, request):
         if self.db.execute("SELECT 1 FROM messages WHERE space=? AND status IN ('running','queued')", (SPACE,)).fetchone():
             raise web.HTTPConflict(text="Wait for the current run to finish")
@@ -439,7 +563,7 @@ class Companion:
         message typed on its own sees it through the ambient block.
         """
         thread = self._insert(SPACE, "assistant", text, "done")
-        self.notify_push(text, thread=thread)
+        self.notify_push(text, thread=thread, message_id=thread)
 
     async def subscribe(self, request):
         if not self.public_key:
@@ -504,14 +628,16 @@ class Companion:
         return data
 
     async def upload(self, request):
-        """Store one image in the vault's attachments folder."""
+        """Store one image or document in the vault's attachments folder."""
         declared = request.content_type
-        if declared not in _IMAGE_TYPES:
-            raise web.HTTPBadRequest(text="Only JPEG, PNG, WebP and GIF images can be attached")
+        if declared not in _UPLOAD_TYPES:
+            raise web.HTTPBadRequest(text="Only images (JPEG, PNG, WebP, GIF), PDFs and text files (plain, Markdown, CSV, JSON) can be attached")
         data = await self._read_upload(request)
-        magic, ext = _IMAGE_TYPES[declared]
-        if not data.startswith(magic):
-            raise web.HTTPBadRequest(text="That file is not the image type it claims to be")
+        magic, ext = _UPLOAD_TYPES[declared]
+        if magic and not data.startswith(magic):
+            raise web.HTTPBadRequest(text="That file is not the type it claims to be")
+        if not magic and not _is_text(data):
+            raise web.HTTPBadRequest(text="That file is not text")
         path = await asyncio.to_thread(self.vault.save_attachment, data, ext)
         return web.json_response({"path": path, "bytes": len(data)})
 
@@ -519,8 +645,7 @@ class Companion:
         file = self._attachment_file(request.query.get("path", ""))
         if not file.is_file():
             raise web.HTTPNotFound(text="Attachment not found")
-        mime = next(mime for mime, (_, ext) in _IMAGE_TYPES.items() if file.suffix == "." + ext)
-        return web.Response(body=await asyncio.to_thread(file.read_bytes), content_type=mime,
+        return web.Response(body=await asyncio.to_thread(file.read_bytes), content_type=_mime_of(file.name),
                             headers={"Cache-Control": "private, max-age=86400"})
 
     async def transcribe(self, request):
@@ -552,16 +677,57 @@ class Companion:
             " AND created > COALESCE((SELECT through FROM seen WHERE space=?), 0)",
             (SPACE, SPACE)).fetchone()[0]
 
-    def notify_push(self, text="", *, thread=None, grace=True):
+    def notify_push(self, text="", *, thread=None, grace=True, message_id=None):
+        """Push a reply or reminder; ``message_id`` names the archived row that records the outcome."""
         if not self.public_key or len(self.push_tasks) >= 8:
             return
         row = self.db.execute("SELECT max(created) FROM messages WHERE space=? AND role='assistant' AND status!='deleted'",
                               (SPACE,)).fetchone()
         created = row[0] if row and row[0] is not None else time.time()
-        task = asyncio.create_task(self._push_unless_seen(text, created, thread) if grace
-                                   else self._push(text, thread))
+        task = asyncio.create_task(self._push_unless_seen(text, created, thread, message_id) if grace
+                                   else self._push(text, thread, message_id=message_id))
         self.push_tasks.add(task)
         task.add_done_callback(self.push_tasks.discard)
+
+    def _record_push(self, message_id, outcome):
+        """Merge a push outcome into the archived row's metadata, for the timeline and the nudge sweep."""
+        row = self.archive.get(message_id)
+        if row is None:
+            return
+        metadata = json.loads(row["metadata"] or "{}")
+        metadata["push"] = {**metadata.get("push", {}), **outcome}
+        self.db.execute("UPDATE messages SET metadata=? WHERE id=?", (json.dumps(metadata, ensure_ascii=False), message_id))
+        self.db.commit()
+
+    async def nudge_unseen(self):
+        """Push once more each reminder still unseen NUDGE_AFTER_SECONDS after it was pushed.
+
+        Reminders only: threads the assistant started. Each is nudged once,
+        marked on its row, and only within the last day, so a device that
+        has been away for a week is not buried on its return.
+        """
+        if not self.public_key:
+            return
+        now = time.time()
+        rows = self.db.execute(
+            "SELECT id, text, metadata FROM messages WHERE space=? AND role='assistant' AND status='done'"
+            " AND id=thread AND created<? AND created>? AND created>? ORDER BY created",
+            (SPACE, now - NUDGE_AFTER_SECONDS, now - NUDGE_WINDOW_SECONDS, self.seen.get(SPACE, 0.0))).fetchall()
+        for row in rows:
+            push = json.loads(row["metadata"] or "{}").get("push")
+            if push is None or push.get("nudged") or push.get("displayed"):
+                continue
+            self._record_push(row["id"], {"nudged": True})
+            logger.info("Reminder still unseen after %d min; pushing again", NUDGE_AFTER_SECONDS // 60)
+            await self._push(row["text"], row["id"], message_id=row["id"])
+
+    async def nudge_loop(self):
+        while True:
+            await asyncio.sleep(NUDGE_POLL_SECONDS)
+            try:
+                await self.nudge_unseen()
+            except Exception:
+                logger.exception("Reminder nudge sweep failed")
 
     def notify_lifecycle(self, text, *, important=False):
         """Push a process event (restarting, started) to the devices that asked.
@@ -595,7 +761,7 @@ class Companion:
             atomic_write_text(marker, current + "\n")
         return STARTED_WITH_UPDATE if previous and previous != current else STARTED
 
-    async def _push_unless_seen(self, text, created, thread=None):
+    async def _push_unless_seen(self, text, created, thread=None, message_id=None):
         # "Seen" means displayed on a focused, recently used device with the
         # thread scrolled to the end, not proof of reading; a device that
         # acknowledges after the window still gets the push, since it cannot
@@ -603,10 +769,19 @@ class Companion:
         await asyncio.sleep(PUSH_GRACE_SECONDS)
         if self.seen.get(SPACE, 0.0) >= created:
             logger.debug("Push skipped: already displayed on a focused device")
+            if message_id:
+                self._record_push(message_id, {"displayed": True})
             return
-        await self._push(text, thread)
+        await self._push(text, thread, message_id=message_id)
 
-    async def _push(self, text="", thread=None, *, kind="reply", opted_in_only=False):
+    async def _push(self, text="", thread=None, *, kind="reply", opted_in_only=False, message_id=None):
+        """Send one push to every (or every opted-in) device.
+
+        With ``message_id``, the outcome — devices tried and devices whose
+        provider accepted the push — is recorded on that archived row. Push
+        acceptance is the provider taking the message, not the device
+        displaying it; it is still the only delivery signal there is.
+        """
         from pywebpush import WebPushException, webpush
         from requests import Session
 
@@ -632,9 +807,12 @@ class Companion:
                         requests_session=transport)
 
         query = "SELECT * FROM subscriptions" + (" WHERE lifecycle=1" if opted_in_only else "")
-        for row in self.db.execute(query).fetchall():
+        rows = self.db.execute(query).fetchall()
+        accepted = 0
+        for row in rows:
             try:
                 await asyncio.to_thread(deliver, json.loads(row["data"]))
+                accepted += 1
             except WebPushException as exc:
                 if exc.response is not None and exc.response.status_code in (404, 410):
                     self.db.execute("DELETE FROM subscriptions WHERE endpoint=?", (row["endpoint"],))
@@ -643,6 +821,8 @@ class Companion:
                     logger.warning("Web push delivery failed")
             except Exception:
                 logger.warning("Web push delivery failed")
+        if message_id:
+            self._record_push(message_id, {"at": time.time(), "devices": len(rows), "accepted": accepted})
 
     def pending(self):
         """Web runs in flight, queued ones included."""
