@@ -28,6 +28,14 @@ _MAX_ITERATIONS = 20
 # Public so callers that must not mistake an abandoned run for a completed one
 # (inbox ingestion clears processed entries) can recognize it.
 MAX_ITERATIONS_REPLY = "[Reached maximum tool-call iterations. Please rephrase your request.]"
+# Delivered instead of the sentinel when a scheduled run is abandoned at the
+# cap: the sentinel is a protocol value for callers, not a message for the
+# user (a catch-up compile once delivered it verbatim, 2026-09-22).
+_JOB_CAP_NOTICE = (
+    "A scheduled run stopped at its tool-call limit before finishing: \u201c{prompt}\u201d. "
+    "What it did before that point is kept; the rest was not done."
+)
+_JOB_CAP_PROMPT_CHARS = 80
 _TOOL_TIMEOUT = 60.0
 # Tools that make their own model calls get longer budgets: research and
 # extraction run one sub-agent/vision call, fan_out runs a whole batch of
@@ -94,9 +102,9 @@ _AMBIENT_HEADER = (
 )
 
 
-def _clip(text: str) -> str:
+def _clip(text: str, limit: int = _AMBIENT_CHARS) -> str:
     text = " ".join(text.split())
-    return text if len(text) <= _AMBIENT_CHARS else text[:_AMBIENT_CHARS] + "…"
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 _SNAPSHOT_HEADER = (
@@ -910,6 +918,10 @@ class Agent:
             send_message_fn=counting_send,
             response_format=_JOB_CLOSE_RESPONSE_FORMAT,
         )
+        if reply == MAX_ITERATIONS_REPLY:
+            if base_send:
+                await counting_send(_JOB_CAP_NOTICE.format(prompt=_clip(prompt, _JOB_CAP_PROMPT_CHARS)))
+            return reply
         close = _parse_job_close(reply)
         if close is not None:
             if close["silent"] or delivered or not close["message"] or base_send is None:

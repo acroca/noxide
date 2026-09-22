@@ -2317,3 +2317,29 @@ async def test_nonterminal_chat_end_preserves_unbounded_uncompacted_work(
     outputs = [m["content"] for m in sent if m["role"] == "tool"]
     assert len(outputs) == 2
     assert all("x" * 6000 in output for output in outputs)
+
+
+@pytest.mark.asyncio
+async def test_run_job_at_iteration_cap_delivers_plain_notice(vault: VaultTools) -> None:
+    """A job abandoned at the cap tells the user in a sentence, never the raw sentinel."""
+    from assistant.agent import MAX_ITERATIONS_REPLY
+
+    captured: list[str] = []
+    agent = _job_agent(vault, captured)
+    vault.write_file("page.md", "hello")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=_make_tool_call_response("read_file", {"path": "page.md"}),
+    )
+
+    with (
+        patch("assistant.copilot.get_client", return_value=mock_client),
+        patch("assistant.agent._MAX_ITERATIONS", 2),
+    ):
+        reply = await agent.run_job("Nightly compile. Run the Compile procedure.")
+
+    assert reply == MAX_ITERATIONS_REPLY
+    assert len(captured) == 1
+    assert MAX_ITERATIONS_REPLY not in captured[0]
+    assert "Nightly compile" in captured[0]
+    assert "tool-call limit" in captured[0]
