@@ -349,6 +349,9 @@ tables are dropped on the first start, and `state/chat_id` is unused and can
 be deleted. Any Telegram messages still in the outage retry queue are dropped
 with a log line.
 
+What the web app does not yet do that Telegram did is listed in
+[ideas/telegram-parity.md](ideas/telegram-parity.md).
+
 ### Backups
 
 Everything that matters is in two directories:
