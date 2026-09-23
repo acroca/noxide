@@ -21,8 +21,8 @@ The raw-journal + compiled-wiki design and its operations (ingest/query/compile/
      the built-in English defaults so operations apply unambiguously. Example:
      - Routines table header: `| Rutina | Frecuencia | Última vez | Próxima | Notas |`
        (= Routine / Frequency / Last done / Next due / Notes)
-     - `now.md` sections: **Hoy** (= Today), **Próximo** (= Upcoming), …
-     - Status label: `**Estado:**`; tasks: `(para …)` / `(hecho …)` / `(esperando: X)`
+     - `now.md` sections: **Hoy** (= Today), **Próximo** (= Upcoming), **Sin prisa** (= Someday), …
+     - Status label: `**Estado:**`; tasks: `(para …)` / `(hecho …)` / `(esperando: X)` / `(sin prisa)` (= someday)
      Localize the words, never the date format: the argument of a task marker stays
      ISO (`(para 2026-08-12)`), and so does every other date in the vault. Weekday
      names in `now.md` are user-visible text and do localize. -->

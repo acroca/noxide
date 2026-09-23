@@ -69,7 +69,10 @@ vault/
 - **Tasks** are owned by project/area pages under `## Tasks`: `- [ ] thing (due
   YYYY-MM-DD)`, `- [x] thing (done YYYY-MM-DD)`, and `(waiting: X)` when blocked
   on someone else. Every open task is also mirrored into `now.md`'s **Tasks**
-  section; the page copy is the authority.
+  section; the page copy is the authority. A task that is wanted but not
+  urgent carries `(someday)` instead of a date: it never reaches Today, is
+  never escalated, and is listed in `now.md`'s **Someday** section, which the
+  weekly lint reads out so it is not forgotten.
 - **Dated events** (an appointment, a trip, a school calendar) live on the
   owning page as `- YYYY-MM-DD — description` bullets (`YYYY-MM-DD HH:MM`
   with a time, `YYYY-MM-DD → YYYY-MM-DD` for a range). Every one within the
@@ -130,8 +133,10 @@ lists as overdue a week or more with a reschedule-or-drop proposal, then
 reviews every live project and area page (one fan-out worker per page):
 status paragraphs against the
 page body and the last two weeks of journal, projects with no journal mention
-in 30+ days (proposing to archive them), tasks open 21+ days, scheduled jobs
-referencing missing files, and the same task tracked on more than one page.
+in 30+ days (proposing to archive them), tasks open 21+ days (someday ones
+excepted), scheduled jobs referencing missing files, and the same task tracked
+on more than one page. It also reads the Someday list out, asking whether any
+of it should get a date now.
 
 Both jobs lean on **`check_vault`**, a deterministic consistency checker built
 into the bot: pure code, no model involved. It enumerates every open task on

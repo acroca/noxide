@@ -106,6 +106,7 @@ def run_checks(
         _mirror_findings(root, wiki_files)
         + event_findings(wiki_files, today)
         + _overdue_findings(wiki_files, today, (log_dates or {}).get("compile"))
+        + _someday_findings(wiki_files)
         + _maintenance_findings(log_dates, today, maintenance)
         + _weekday_findings(wiki_files)
         + _reminder_findings(root, wiki_files)
@@ -282,6 +283,87 @@ def _overdue_findings(
             findings.append((
                 _OVERDUE_HEADING,
                 f'{rel}:{i}: overdue {age} day{"s" if age != 1 else ""} (due {due}): "{text}"{note}',
+            ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Someday tasks: wanted, no rush. "(someday)" replaces the date, so the task
+# never reaches Today and never lapses; now.md lists it under Tasks like any
+# open task and, grouped, under its own Someday section, which the lint reads
+# out weekly. Eight soft-dated tasks once sat in Today for weeks and were
+# escalated every Sunday without an answer (2026-09). The marker word and
+# the heading are enumerated in the languages vaults use (en/es/ca).
+# ---------------------------------------------------------------------------
+
+_SOMEDAY_HEADING = "Someday tasks (wiki/now.md Someday section vs wiki pages)"
+
+_SOMEDAY_WORDS = r"(?:someday|sin prisa|alg[uú]n d[ií]a)"
+_SOMEDAY_MARKER = re.compile(r"\(" + _SOMEDAY_WORDS + r"\)", re.IGNORECASE)
+_SOMEDAY_SECTION = re.compile(r"^##\s+" + _SOMEDAY_WORDS + r"\s*$", re.IGNORECASE)
+_ANY_SECTION = re.compile(r"^##\s")
+
+
+def _someday_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
+    someday: list[tuple[str, int, str]] = []
+    findings = []
+    now_lines: list[str] | None = None
+    for rel, lines in wiki_files:
+        if rel == _NOW_PATH:
+            now_lines = lines
+            continue
+        if rel.startswith("wiki/archive/"):
+            continue
+        for i, line in _content_lines(lines):
+            m = _OPEN_TASK.match(line)
+            if m is None or not _SOMEDAY_MARKER.search(m.group("text")):
+                continue
+            text = m.group("text")
+            if _DUE_RX.search(text):
+                findings.append((
+                    _SOMEDAY_HEADING,
+                    f'{rel}:{i}: task carries both a due date and a someday marker — keep one: "{text}"',
+                ))
+                continue
+            someday.append((rel, i, text))
+    if now_lines is None:
+        return findings
+
+    section: list[tuple[int, str]] | None = None
+    inside = False
+    for i, line in _content_lines(now_lines):
+        stripped = line.strip()
+        if _SOMEDAY_SECTION.match(stripped):
+            inside, section = True, []
+            continue
+        if _ANY_SECTION.match(stripped):
+            inside = False
+            continue
+        if inside and section is not None and (m := _OPEN_TASK.match(line)):
+            section.append((i, m.group("text")))
+    if section is None:
+        if someday:
+            findings.append((
+                _SOMEDAY_HEADING,
+                f"{_NOW_PATH}: no Someday section — add one (`## Someday`, localized as the vault "
+                f"instructions say) listing every someday task, one line each with its page",
+            ))
+        return findings
+
+    listed = [_normalize(text) for _, text in section]
+    for rel, i, text in someday:
+        if not any(_normalize(text) in entry for entry in listed):
+            findings.append((
+                _SOMEDAY_HEADING,
+                f'{rel}:{i}: someday task not listed under the Someday section of {_NOW_PATH}: "{text}"',
+            ))
+    wanted = [_normalize(text) for _, _, text in someday]
+    for i, text in section:
+        entry = _normalize(text)
+        if not any(w in entry or entry in w for w in wanted):
+            findings.append((
+                _SOMEDAY_HEADING,
+                f'{_NOW_PATH}:{i}: line under Someday is not a someday task on any page: "{text}"',
             ))
     return findings
 

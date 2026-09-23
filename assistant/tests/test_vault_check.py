@@ -1305,3 +1305,57 @@ def test_routine_row_naming_no_routine_is_a_hygiene_finding(tmp_path: Path) -> N
     report = _check(tmp_path)
     assert "bbbb2222" in report and "Piano" in report and "routines.md" in report
     assert "aaaa1111" not in report
+
+
+# ---------------------------------------------------------------------------
+# Someday tasks: wanted, no rush — "(someday)" instead of a date, listed in
+# now.md's own Someday section as well as under Tasks, never in Today.
+# ---------------------------------------------------------------------------
+
+def _someday_vault(root: Path, now_md: str) -> None:
+    _write(root, "wiki/areas/casa.md", "# Casa\n\n## Tasks\n- [ ] ordenar los cables (someday)\n- [ ] arreglar la cisterna (due 2026-08-05)\n")
+    _write(root, "wiki/now.md", now_md)
+
+
+def test_someday_task_mirrored_under_its_section_is_clean(tmp_path: Path) -> None:
+    _someday_vault(tmp_path, "# Now\n\n## Tasks\n[casa](areas/casa.md)\n- [ ] ordenar los cables (someday)\n"
+                   "- [ ] arreglar la cisterna (due 2026-08-05)\n\n## Someday\n- [ ] ordenar los cables (someday) — [casa](areas/casa.md)\n")
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_someday_task_missing_from_the_someday_section_is_reported(tmp_path: Path) -> None:
+    _someday_vault(tmp_path, "# Now\n\n## Tasks\n[casa](areas/casa.md)\n- [ ] ordenar los cables (someday)\n"
+                   "- [ ] arreglar la cisterna (due 2026-08-05)\n\n## Someday\n")
+    report = _check(tmp_path)
+    assert "Someday" in report and "wiki/areas/casa.md:4" in report and "ordenar los cables" in report
+
+
+def test_someday_section_missing_entirely_is_one_finding(tmp_path: Path) -> None:
+    _someday_vault(tmp_path, "# Now\n\n## Tasks\n[casa](areas/casa.md)\n- [ ] ordenar los cables (someday)\n"
+                   "- [ ] arreglar la cisterna (due 2026-08-05)\n")
+    report = _check(tmp_path)
+    assert "no Someday section" in report and report.count("Someday") >= 1
+    assert "casa.md:4" not in report
+
+
+def test_dated_task_listed_under_someday_is_reported(tmp_path: Path) -> None:
+    _someday_vault(tmp_path, "# Now\n\n## Tasks\n[casa](areas/casa.md)\n- [ ] ordenar los cables (someday)\n"
+                   "- [ ] arreglar la cisterna (due 2026-08-05)\n\n## Someday\n- [ ] ordenar los cables (someday)\n"
+                   "- [ ] arreglar la cisterna (due 2026-08-05)\n")
+    report = _check(tmp_path)
+    assert "wiki/now.md:10" in report and "not a someday task" in report
+
+
+def test_task_with_both_a_date_and_someday_is_reported(tmp_path: Path) -> None:
+    _write(tmp_path, "wiki/areas/casa.md", "# Casa\n\n## Tasks\n- [ ] pintar (due 2026-09-01) (someday)\n")
+    _write(tmp_path, "wiki/now.md", "# Now\n\n## Tasks\n- [ ] pintar (due 2026-09-01) (someday)\n\n## Someday\n- [ ] pintar (due 2026-09-01) (someday)\n")
+    report = _check(tmp_path)
+    assert "wiki/areas/casa.md:4" in report and "both" in report
+
+
+def test_localized_someday_marker_and_heading(tmp_path: Path) -> None:
+    _write(tmp_path, "wiki/areas/casa.md", "# Casa\n\n## Tareas\n- [ ] ordenar los cables (sin prisa)\n")
+    _write(tmp_path, "wiki/now.md", "# Now\n\n## Tareas\n- [ ] ordenar los cables (sin prisa)\n\n## Sin prisa\n- [ ] ordenar los cables (sin prisa)\n")
+    assert _check(tmp_path) == "[no findings]"
+    _write(tmp_path, "wiki/now.md", "# Now\n\n## Tareas\n- [ ] ordenar los cables (sin prisa)\n\n## Algún día\n")
+    assert "casa.md:4" in _check(tmp_path)

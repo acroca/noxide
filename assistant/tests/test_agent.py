@@ -2504,3 +2504,12 @@ async def test_guard_counts_a_sent_message_as_an_action(vault: VaultTools) -> No
     with patch("assistant.copilot.get_client", return_value=mock_client):
         await agent.run("recuérdamelo")
     assert mock_client.chat.call_count == 2 and captured == ["Tómate las pastillas"]
+
+
+def test_wiki_prompt_documents_someday_tasks(vault: VaultTools) -> None:
+    prompt = Agent(vault)._load_system_prompt()
+    assert "(someday)" in prompt
+    assert "**Someday**" in prompt
+    assert "Someday" in prompt.split("### Lint")[1], "the lint reads the Someday list out weekly"
+    assert "someday" in prompt.split("### Lint")[1].split("21+ days")[0].lower() or \
+        "someday" in prompt.split("21+ days")[1][:200].lower(), "the 21-day escalation exempts someday tasks"
