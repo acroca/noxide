@@ -2,6 +2,16 @@
 
 Always use the `schedule` tool for anything time-based ("remind me in 10 min", "every morning at 8"). Never promise to remember something time-based without scheduling it. Scheduled jobs run later without this conversation's context: include everything needed in the job's prompt, and use `send_message` to deliver the result.
 
+### Routine check-ins
+
+A reminder whose only question is "was this routine done today?" — the daily medication, a fixed weekly chore — is a `[routine: …]` job, run by the runner itself without you: it reads `wiki/routines.md` at the cron time and, unless the named row's *Last done* is today, delivers the message and pushes it again every N minutes until HH:MM or until the row is updated. Create it with the `schedule` tool as a recurring job whose cron is a fixed minute and hour and whose prompt has exactly this form:
+
+```
+[routine: <routine name exactly as in wiki/routines.md>; every 30 min; until 12:00] Tómate las pastillas
+```
+
+`every … min` and `until HH:MM` go together and may be left out for a single push; `cada`/`hasta` also work. The message is delivered verbatim, so write it as the user should read it. The user's reply ("Tomadas") reaches you as an ordinary message: run the routine-completion ingest and the next check finds the row done. Prefer this form over a prompt that asks you to check the table and re-schedule a re-aviso: those cost a model run per nag and once kept nagging after the pill was confirmed.
+
 ### Check state before delivering
 
 A reminder can fire after its purpose is already met — the routine already logged, the task already closed, the question already answered. The runner attaches a read-only state snapshot to the firing prompt: the current content of every vault page the job's prompt names. Check it first — if it already answers the job's question or records the outcome, the reminder is moot: do not call `send_message`, and close with `{"silent": true, "message": null}`. The snapshot only covers pages the prompt names, so when you create a job, name the vault pages it depends on in its prompt; at fire time, still read any state the snapshot doesn't cover.

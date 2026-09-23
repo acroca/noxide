@@ -38,6 +38,13 @@ from apscheduler.triggers.date import DateTrigger
 
 from .copilot import CopilotUnavailableError
 from .maintenance import BuiltinJob, MaintenanceState
+from .routines import (
+    RoutineSpec,
+    fixed_time,
+    is_routine_prompt,
+    parse_routine_prompt,
+    routine_last_done,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,9 +183,20 @@ class Scheduler:
         queue_job_fn: Callable[[str], None] | None = None,
         builtins: Iterable[BuiltinJob] = (),
         maintenance_state: MaintenanceState | None = None,
+        remind_fn: Callable[[str, str | None], Coroutine[Any, Any, str | None]] | None = None,
     ) -> None:
         self._vault = vault_tools
         self._run_job = run_job_fn
+        # Routine check-ins ([routine: …] rows, routines.py) push through
+        # this instead of running the model: remind(text, thread) delivers
+        # on the first call and re-pushes the same thread after.
+        self._remind = remind_fn
+        self._local_now: Callable[[], datetime] = lambda: datetime.now(ZoneInfo(tz_name))
+        self._routine_sleep: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep
+        # Repeat loops of routine check-ins, cancelled outright by drain():
+        # nothing is lost by cutting a nag short, and catch_up() restarts a
+        # window still in progress at the next start.
+        self._routine_tasks: set[asyncio.Task[None]] = set()
         # Hands a one-off's prompt to the outage retry queue when its run
         # failed because Copilot was unreachable — the row is still removed,
         # so the reminder must survive somewhere.
@@ -221,6 +239,8 @@ class Scheduler:
         # wait=True. Pause submissions first and shut down only after draining.
         with contextlib.suppress(Exception):
             self._apscheduler.pause()
+        for task in list(self._routine_tasks):
+            task.cancel()
         try:
             # Jobs submitted before pause may not have entered _fire yet.
             await asyncio.sleep(0)
@@ -377,7 +397,10 @@ class Scheduler:
         completed = False
         try:
             try:
-                await self._run_job(prompt)
+                if is_routine_prompt(prompt):
+                    await self._run_routine(job_id, parse_routine_prompt(prompt))
+                else:
+                    await self._run_job(prompt)
                 completed = True
             except CopilotUnavailableError as exc:
                 if not recurring and self._queue_job_fn is not None:
@@ -485,6 +508,13 @@ class Scheduler:
             nxt = self._parse_next(entry.next)
             if nxt is None or nxt > now:
                 continue
+            if is_routine_prompt(entry.prompt):
+                # A routine's late run is its own loop: worth starting only
+                # while its window (cron time … until) is still open today.
+                if self._routine_window_open(entry.when, entry.prompt):
+                    self._fire_now(entry.id, entry.prompt)
+                    fired += 1
+                continue
             self._fire_late(entry.id, entry.prompt, nxt)
             fired += 1
         state = self._maintenance
@@ -507,6 +537,11 @@ class Scheduler:
             fired += 1
         return fired
 
+    def _fire_now(self, job_id: str, prompt: str) -> None:
+        fire_task = asyncio.create_task(self._fire(job_id, prompt, recurring=True))
+        self._inflight.add(fire_task)
+        fire_task.add_done_callback(self._inflight.discard)
+
     def _fire_late(self, job_id: str, prompt: str, due: datetime) -> None:
         due_local = due.astimezone(ZoneInfo(self._tz)).strftime("%Y-%m-%d %H:%M")
         prompt = (
@@ -519,6 +554,73 @@ class Scheduler:
         # holding the task here keeps it referenced (and drainable) until then.
         self._inflight.add(fire_task)
         fire_task.add_done_callback(self._inflight.discard)
+
+    # ------------------------------------------------------------------
+    # Routine check-ins (routines.py): no model, a table lookup and pushes
+    # ------------------------------------------------------------------
+
+    def _routine_done_today(self, spec: RoutineSpec) -> bool | None:
+        """True/False from the routines table; None when the routine has no row."""
+        try:
+            last = routine_last_done(self._vault.read_file_full("wiki/routines.md"), spec.name)
+        except LookupError:
+            return None
+        return last == self._local_now().date()
+
+    def _routine_deadline(self, spec: RoutineSpec) -> datetime | None:
+        if spec.until is None:
+            return None
+        now = self._local_now()
+        return datetime.combine(now.date(), spec.until, tzinfo=now.tzinfo)
+
+    def _routine_window_open(self, cron: str, prompt: str) -> bool:
+        try:
+            spec = parse_routine_prompt(prompt)
+        except ValueError:
+            return False
+        start = fixed_time(cron)
+        if start is None:
+            return False
+        now = self._local_now()
+        opened = datetime.combine(now.date(), start, tzinfo=now.tzinfo)
+        deadline = self._routine_deadline(spec) or opened
+        return opened <= now < deadline or (spec.every is None and opened <= now)
+
+    async def _run_routine(self, job_id: str, spec: RoutineSpec) -> None:
+        """First check and push, synchronously; the repeats run in a background task."""
+        if self._remind is None:
+            logger.warning("Routine check-in %s has no remind function wired; skipped", job_id)
+            return
+        done = self._routine_done_today(spec)
+        if done is None:
+            logger.warning(
+                "Routine check-in %s names %r, which is not a row of wiki/routines.md; "
+                "delivering its text once without checking", job_id, spec.name,
+            )
+            await self._remind(spec.text, None)
+            return
+        if done:
+            logger.info("Routine %r already done today; nothing to send", spec.name)
+            return
+        thread = await self._remind(spec.text, None)
+        if spec.every is None:
+            return
+        task = asyncio.create_task(self._routine_loop(spec, thread))
+        self._routine_tasks.add(task)
+        task.add_done_callback(self._routine_tasks.discard)
+
+    async def _routine_loop(self, spec: RoutineSpec, thread: str | None) -> None:
+        assert spec.every is not None and self._remind is not None
+        deadline = self._routine_deadline(spec)
+        while True:
+            next_push = self._local_now() + spec.every
+            if deadline is not None and next_push >= deadline:
+                return
+            await self._routine_sleep(spec.every.total_seconds())
+            if self._routine_done_today(spec) is not False:
+                return
+            logger.info("Routine %r still not done; pushing again", spec.name)
+            thread = await self._remind(spec.text, thread) or thread
 
     # ------------------------------------------------------------------
     # Startup reload
@@ -587,6 +689,15 @@ class Scheduler:
             )
         if recurring and (problem := cron_problem(when)):
             return f"[error: {problem}]"
+        if is_routine_prompt(prompt):
+            if not recurring:
+                return "[error: a [routine: …] check-in must be recurring, with a cron at a fixed time]"
+            if fixed_time(when) is None:
+                return "[error: a [routine: …] check-in needs a cron with a fixed minute and hour (e.g. '30 8 * * *')]"
+            try:
+                parse_routine_prompt(prompt)
+            except ValueError as exc:
+                return f"[error: {exc}]"
 
         job_id = _generate_id()
         now_iso = datetime.now(tz=UTC).isoformat()

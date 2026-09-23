@@ -964,3 +964,16 @@ async def test_no_nudge_inside_quiet_hours_and_nudges_count_from_the_push(compan
     with patch("pywebpush.webpush") as send, patch("assistant.companion._local_now", return_value=_madrid(8, 0)):
         await service.nudge_unseen()
         assert send.call_count == 1
+
+
+async def test_remind_archives_once_and_repushes_the_same_thread(companion):
+    service, client = companion
+    with patch.object(service, "notify_push") as notify:
+        thread = await service.remind("Tómate las pastillas")
+        assert await service.remind("Tómate las pastillas", thread) == thread
+    rows = service.db.execute("SELECT id, text FROM messages").fetchall()
+    assert [tuple(r) for r in rows] == [(thread, "Tómate las pastillas")]
+    assert notify.call_args_list == [
+        ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
+        ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
+    ]

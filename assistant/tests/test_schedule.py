@@ -9,6 +9,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -938,3 +939,130 @@ def test_schedule_accepts_named_cron_weekday(tmp_path: Path) -> None:
 def test_schedule_accepts_digits_in_other_cron_fields(tmp_path: Path) -> None:
     s = _hardening_scheduler(tmp_path)
     assert s.schedule("0 9 27 * *", "Monthly top-up.", True).startswith("Scheduled job")
+
+
+# ---------------------------------------------------------------------------
+# Routine check-ins: [routine: …] rows run by code, never by the model.
+# ---------------------------------------------------------------------------
+
+ROUTINES = """| Rutina | Frecuencia | Última vez | Próxima | Notas |
+| --- | --- | --- | --- | --- |
+| Pastilla | Diaria | {last} | 2026-09-24 | |
+"""
+PILL = "[routine: Pastilla; every 30 min; until 09:30] Tómate las pastillas"
+
+
+def _routine_scheduler(vault: VaultTools, last: str, *, now: datetime | None = None):
+    """A scheduler with a fake clock that sleep() advances and a remind double that returns a thread."""
+    vault.write_file("wiki/routines.md", ROUTINES.format(last=last))
+    reminded: list[tuple[str, str | None]] = []
+    clock = {"now": now or datetime(2026, 9, 23, 8, 30, tzinfo=ZoneInfo("Europe/Madrid"))}
+    run_job = AsyncMock()
+
+    async def remind(text: str, thread: str | None = None) -> str:
+        reminded.append((text, thread))
+        return thread or "thread-1"
+
+    async def sleep(seconds: float) -> None:
+        clock["now"] += timedelta(seconds=seconds)
+
+    s = Scheduler(vault_tools=vault, run_job_fn=run_job, tz_name="Europe/Madrid", remind_fn=remind)
+    s._local_now = lambda: clock["now"]
+    s._routine_sleep = sleep
+    return s, reminded, run_job, clock
+
+
+@pytest.mark.parametrize("prompt,recurring,when,problem", [
+    (PILL, False, "in 10 minutes", "recurring"),
+    (PILL, True, "*/30 8 * * *", "fixed"),
+    ("[routine: Pastilla; every 30 min] x", True, "30 8 * * *", "until"),
+    ("[routine: ] x", True, "30 8 * * *", "name"),
+])
+def test_schedule_validates_routine_rows(vault: VaultTools, prompt, recurring, when, problem) -> None:
+    s = Scheduler(vault_tools=vault, run_job_fn=AsyncMock(), tz_name="UTC")
+    assert problem in s.schedule(when, prompt, recurring)
+    assert s._read_entries() == []
+    assert s.schedule("30 8 * * *", PILL, True).startswith("Scheduled job")
+
+
+async def test_routine_done_today_fires_nothing(vault: VaultTools) -> None:
+    s, reminded, run_job, _ = _routine_scheduler(vault, "2026-09-23 08:10")
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+    await s._fire(job.id, job.prompt, recurring=True)
+    assert reminded == [] and run_job.await_count == 0
+    assert datetime.fromisoformat(s._read_entries()[0].next) > datetime(2026, 9, 23, tzinfo=UTC), "completed: next advanced"
+
+
+async def test_routine_reminds_then_repushes_the_same_thread_until_done(vault: VaultTools) -> None:
+    s, reminded, run_job, clock = _routine_scheduler(vault, "2026-09-22 08:10")
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+
+    async def sleep(seconds: float) -> None:
+        clock["now"] += timedelta(seconds=seconds)
+        if len(reminded) == 2:  # the user registers the pill after the second push
+            vault.write_file("wiki/routines.md", ROUTINES.format(last="2026-09-23 09:05"))
+    s._routine_sleep = sleep
+
+    await s._fire(job.id, job.prompt, recurring=True)
+    await asyncio.gather(*s._routine_tasks)
+    assert reminded == [("Tómate las pastillas", None), ("Tómate las pastillas", "thread-1")]
+    assert run_job.await_count == 0
+
+
+async def test_routine_stops_repushing_at_until(vault: VaultTools) -> None:
+    s, reminded, _, clock = _routine_scheduler(vault, "2026-09-22 08:10")
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+    await s._fire(job.id, job.prompt, recurring=True)
+    await asyncio.gather(*s._routine_tasks)
+    # 08:30 first, 09:00 second; the 09:30 bound gets no push, and the loop
+    # ends at 09:00 rather than waiting out the bound.
+    assert [t for t, _ in reminded] == ["Tómate las pastillas"] * 2
+    assert clock["now"].strftime("%H:%M") == "09:00"
+
+
+async def test_routine_without_a_row_delivers_once_and_warns(vault: VaultTools, caplog) -> None:
+    s, reminded, _, _ = _routine_scheduler(vault, "2026-09-22")
+    s.schedule("30 8 * * *", "[routine: Piano; every 30 min; until 09:30] Piano de Leo", True)
+    job = s._read_entries()[0]
+    with caplog.at_level(logging.WARNING):
+        await s._fire(job.id, job.prompt, recurring=True)
+    assert reminded == [("Piano de Leo", None)] and not s._routine_tasks
+    assert "Piano" in caplog.text and "routines.md" in caplog.text
+
+
+async def test_catch_up_resumes_a_routine_whose_window_is_in_progress(vault: VaultTools) -> None:
+    s, reminded, _, _ = _routine_scheduler(
+        vault, "2026-09-22", now=datetime(2026, 9, 23, 9, 10, tzinfo=ZoneInfo("Europe/Madrid")))
+    s.schedule("30 8 * * *", PILL, True)
+    entries = s._read_entries()
+    entries[0].next = "2026-09-23T06:30:00+00:00"  # missed while down
+    s._write_entries(entries)
+    assert s.catch_up() == 1
+    await asyncio.gather(*s._inflight)
+    await asyncio.gather(*s._routine_tasks)
+    assert reminded[0] == ("Tómate las pastillas", None)
+
+
+async def test_catch_up_leaves_a_routine_whose_window_has_passed(vault: VaultTools) -> None:
+    s, reminded, _, _ = _routine_scheduler(
+        vault, "2026-09-22", now=datetime(2026, 9, 23, 13, 0, tzinfo=ZoneInfo("Europe/Madrid")))
+    s.schedule("30 8 * * *", PILL, True)
+    entries = s._read_entries()
+    entries[0].next = "2026-09-23T06:30:00+00:00"
+    s._write_entries(entries)
+    assert s.catch_up() == 0 and reminded == []
+
+
+async def test_drain_cancels_routine_loops(vault: VaultTools) -> None:
+    s, reminded, _, _ = _routine_scheduler(vault, "2026-09-22")
+    s._routine_sleep = asyncio.sleep  # a real wait the drain must cut
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+    await s._fire(job.id, job.prompt, recurring=True)
+    assert len(s._routine_tasks) == 1
+    assert await s.drain(timeout=1) == 0
+    await asyncio.sleep(0)
+    assert not s._routine_tasks and reminded == [("Tómate las pastillas", None)]

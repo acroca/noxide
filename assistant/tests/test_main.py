@@ -518,3 +518,11 @@ async def test_real_scheduler_records_success_only_for_completed_callback(runtim
         assert persisted.last_success(COMPILE_ID) == state.last_success(COMPILE_ID)
         assert next_run > baseline
     assert runtime.agent.run_job.await_count == 2
+
+
+async def test_scheduler_gets_the_app_remind_fn(runtime) -> None:
+    await asyncio.wait_for(main._run(None), timeout=2)
+    remind = runtime.scheduler_factory.call_args.kwargs["remind_fn"]
+    runtime.app.remind = AsyncMock(return_value="t1")
+    assert await remind("Take the pills", None) == "t1"
+    runtime.app.remind.assert_awaited_once_with("Take the pills", None)

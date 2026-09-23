@@ -27,6 +27,7 @@ from collections.abc import Iterable
 from datetime import date, timedelta
 from pathlib import Path
 
+from .routines import routine_last_done
 from .vault_check_events import event_findings
 from .vault_check_pages import (
     _LINK_RX,
@@ -433,12 +434,19 @@ _HYGIENE_HEADING = "Schedule hygiene (system/schedule.md)"
 
 _SCHEDULED_RUN_TAG = re.compile(r"\[scheduled run\]", re.IGNORECASE)
 _SILENT_SENTINEL = re.compile(r"\[silent\]", re.IGNORECASE)
+# A routine check-in's name (routines.py) must be a row of wiki/routines.md,
+# or the scheduler delivers the text blind every day.
+_ROUTINE_NAME = re.compile(r"\[routine:([^;\]]*)", re.IGNORECASE)
 
 
 def _schedule_hygiene_findings(root: Path) -> list[tuple[str, str]]:
     rows = _schedule_rows(root)
     if rows is None:
         return []
+    try:
+        routines_text = (root / "wiki/routines.md").read_text(encoding="utf-8")
+    except OSError:
+        routines_text = ""
     findings = []
     for i, job_id, when, recurring, line in rows:
         # Scanning the raw line is safe: id/when/recurring cells can't
@@ -455,6 +463,16 @@ def _schedule_hygiene_findings(root: Path) -> list[tuple[str, str]]:
                 f'{_SCHEDULE_PATH}:{i}: job {job_id} prompt restates the close '
                 f'contract ("[silent]") — it applies on its own; rewrite the prompt without it',
             ))
+        if (rm := _ROUTINE_NAME.search(line)) and rm.group(1).strip():
+            try:
+                routine_last_done(routines_text, rm.group(1))
+            except LookupError:
+                findings.append((
+                    _HYGIENE_HEADING,
+                    f"{_SCHEDULE_PATH}:{i}: job {job_id} is a routine check-in for "
+                    f"{rm.group(1).strip()!r}, which is not a row of wiki/routines.md — "
+                    f"fix the name in the job or add the routine",
+                ))
         cron_fields = when.split()
         if recurring == "true" and len(cron_fields) == 5 and re.search(r"\d", cron_fields[4]):
             findings.append((

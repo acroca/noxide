@@ -172,6 +172,11 @@ async def _run(config_path: Path | None) -> None:
 
     # The built-ins ride the same scheduler as the table's rows; their
     # last-success bookkeeping lives in the state dir.
+    # A routine check-in ([routine: …] rows) pushes through the app, which is
+    # built after the scheduler, hence the closure.
+    async def remind(text: str, thread: str | None = None) -> str | None:
+        return await companion.remind(text, thread)
+
     scheduler = Scheduler(
         vault_tools=vault,
         run_job_fn=run_job,
@@ -179,6 +184,7 @@ async def _run(config_path: Path | None) -> None:
         queue_job_fn=retry_queue.enqueue_job,
         builtins=maintenance_jobs,
         maintenance_state=MaintenanceState(cfg.state_dir / STATE_FILENAME),
+        remind_fn=remind,
     )
 
     # A proactive delivery (a scheduled run's reminder) is the web app's to

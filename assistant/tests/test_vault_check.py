@@ -1292,3 +1292,16 @@ def test_fences_require_matching_character_length_and_empty_closer(
 
     assert report.startswith("1 finding.")
     assert "wiki/a.md:6: leaked" in report
+
+
+def test_routine_row_naming_no_routine_is_a_hygiene_finding(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _write(tmp_path, "wiki/routines.md", "| Rutina | Frecuencia | Última vez | Próxima | Notas |\n"
+           "| --- | --- | --- | --- | --- |\n| Pastilla | Diaria | 2026-09-23 | 2026-09-24 | |\n")
+    _write(tmp_path, "system/schedule.md", "# Schedule\n\n| id | when | recurring | prompt | created | next |\n"
+           "|-----|------|-----------|--------|---------|------|\n"
+           "| aaaa1111 | 30 8 * * * | true | [routine: Pastilla; every 30 min; until 12:00] Tómate | c | n |\n"
+           "| bbbb2222 | 30 8 * * * | true | [routine: Piano; every 30 min; until 12:00] Piano | c | n |\n")
+    report = _check(tmp_path)
+    assert "bbbb2222" in report and "Piano" in report and "routines.md" in report
+    assert "aaaa1111" not in report

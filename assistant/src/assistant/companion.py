@@ -571,7 +571,8 @@ class Companion:
         """A proactive message (a scheduled run's reminder): archive it as a thread root and notify.
 
         A reply to it continues its thread with the reminder in context; a
-        message typed on its own sees it through the ambient block.
+        message typed on its own sees it through the ambient block. Returns
+        the thread id.
         """
         thread = self._insert(SPACE, "assistant", text, "done")
         held_until = self.quiet_until()
@@ -581,8 +582,21 @@ class Companion:
             # nine nights, 2026-09). Kept on the row so a restart cannot
             # lose it; release_held() sends it through the seen check.
             self._record_push(thread, {"held_until": held_until.timestamp()})
-            return
+            return thread
         self.notify_push(text, thread=thread, message_id=thread)
+        return thread
+
+    async def remind(self, text, thread=None):
+        """A routine check-in: the first call delivers, later calls push the same row again.
+
+        The timeline shows one reminder however many times the phone is
+        nudged; a reply to it continues that one thread. Returns the thread.
+        """
+        if thread is None:
+            return await self.deliver(text)
+        if self.quiet_until() is None:
+            self.notify_push(text, thread=thread, message_id=thread)
+        return thread
 
     def quiet_until(self):
         """The end of the current quiet-hours window, or None outside it (or when unset)."""
