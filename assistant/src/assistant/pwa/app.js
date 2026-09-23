@@ -479,7 +479,7 @@ function renderChat(pageVersion) {
     // with the day only when it differs from the thread's day.
     const article = (m, day) => `
       <article class="message message-${escape(m.role)}" data-message="${escape(m.id)}">
-        <div class="message-body">${m.role === 'user' ? attachmentsHtml(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
+        <div class="message-body">${m.role === 'user' ? attachmentsHtml(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}${metadataOf(m).via === 'shortcut' ? ' · Shortcut' : ''}</time></div>
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
         ${m.role === 'assistant' ? receiptNote(m) + pushNote(m) : ''}
       </article>`;

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -19,6 +20,7 @@ import math
 import re
 import sqlite3
 import time
+import uuid
 from datetime import datetime
 from importlib.resources import files
 from urllib.parse import urlsplit
@@ -96,6 +98,12 @@ AUTO_RETRY_PREFIX = "[Automatic retry after a Copilot outage; earlier work may h
 NUDGE_AFTER_SECONDS = 30 * 60
 NUDGE_POLL_SECONDS = 60
 NUDGE_WINDOW_SECONDS = 24 * 3600
+# POST /api/capture (an iOS Shortcut, with the configured bearer token) waits
+# for the run so the Shortcut can speak the reply; the Shortcut picks the wait
+# because the platform's own request timeout is its constraint, and the
+# server caps it well under a minute.
+CAPTURE_WAIT_SECONDS = 45
+CAPTURE_WAIT_MAX = 55
 # A held push (quiet hours) is released by the same sweep; older rows are
 # never revisited, so a hold cannot resurface days later.
 HELD_WINDOW_SECONDS = 24 * 3600
@@ -112,6 +120,37 @@ _ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/st
 LIFECYCLE = "lifecycle"
 STARTED = "Started"
 STARTED_WITH_UPDATE = "Restarted with an app update. Reload when you're ready."
+
+
+_MD_LINE = re.compile(r"^(?:#{1,6}\s+|>\s|\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s*)?)")
+_MD_RULE = re.compile(r"^\s*(?:[-*_]\s*){3,}$|^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+_MD_SPANS = (
+    (re.compile(r"!?\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)"), r"\1"),
+    (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"(\*\*|__)(.+?)\1"), r"\2"),
+    (re.compile(r"~~(.+?)~~"), r"\1"),
+    (re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])"), r"\1"),
+    (re.compile(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)"), r"\1"),
+)
+
+
+def spoken(text):
+    """A reply flattened for speech: markdown markers dropped, words kept.
+
+    The archived reply keeps its markdown for the timeline; this is what a
+    Shortcut hands to Siri, which would otherwise read the asterisks.
+    """
+    lines = []
+    for line in text.splitlines():
+        if line.strip().startswith("```") or _MD_RULE.match(line):
+            continue
+        line = _MD_LINE.sub("", line)
+        if line.strip().startswith("|"):
+            line = " ".join(cell.strip() for cell in line.strip().strip("|").split("|"))
+        for pattern, replacement in _MD_SPANS:
+            line = pattern.sub(replacement, line)
+        lines.append(line.rstrip())
+    return "\n".join(lines).strip()
 
 
 def shell_revision(agent_name, root=None):
@@ -180,6 +219,8 @@ class Companion:
         self.db.commit()
         self.tasks: dict[str, asyncio.Task] = {}
         self.push_tasks: set[asyncio.Task] = set()
+        # Reply rows a capture request handed back: heard already, not pushed.
+        self.spoken: set[str] = set()
         # Newest message timestamp a focused device reported displaying, per
         # space: skips the push for a reply already on screen, and everything
         # newer is the unread count behind the app badge. Persisted, since the
@@ -224,6 +265,7 @@ class Companion:
         self.app.router.add_get("/api/now", self.now)
         self.app.router.add_get("/api/messages", self.messages)
         self.app.router.add_post("/api/messages", self.submit)
+        self.app.router.add_post("/api/capture", self.capture)
         self.app.router.add_post("/api/retry", self.retry)
         self.app.router.add_post("/api/reset", self.reset)
         self.app.router.add_post("/api/seen", self.mark_seen)
@@ -245,7 +287,9 @@ class Companion:
         try:
             if request.host != urlsplit(self.cfg.pwa_origin).netloc:
                 raise web.HTTPForbidden(text="Unrecognized host")
-            if request.method not in ("GET", "HEAD"):
+            # The capture route is guarded by its bearer token instead of the
+            # app's headers, which a Shortcut cannot send.
+            if request.method not in ("GET", "HEAD") and request.path != "/api/capture":
                 if (request.headers.get("Origin") != self.cfg.pwa_origin
                         or request.headers.get("X-Noxide") != "1"):
                     raise web.HTTPForbidden(text="Same-origin requests required")
@@ -396,6 +440,67 @@ class Companion:
         self._insert(SPACE, "user", text, "queued", message_id=message_id, reply_to=reply_to, metadata=metadata)
         self._launch(message_id)
         return web.json_response({"id": message_id}, status=202)
+
+    def _capture_authorized(self, request):
+        """Whether the request carries the configured capture token.
+
+        The token replaces the app's same-origin headers for a client that
+        cannot send them (an iOS Shortcut); it is not access control, which
+        stays with the network, and no other route takes it.
+        """
+        scheme, _, supplied = request.headers.get("Authorization", "").partition(" ")
+        return scheme == "Bearer" and hmac.compare_digest(supplied.strip().encode(),
+                                                          self.cfg.pwa_capture_token.encode())
+
+    async def capture(self, request):
+        """One message from outside the browser, answered in the same request.
+
+        The message is archived and run exactly like one from the composer;
+        the request then waits up to ``wait`` seconds for the run so the
+        caller (a Shortcut, read aloud by Siri) can hand back the reply. A
+        run that outlasts the wait carries on and notifies as any reply does.
+        """
+        if not self.cfg.pwa_capture_token:
+            raise web.HTTPNotFound(text="Capture is not enabled")
+        if not self._capture_authorized(request):
+            raise web.HTTPForbidden(text="A valid capture token is required")
+        if not self.accepting:
+            raise web.HTTPServiceUnavailable(text="Service restarting; try again shortly")
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text="Send a JSON object with a text field")
+        text, wait = data.get("text"), data.get("wait", CAPTURE_WAIT_SECONDS)
+        if not isinstance(text, str) or not text.strip() or len(text) > 20000:
+            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters")
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or wait < 0 or math.isnan(wait):
+            raise web.HTTPBadRequest(text="wait must be a number of seconds")
+        if len(self.tasks) >= MAX_IN_FLIGHT:
+            raise web.HTTPTooManyRequests(text="Too many messages are in progress. Try again shortly.")
+        message_id = uuid.uuid4().hex
+        self._insert(SPACE, "user", text, "queued", message_id=message_id, metadata={"via": "shortcut"})
+        self._launch(message_id)
+        # Never await the task itself: a client that gives up must not cancel the run.
+        await asyncio.wait({self.tasks[message_id]}, timeout=min(wait, CAPTURE_WAIT_MAX))
+        return web.json_response({"id": message_id, **self._capture_result(message_id)})
+
+    def _capture_result(self, message_id):
+        """What a Shortcut says for the row's state once the wait is over."""
+        name = self.cfg.agent_name
+        status = self.db.execute("SELECT status FROM messages WHERE id=?", (message_id,)).fetchone()["status"]
+        if status == "done":
+            reply = self.db.execute("SELECT text FROM messages WHERE id=?", (f"reply:{message_id}",)).fetchone()
+            # Handed back here, the reply is heard: its pending push is
+            # dropped rather than repeating it on the same phone.
+            self.spoken.add(f"reply:{message_id}")
+            text = spoken(reply["text"]) if reply else ""
+            return {"status": "done", "reply": text or f"{name} finished without a reply."}
+        if status in ("queued", "running"):
+            return {"status": "working",
+                    "reply": f"{name} is still working on it. The answer will arrive as a notification."}
+        if status == "unavailable":
+            return {"status": "unavailable", "reply": f"{name} is unavailable right now. "
+                    "Your message is saved and will be answered when it is back."}
+        return {"status": "failed", "reply": f"{name} could not finish. Open the app to retry."}
 
     def _attachments(self, value):
         """Validate stored attachment paths a message refers to."""
@@ -832,8 +937,9 @@ class Companion:
         # acknowledges after the window still gets the push, since it cannot
         # be retracted.
         await asyncio.sleep(PUSH_GRACE_SECONDS)
-        if self.seen.get(SPACE, 0.0) >= created:
-            logger.debug("Push skipped: already displayed on a focused device")
+        if self.seen.get(SPACE, 0.0) >= created or message_id in self.spoken:
+            logger.debug("Push skipped: already displayed on a focused device or spoken by a Shortcut")
+            self.spoken.discard(message_id)
             if message_id:
                 self._record_push(message_id, {"displayed": True})
             return

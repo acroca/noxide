@@ -32,6 +32,10 @@ original name and MIME type, never the bytes, as the Telegram path did.
 into the app from another app, so bursts do not happen; revisit if a share
 target is added.
 
+*Update 2026-09-23:* a Shortcut can now post to `POST /api/capture`, including
+from the share sheet, so sharing several items in a row is possible again.
+Each share is its own request and its own thread; still not merged.
+
 Several messages arriving within a second (a WhatsApp share, a few quick
 lines) were combined into one run with one reply and a
 `[N messages sent together]` header. In the web app each send is its own

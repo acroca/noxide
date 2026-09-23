@@ -16,6 +16,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .models import DEFAULT_VENDORS
 from .quiet_hours import parse_window
 
+# A capture token shorter than this is refused: it is the only thing standing
+# between a same-origin check and a stray POST.
+MIN_CAPTURE_TOKEN = 16
+
 
 class ConfigError(RuntimeError):
     """The loaded config is not ready to run the service."""
@@ -60,6 +64,10 @@ class Config(BaseSettings):
     # until the window ends; empty disables. Replies and lifecycle notices
     # are never held.
     pwa_quiet_hours: str = ""
+    # Bearer token that lets a non-browser client (an iOS Shortcut) post one
+    # message through POST /api/capture and read its reply; empty disables the
+    # route. It stands in for the same-origin headers, not for access control.
+    pwa_capture_token: str = ""
 
     # Vault backup (optional) — local-only git history of the vault, kept in a
     # git dir outside it. None means <state_dir>/vault.git.
@@ -158,6 +166,11 @@ class Config(BaseSettings):
                 f"pwa.quiet_hours {self.pwa_quiet_hours!r} must be HH:MM-HH:MM on the local "
                 'clock (e.g. "23:00-07:30"), or "" to disable'
             )
+        if self.pwa_capture_token and len(self.pwa_capture_token) < MIN_CAPTURE_TOKEN:
+            problems.append(
+                f"pwa.capture_token must be at least {MIN_CAPTURE_TOKEN} characters "
+                "(e.g. `openssl rand -hex 24`), or empty to disable capture"
+            )
         if self.pwa_push_contact and not self.pwa_push_contact.startswith("mailto:"):
             problems.append("pwa.push_contact must be a mailto: address, or empty to disable push")
 
@@ -184,6 +197,7 @@ _TOML_FIELDS = (
     ("pwa", "origin", "pwa_origin"),
     ("pwa", "push_contact", "pwa_push_contact"),
     ("pwa", "quiet_hours", "pwa_quiet_hours"),
+    ("pwa", "capture_token", "pwa_capture_token"),
     ("backup", "enabled", "backup_enabled"),
     ("backup", "git_dir", "backup_git_dir"),
     ("maintenance", "compile", "maintenance_compile"),
@@ -205,6 +219,7 @@ _ENV_FIELDS = {
     "PWA_ORIGIN": "pwa_origin",
     "PWA_PUSH_CONTACT": "pwa_push_contact",
     "PWA_QUIET_HOURS": "pwa_quiet_hours",
+    "PWA_CAPTURE_TOKEN": "pwa_capture_token",
     "BACKUP_ENABLED": "backup_enabled",
     "BACKUP_GIT_DIR": "backup_git_dir",
     "MAINTENANCE_COMPILE": "maintenance_compile",

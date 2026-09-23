@@ -452,3 +452,20 @@ def test_validate_rejects_malformed_quiet_hours(state_dir: Path) -> None:
     _config(state_dir, pwa_quiet_hours="23:00-07:30").validate_for_run()  # should not raise
     with pytest.raises(ConfigError, match="pwa.quiet_hours"):
         _config(state_dir, pwa_quiet_hours="night").validate_for_run()
+
+
+def test_capture_token_from_toml_and_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('[pwa]\ncapture_token = "shortcut-token-from-toml"\n')
+    assert load_config(cfg_file).pwa_capture_token == "shortcut-token-from-toml"
+    monkeypatch.setenv("PWA_CAPTURE_TOKEN", "shortcut-token-from-env")
+    assert load_config(cfg_file).pwa_capture_token == "shortcut-token-from-env"
+    assert load_config(tmp_path / "missing.toml").pwa_capture_token == "shortcut-token-from-env"
+
+
+def test_validate_rejects_a_short_capture_token(state_dir: Path) -> None:
+    _write_oauth_token(state_dir)
+    _config(state_dir).validate_for_run()  # unset: capture disabled
+    _config(state_dir, pwa_capture_token="x" * 16).validate_for_run()  # should not raise
+    with pytest.raises(ConfigError, match="pwa.capture_token"):
+        _config(state_dir, pwa_capture_token="short").validate_for_run()

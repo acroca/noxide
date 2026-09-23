@@ -341,6 +341,54 @@ your vault, and [SECURITY.md](../SECURITY.md) for the threat model.
 
 Work out of the box — Copilot's default model does vision, no extra token.
 
+### Siri and Shortcuts (iOS)
+
+An Apple Shortcut can send a message to the assistant from anywhere iOS
+exposes Shortcuts — Siri, the Action Button, Back Tap, a Lock Screen or
+Control Center control, a widget, or the share sheet — and read the reply
+back, aloud when it was started by voice.
+
+**1.** Generate a token and set it as `PWA_CAPTURE_TOKEN` in `.env` (or
+`[pwa] capture_token` in `config.toml`), then restart:
+
+```bash
+openssl rand -hex 24
+```
+
+**2.** In the Shortcuts app, create a shortcut named for the phrase you want
+to say (`Ask Nox` runs on "Hey Siri, ask Nox") with these actions:
+
+1. **Dictate Text** (or **Ask for Input**, or **Receive** text/URLs from the
+   share sheet, as you prefer)
+2. **Get Contents of URL** — `https://<your origin>/api/capture`, method
+   POST, header `Authorization` = `Bearer <token>`, request body JSON with
+   `text` = the dictated text and `wait` = `45`
+3. **Get Dictionary Value** — key `reply` from the previous result
+4. **Show Result** (Siri reads it aloud when the shortcut was started by
+   voice; on the Action Button it shows a banner) — or **Speak Text**
+
+Siri runs a shortcut by its name only, so the question is a second step:
+"Hey Siri, ask Nox", then say the question when prompted. That is the
+ceiling on iOS: a native app's intents cannot take free-form text inline
+either.
+
+The request waits up to `wait` seconds (the server caps it at 55) for the
+run to finish. A run that takes longer carries on, the reply says so, and the
+answer arrives as a push notification like any other reply. Tune `wait` down
+if Shortcuts times out on your phone before the server answers. The reply
+comes back flattened for speech (no markdown markers); the app's timeline
+keeps the formatted text and marks the message as sent from a Shortcut. A
+reply the Shortcut received is not pushed again, though the app badge still
+counts it until you open the chat. Each run of the Shortcut is a new message:
+running it again after a timeout sends the question twice.
+
+The phone must be able to reach the app, which with Tailscale Serve means it
+is on your tailnet. The token replaces the browser's same-origin headers for
+this one route and grants nothing else: it cannot read history or change
+settings. Anyone holding it can still send messages, and Shortcuts stores it
+in plain text and syncs it through iCloud, so treat it like a password and
+rotate it by changing the setting.
+
 ---
 
 ## Operating

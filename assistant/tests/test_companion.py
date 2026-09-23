@@ -977,3 +977,135 @@ async def test_remind_archives_once_and_repushes_the_same_thread(companion):
         ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
         ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
     ]
+
+
+CAPTURE_TOKEN = "shortcut-token-0123456789"
+# A Shortcut sends neither the app's Origin nor its X-Noxide header.
+SHORTCUT_HEADERS = {"Origin": "", "X-Noxide": "", "Authorization": f"Bearer {CAPTURE_TOKEN}"}
+
+
+async def test_capture_is_absent_until_a_token_is_configured(companion):
+    service, client = companion
+    response = await client.post("/api/capture", json={"text": "Hi"}, headers=SHORTCUT_HEADERS)
+    assert response.status == 404
+    response = await client.post("/api/capture", json={"text": "Hi"})
+    assert response.status == 404
+
+
+async def test_capture_takes_a_bearer_token_in_place_of_the_app_headers(companion):
+    service, client = companion
+    service.cfg.pwa_capture_token = CAPTURE_TOKEN
+    service.agent.reply = "## Lunch\n\n- **Monday**: pasta\n- Tuesday: `rice`\n\nSee the [menu](https://school.test/menu)."
+    response = await client.post("/api/capture", json={"text": "What do the kids have for lunch?"},
+                                 headers=SHORTCUT_HEADERS)
+    assert response.status == 200
+    body = await response.json()
+    assert body["status"] == "done"
+    assert body["reply"] == "Lunch\n\nMonday: pasta\nTuesday: rice\n\nSee the menu."
+    await settle(service)
+    rows = flat(await timeline(client))
+    assert [(m["role"], m["text"], m["status"]) for m in rows] == [
+        ("user", "What do the kids have for lunch?", "done"), ("assistant", service.agent.reply, "done")]
+    assert rows[0]["id"] == body["id"] and json.loads(rows[0]["metadata"])["via"] == "shortcut"
+    # The stored reply keeps its markdown; only the spoken rendition is plain.
+    assert rows[1]["text"] == service.agent.reply
+    # Wrong or missing token, or the token on any other route: refused.
+    bad = {**SHORTCUT_HEADERS, "Authorization": "Bearer nope"}
+    assert (await client.post("/api/capture", json={"text": "Hi"}, headers=bad)).status == 403
+    assert (await client.post("/api/capture", json={"text": "Hi"}, headers={"Origin": "", "X-Noxide": ""})).status == 403
+    assert (await client.post("/api/capture", json={"text": "Hi"})).status == 403
+    for path in ("/api/reset", "/api/messages", "/api/retry"):
+        assert (await client.post(path, json={"text": "Hi", "id": "c" * 32}, headers=SHORTCUT_HEADERS)).status == 403
+    assert (await client.post("/api/capture", json={"text": "Hi"},
+                              headers={**SHORTCUT_HEADERS, "Host": "evil.test"})).status == 403
+    # Validation matches the composer's.
+    for body in ({"text": ""}, {"text": "   "}, {"text": "x" * 20001}, {"text": 5}, {"text": "Hi", "wait": "soon"},
+                 {"text": "Hi", "wait": -1}, {"text": "Hi", "wait": True}, ["Hi"], "Hi"):
+        assert (await client.post("/api/capture", json=body, headers=SHORTCUT_HEADERS)).status == 400, body
+    # A run that ends without reply text still gives Siri a sentence.
+    service.agent.reply = "  "
+    body = await (await client.post("/api/capture", json={"text": "Hi"}, headers=SHORTCUT_HEADERS)).json()
+    assert body == {"id": body["id"], "status": "done", "reply": "Noxide finished without a reply."}
+
+
+async def test_a_spoken_reply_is_marked_displayed_instead_of_pushed(companion):
+    service, client = companion
+    service.cfg.pwa_capture_token = CAPTURE_TOKEN
+    service.public_key = "configured"
+    with patch.object(service, "_push", new_callable=AsyncMock) as push, \
+            patch("assistant.companion.PUSH_GRACE_SECONDS", 0.05):
+        body = await (await client.post("/api/capture", json={"text": "Lunch?"}, headers=SHORTCUT_HEADERS)).json()
+        assert body["status"] == "done" and service.push_tasks
+        await asyncio.gather(*service.push_tasks)
+        push.assert_not_called()
+        reply = service.archive.get(f"reply:{body['id']}")
+        assert json.loads(reply["metadata"])["push"] == {"displayed": True}
+        assert not service.spoken
+        # A reply the wait did not cover is pushed as any other.
+        release = asyncio.Event()
+
+        async def run(text, *, message_id, **kwargs):
+            await release.wait()
+            return complete(service.archive, message_id, text, "Late")
+
+        service.agent.run.side_effect = run
+        body = await (await client.post("/api/capture", json={"text": "Slow?", "wait": 0}, headers=SHORTCUT_HEADERS)).json()
+        assert body["status"] == "working"
+        release.set()
+        await settle(service)
+        await asyncio.gather(*service.push_tasks)
+        push.assert_awaited_once()
+
+
+async def test_capture_answers_still_working_when_the_run_outlasts_the_wait(companion):
+    service, client = companion
+    service.cfg.pwa_capture_token = CAPTURE_TOKEN
+    release = asyncio.Event()
+
+    async def run(text, *, message_id, **kwargs):
+        await release.wait()
+        return complete(service.archive, message_id, text, "Late answer")
+
+    service.agent.run.side_effect = run
+    service.notify_push = MagicMock()
+    response = await client.post("/api/capture", json={"text": "Slow question", "wait": 0}, headers=SHORTCUT_HEADERS)
+    assert response.status == 200
+    body = await response.json()
+    assert body["status"] == "working"
+    assert body["reply"] == "Noxide is still working on it. The answer will arrive as a notification."
+    # The run was not cancelled with the wait: it finishes and notifies as any reply does.
+    release.set()
+    await settle(service)
+    assert [(m["role"], m["status"]) for m in flat(await timeline(client))] == [("user", "done"), ("assistant", "done")]
+    service.notify_push.assert_called_once()
+    assert service.notify_push.call_args.args[0] == "Late answer"
+
+
+async def test_capture_says_when_the_assistant_is_unavailable_or_the_run_failed(companion):
+    service, client = companion
+    service.cfg.pwa_capture_token = CAPTURE_TOKEN
+    service.agent.run.side_effect = CopilotUnavailableError("offline")
+    body = await (await client.post("/api/capture", json={"text": "Hi"}, headers=SHORTCUT_HEADERS)).json()
+    assert body["status"] == "unavailable"
+    assert body["reply"] == "Noxide is unavailable right now. Your message is saved and will be answered when it is back."
+    service.agent.run.side_effect = RuntimeError("boom")
+    body = await (await client.post("/api/capture", json={"text": "Hi"}, headers=SHORTCUT_HEADERS)).json()
+    assert body["status"] == "failed"
+    assert body["reply"] == "Noxide could not finish. Open the app to retry."
+    service.accepting = False
+    assert (await client.post("/api/capture", json={"text": "Hi"}, headers=SHORTCUT_HEADERS)).status == 503
+
+
+def test_spoken_flattens_markdown_for_speech():
+    from assistant.companion import spoken
+
+    text = ("# Title\n\nSome *emphasis* and __strong__ text.\n\n"
+            "1. First `code`\n2. Second\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+            "```\nkept as is\n```\n> quoted\n---\nEnd ~~gone~~.")
+    assert spoken(text) == ("Title\n\nSome emphasis and strong text.\n\n"
+                            "First code\nSecond\n\na b\n1 2\n\nkept as is\nquoted\nEnd gone.")
+    # Words that look like markup stay words; links with parentheses, images,
+    # task boxes and nested bullets lose only their markers.
+    assert spoken("- [ ] call my_friend about 2*3*4 and 2 * 3 * 4\n  - see [Foo](https://x.test/Foo_(bar)) now\n"
+                  "![alt](img.png) >= 3 and __init__") == (
+        "call my_friend about 2*3*4 and 2 * 3 * 4\nsee Foo now\nalt >= 3 and init")
