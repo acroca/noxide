@@ -9,6 +9,7 @@ import re
 import time
 import traceback
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.resources import files
 from typing import Any
@@ -55,6 +56,32 @@ _TOOL_TIMEOUTS = {
 _ERROR_RESULT_RX = re.compile(
     r"^\[[^\]\n]*\b(error|not found|timed out|denied|unknown tool)\b"
 )
+
+# The empty-write guard. A reply that reads as a confirmation ("Anotado",
+# "Guardado en…", "Hecho, tarea cerrada") while the run changed nothing in the
+# vault or the schedule and sent nothing is, more often than not, a write that
+# never happened — the user found out days later on every occasion in the
+# 2026-08/09 audit ("Ya te he dicho antes que me la he tomado", "no has
+# actualizado el index", "juraría que ya te lo dije"). Such a draft is
+# withdrawn and the model gets one more turn, told what it claimed; a second
+# no-write reply is accepted and flagged on the reply row (``guard: unsaved``)
+# so the app can say so. The lexicon is Spanish and English stems of the
+# verbs the bot uses to confirm an action; generic closers ("hecho", "done")
+# are left out because they follow read-only work too. A false positive
+# costs one cached turn, a miss costs a lost fact.
+_CLAIM_RX = re.compile(
+    r"\b(anot|apunt|guardad|registr|cerrad|correg|program|cancel|actualiz|añad|anad|"
+    r"quit|elimin|borrad|archiv|movid|"
+    r"saved|noted|recorded|scheduled|updated|removed|closed|added|archived|deleted|moved)",
+    re.IGNORECASE,
+)
+_GUARD_NOTE = (
+    "[Your draft reply was: \u201c{draft}\u201d — but this turn made no change to the vault "
+    "or the schedule and sent no message. If something should have been saved, updated, "
+    "scheduled, closed or cancelled, do it now with the tools and then reply; if it was "
+    "already in place, reply again saying so plainly.]"
+)
+_GUARD_DRAFT_CHARS = 300
 
 # A scheduled run replies with this sentinel (prompts/schedule.md) when it
 # finds its purpose already met; run_job then delivers nothing.
@@ -231,6 +258,29 @@ def extract_tool_calls(msg: dict[str, Any]) -> list[dict[str, Any]]:
             },
         }]
     return []
+
+
+@dataclass
+class RunResult:
+    """What one pass of the loop produced, beyond the reply text.
+
+    ``touched`` is every path a write *may* have changed (for the backup
+    commit, where over-reporting is harmless); ``wrote`` only the paths whose
+    write did not fail (the receipt shown to the user). ``guard`` is
+    ``"unsaved"`` when the empty-write guard re-prompted and the reply still
+    changed nothing.
+    """
+
+    reply: str
+    touched: set[str] = field(default_factory=set)
+    wrote: set[str] = field(default_factory=set)
+    guard: str | None = None
+
+    def metadata(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"wrote": sorted(self.wrote)}
+        if self.guard:
+            data["guard"] = self.guard
+        return data
 
 
 class Agent:
@@ -603,7 +653,7 @@ class Agent:
                 history.request_ids.add(message_id)
                 history.active_request_id = message_id
             try:
-                reply, touched = await self._run_locked(
+                result = await self._run_locked(
                     thread, user_message, response_format=response_format, **kwargs,
                 )
             except BaseException as exc:
@@ -611,13 +661,18 @@ class Agent:
                     self._mark_unfinished(message_id, _failure_status(exc),
                                           "Run did not finish; some work may have completed.")
                 raise
-            if self.archive and message_id and reply == MAX_ITERATIONS_REPLY:
-                self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+            reply = result.reply
+            if self.archive and message_id:
+                if reply == MAX_ITERATIONS_REPLY:
+                    self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+                else:
+                    # The receipt: what this run changed, for the timeline.
+                    self.archive.merge_metadata(f"reply:{message_id}", result.metadata())
             self._release_thread(thread)
         # One commit per interaction, in the background: the reply is not
         # delayed by git, and the commit message carries the full exchange.
-        if self._backup is not None and touched:
-            self._backup.schedule_commit(touched, trigger=user_message, response=reply)
+        if self._backup is not None and result.touched:
+            self._backup.schedule_commit(result.touched, trigger=user_message, response=reply)
         return reply
 
     def _mark_unfinished(self, message_id: str, status: str, error: str) -> None:
@@ -653,7 +708,7 @@ class Agent:
         send_message_fn: SendMessageFn | None = None,
         response_format: dict[str, Any] | None = None,
         unwind_on_unavailable: bool = False,
-    ) -> tuple[str, set[str]]:
+    ) -> RunResult:
         """Returns the final text reply and the vault paths this run touched.
 
         With ``unwind_on_unavailable`` (outage-resume attempts), a
@@ -668,7 +723,11 @@ class Agent:
         t_start = time.monotonic()
         history = self._get_history(thread)
         history.begin_run()
-        touched: set[str] = set()
+        result = RunResult("")
+        # Live-only note the guard appends after withdrawing a no-write
+        # confirmation; never stored, so later turns don't carry it.
+        guard_note: dict[str, Any] | None = None
+        acted = False  # a message sent counts as an action the guard accepts
 
         if thread is not None:
             ambient = self._ambient_context(thread)
@@ -722,6 +781,8 @@ class Agent:
                     live_entry if m is user_entry else m for m in turn_messages
                 ]
             messages = [{"role": "system", "content": system_prompt}] + turn_messages
+            if guard_note is not None:
+                messages.append(guard_note)
             try:
                 response = await client.chat(messages, tools, response_format=response_format)
             except copilot.CopilotUnavailableError:
@@ -768,8 +829,18 @@ class Agent:
                         finish_reason,
                         json.dumps(msg, ensure_ascii=False)[:4000],
                     )
+                reply = msg.get("content") or ""
+                if not result.wrote and not acted and _CLAIM_RX.search(reply):
+                    if guard_note is None:
+                        logger.info("Empty-write guard: re-prompting a confirmation that wrote nothing")
+                        history.pop_if_last(msg)
+                        guard_note = {"role": "user", "content": _GUARD_NOTE.format(
+                            draft=_clip(reply, _GUARD_DRAFT_CHARS))}
+                        continue
+                    result.guard = "unsaved"
                 history.finish_run(timestamp=self._local_stamp())
-                return msg.get("content") or "", touched
+                result.reply = reply
+                return result
 
             # Execute tool calls
             for tc in tool_calls_in_turn:
@@ -791,41 +862,47 @@ class Agent:
                         logger.warning("on_research callback failed", exc_info=True)
                     on_research = None  # notify at most once per run
                 failure_tb = ""
+                may_write: set[str] = set()
                 try:
                     if not isinstance(fn_args, dict):
                         raise ValueError("tool arguments must be a JSON object")
-                    touched |= _paths_touched(fn_name, fn_args)
+                    may_write = _paths_touched(fn_name, fn_args)
+                    result.touched |= may_write
                     timeout = _TOOL_TIMEOUTS.get(fn_name, _TOOL_TIMEOUT)
-                    result = await asyncio.wait_for(
+                    tool_result = await asyncio.wait_for(
                         self._dispatch_tool(fn_name, fn_args, send_message_fn, history),
                         timeout=timeout,
                     )
                 except TimeoutError:
-                    result = f"[tool {fn_name} timed out after {timeout}s]"
+                    tool_result = f"[tool {fn_name} timed out after {timeout}s]"
                 except PermissionError as e:
-                    result = f"[permission denied: {e}]"
+                    tool_result = f"[permission denied: {e}]"
                 except Exception as e:
-                    result = f"[tool error: {e}]"
+                    tool_result = f"[tool error: {e}]"
                     failure_tb = traceback.format_exc()
 
-                if _ERROR_RESULT_RX.match(str(result)):
+                if _ERROR_RESULT_RX.match(str(tool_result)):
                     logger.warning(
                         "tool %s failed: %s | args: %s%s",
                         fn_name,
-                        str(result)[:300],
+                        str(tool_result)[:300],
                         json.dumps(fn_args, ensure_ascii=False)[:300],
                         f"\n{failure_tb}" if failure_tb else "",
                     )
+                else:
+                    result.wrote |= may_write
+                    acted |= fn_name == "send_message"
 
                 history.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": str(result),
+                    "content": str(tool_result),
                 })
 
         # Hit iteration cap
         logger.warning("Agent hit max iterations (%d) for thread=%s", _MAX_ITERATIONS, thread)
-        return MAX_ITERATIONS_REPLY, touched
+        result.reply = MAX_ITERATIONS_REPLY
+        return result
 
     async def resume(
         self,
@@ -871,7 +948,7 @@ class Agent:
                 "incomplete]"
             )
             try:
-                reply, touched = await self._run_locked(
+                result = await self._run_locked(
                     thread, note, unwind_on_unavailable=True, send_message_fn=send_message_fn,
                 )
             except BaseException as exc:
@@ -879,11 +956,15 @@ class Agent:
                     self._mark_unfinished(message_id, _failure_status(exc),
                                           "Retry did not finish; some work may have completed.")
                 raise
-            if self.archive and message_id and reply == MAX_ITERATIONS_REPLY:
-                self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+            reply = result.reply
+            if self.archive and message_id:
+                if reply == MAX_ITERATIONS_REPLY:
+                    self.archive.status(message_id, "failed", "Iteration limit reached; retry to continue.")
+                else:
+                    self.archive.merge_metadata(f"reply:{message_id}", result.metadata())
             self._release_thread(thread)
-        if self._backup is not None and touched:
-            self._backup.schedule_commit(touched, trigger=note, response=reply)
+        if self._backup is not None and result.touched:
+            self._backup.schedule_commit(result.touched, trigger=note, response=reply)
         return reply
 
     async def run_job(self, prompt: str) -> str:

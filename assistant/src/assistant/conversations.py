@@ -89,6 +89,16 @@ class ConversationArchive:
     def get(self, message_id):
         return self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
 
+    def merge_metadata(self, message_id, patch):
+        """Merge *patch* into a row's metadata; a vanished row is silently skipped."""
+        row = self.get(message_id)
+        if row is None:
+            return
+        metadata = {**json.loads(row["metadata"] or "{}"), **patch}
+        self.db.execute("UPDATE messages SET metadata=? WHERE id=?",
+                        (json.dumps(metadata, ensure_ascii=False), message_id))
+        self.db.commit()
+
     def status(self, message_id, status, error=""):
         self.db.execute("UPDATE messages SET status=?, error=? WHERE id=?", (status, error, message_id))
         self.db.commit()

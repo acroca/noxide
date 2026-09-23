@@ -165,6 +165,15 @@ function pushNote(message) {
     : push.accepted ? `Notified ${push.accepted} of ${push.devices} devices` : 'Notification could not be delivered';
   return `<div class="message-status"><span>${escape(text)}</span></div>`;
 }
+function receiptNote(message) {
+  // What the run changed, from the reply row's receipt; a confirmation that
+  // changed nothing after the guard's second chance says so.
+  const meta = metadataOf(message);
+  if (meta.guard === 'unsaved') return '<div class="message-status"><span>Nothing was saved</span></div>';
+  if (!meta.wrote || !meta.wrote.length) return '';
+  const names = meta.wrote.map(path => path.replace(/^wiki\//, ''));
+  return `<div class="message-status"><span>Saved: ${escape(names.join(', '))}</span></div>`;
+}
 function inline(text) {
   return escape(text).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 }
@@ -471,7 +480,7 @@ function renderChat(pageVersion) {
       <article class="message message-${escape(m.role)}" data-message="${escape(m.id)}">
         <div class="message-body">${m.role === 'user' ? attachmentsHtml(m) + escape(m.text) : markdown(m.text)}<time class="message-time" datetime="${escape(new Date(m.created * 1000).toISOString())}">${dayOf(m.created) !== day ? escape(dayLabel(dayOf(m.created))) + ', ' : ''}${escape(timeLabel(m.created))}</time></div>
         ${m.role === 'user' && !['done', 'dismissed'].includes(m.status) ? `<div class="message-status"><span>${escape(m.activity || m.error || ({ queued: 'Queued…', running: 'Working…' }[m.status] || m.status))}</span>${['failed', 'interrupted', 'unavailable'].includes(m.status) ? `<button data-retry="${escape(m.id)}">Retry</button>` : ''}</div>` : ''}
-        ${m.role === 'assistant' ? pushNote(m) : ''}
+        ${m.role === 'assistant' ? receiptNote(m) + pushNote(m) : ''}
       </article>`;
     const dayOfThread = t => dayOf(t.messages[0].created);
     // The load-earlier button scrolls with the timeline, so it is reached by

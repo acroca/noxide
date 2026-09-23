@@ -302,3 +302,13 @@ async def test_database_reopen_restores_only_completed_text(tmp_path):
         assert len(archive.load_context(SPACE)) == 4
     finally:
         archive.close()
+
+
+def test_merge_metadata_patches_one_row_and_keeps_the_rest(setup):
+    archive, _, _ = setup
+    row = archive.insert(SPACE, "assistant", "hi", "done", metadata={"push": {"devices": 1}})
+    archive.merge_metadata(row, {"wrote": ["a.md"]})
+    archive.merge_metadata(row, {"push": {"accepted": 1}})
+    import json
+    assert json.loads(archive.get(row)["metadata"]) == {"push": {"accepted": 1}, "wrote": ["a.md"]}
+    archive.merge_metadata("missing", {"x": 1})  # a vanished row is not an error
