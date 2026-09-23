@@ -390,7 +390,10 @@ first, then **Get Contents of URL** with the request body set to **File** and
 the recording as the file, the same `Authorization` header, and `?wait=45` on
 the URL; the answer carries `text`, what was heard, beside `reply`. Recording
 needs the screen, so this variant suits the Action Button, Back Tap or a Home
-Screen button rather than "Hey Siri".
+Screen button rather than "Hey Siri". Record Audio leaves the phone's audio
+session in call mode, so a following **Speak** plays through the earpiece:
+put a **Set Playback Destination** action set to iPhone before Speak. The
+action is iPhone-only and found by search; the Mac editor never lists it.
 
 The phone must be able to reach the app, which with Tailscale Serve means it
 is on your tailnet. The token replaces the browser's same-origin headers for
