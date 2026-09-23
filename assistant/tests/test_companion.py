@@ -812,6 +812,10 @@ async def test_unseen_reminders_are_pushed_again_once(companion):
         old = time.time() - NUDGE_AFTER_SECONDS - 1
         service.db.execute("UPDATE messages SET created=?", (old,))
         service.db.commit()
+        for row in service.db.execute("SELECT id, metadata FROM messages").fetchall():
+            push = json.loads(row["metadata"]).get("push")
+            if push:  # the nudge counts from the push, not the row
+                service.archive.merge_metadata(row["id"], {"push": {**push, "at": old}})
         await service.nudge_unseen()
         # Only the reminder (a thread the assistant started) is nudged, and only once.
         assert send.call_count == 3 and json.loads(send.call_args.kwargs["data"])["body"] == "Take the pills"
@@ -880,3 +884,83 @@ async def test_outage_failed_messages_replay_by_themselves(companion):
         assert service.archive.get("c" * 32)["status"] == "interrupted"
     finally:
         await restarted.close()
+
+
+def _madrid(hh, mm=0, day=23):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime(2026, 9, day, hh, mm, tzinfo=ZoneInfo("Europe/Madrid"))
+
+
+async def test_delivery_inside_quiet_hours_is_held_until_the_window_ends(companion):
+    """A reminder at 03:01 is archived at once but its push waits for 07:30; the
+    hold lives on the row, and the release goes through the seen check."""
+    service, client = companion
+    service.public_key = "configured"
+    service.cfg.timezone, service.cfg.pwa_quiet_hours = "Europe/Madrid", "23:00-07:30"
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/phone",
+                                       "keys": {"p256dh": "a" * 87, "auth": "b" * 22}})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0), \
+            patch("assistant.companion._local_now", return_value=_madrid(3, 1)):
+        await service.deliver("Compilación hecha. Una tarea venció ayer.")
+        await asyncio.gather(*service.push_tasks)
+        assert send.call_count == 0
+        row = service.db.execute("SELECT * FROM messages WHERE text LIKE 'Compilación%'").fetchone()
+        assert json.loads(row["metadata"])["push"] == {"held_until": _madrid(7, 30).timestamp()}
+        await service.release_held()  # still night: nothing moves
+        assert send.call_count == 0
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0), \
+            patch("assistant.companion._local_now", return_value=_madrid(7, 31)):
+        await service.release_held()
+        assert send.call_count == 1 and json.loads(send.call_args.kwargs["data"])["thread"] == row["id"]
+        push = json.loads(service.archive.get(row["id"])["metadata"])["push"]
+        assert push["accepted"] == 1 and "held_until" not in push
+        await service.release_held()
+        assert send.call_count == 1, "released once"
+
+
+async def test_a_held_reminder_seen_in_the_app_is_not_pushed(companion):
+    service, client = companion
+    service.public_key = "configured"
+    service.cfg.timezone, service.cfg.pwa_quiet_hours = "Europe/Madrid", "23:00-07:30"
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/phone",
+                                       "keys": {"p256dh": "a" * 87, "auth": "b" * 22}})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0), \
+            patch("assistant.companion._local_now", return_value=_madrid(3, 1)):
+        await service.deliver("Held")
+        await client.post("/api/seen", json={"through": time.time()})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0), \
+            patch("assistant.companion._local_now", return_value=_madrid(8, 0)):
+        await service.release_held()
+        assert send.call_count == 0
+        row = service.db.execute("SELECT metadata FROM messages WHERE text='Held'").fetchone()
+        assert json.loads(row["metadata"])["push"] == {"displayed": True}
+
+
+async def test_no_nudge_inside_quiet_hours_and_nudges_count_from_the_push(companion):
+    from assistant.companion import NUDGE_AFTER_SECONDS
+
+    service, client = companion
+    service.public_key = "configured"
+    service.cfg.timezone, service.cfg.pwa_quiet_hours = "Europe/Madrid", "23:00-07:30"
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/phone",
+                                       "keys": {"p256dh": "a" * 87, "auth": "b" * 22}})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0), \
+            patch("assistant.companion._local_now", return_value=_madrid(12, 0)):
+        await service.deliver("Take the pills")
+        await asyncio.gather(*service.push_tasks)
+        assert send.call_count == 1
+        old = time.time() - NUDGE_AFTER_SECONDS - 1
+        service.db.execute("UPDATE messages SET created=?", (old,))
+        service.db.commit()
+        await service.nudge_unseen()
+        assert send.call_count == 1, "the push was a moment ago, whatever the row's age"
+        service.archive.merge_metadata(
+            service.db.execute("SELECT id FROM messages").fetchone()["id"],
+            {"push": {"at": old, "devices": 1, "accepted": 1}})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion._local_now", return_value=_madrid(23, 30)):
+        await service.nudge_unseen()
+        assert send.call_count == 0, "no nudges at night"
+    with patch("pywebpush.webpush") as send, patch("assistant.companion._local_now", return_value=_madrid(8, 0)):
+        await service.nudge_unseen()
+        assert send.call_count == 1

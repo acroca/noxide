@@ -19,8 +19,10 @@ import math
 import re
 import sqlite3
 import time
+from datetime import datetime
 from importlib.resources import files
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
@@ -30,6 +32,7 @@ from .config import Config
 from .conversations import SPACE, ConversationArchive
 from .copilot import CopilotUnavailableError
 from .models import ModelPicker
+from .quiet_hours import parse_window, window_end
 from .retry_queue import BACKOFF_INITIAL, next_backoff
 from .tools import VaultTools
 from .transcribe import Transcriber, TranscriptionError
@@ -93,6 +96,14 @@ AUTO_RETRY_PREFIX = "[Automatic retry after a Copilot outage; earlier work may h
 NUDGE_AFTER_SECONDS = 30 * 60
 NUDGE_POLL_SECONDS = 60
 NUDGE_WINDOW_SECONDS = 24 * 3600
+# A held push (quiet hours) is released by the same sweep; older rows are
+# never revisited, so a hold cannot resurface days later.
+HELD_WINDOW_SECONDS = 24 * 3600
+
+
+def _local_now(tz_name):
+    """The user's wall clock (patched in tests)."""
+    return datetime.now(ZoneInfo(tz_name))
 _ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/style.css": "style.css",
            "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
@@ -563,7 +574,44 @@ class Companion:
         message typed on its own sees it through the ambient block.
         """
         thread = self._insert(SPACE, "assistant", text, "done")
+        held_until = self.quiet_until()
+        if held_until is not None:
+            # Quiet hours: archived now, pushed when the window ends (the
+            # nightly compile's notices woke the phone at 03:01 on four of
+            # nine nights, 2026-09). Kept on the row so a restart cannot
+            # lose it; release_held() sends it through the seen check.
+            self._record_push(thread, {"held_until": held_until.timestamp()})
+            return
         self.notify_push(text, thread=thread, message_id=thread)
+
+    def quiet_until(self):
+        """The end of the current quiet-hours window, or None outside it (or when unset)."""
+        window = parse_window(self.cfg.pwa_quiet_hours)
+        if window is None:
+            return None
+        return window_end(_local_now(self.cfg.timezone), window)
+
+    async def release_held(self):
+        """Push every reminder whose quiet-hours hold has ended, once, through the seen check."""
+        if not self.public_key:
+            return
+        now = _local_now(self.cfg.timezone).timestamp()
+        rows = self.db.execute(
+            "SELECT id, text, created, metadata FROM messages WHERE space=? AND role='assistant'"
+            " AND status='done' AND id=thread AND created>? ORDER BY created",
+            (SPACE, time.time() - HELD_WINDOW_SECONDS)).fetchall()
+        for row in rows:
+            push = json.loads(row["metadata"] or "{}").get("push") or {}
+            held_until = push.get("held_until")
+            if held_until is None or held_until > now:
+                continue
+            metadata = json.loads(row["metadata"] or "{}")
+            metadata["push"] = {k: v for k, v in push.items() if k != "held_until"}
+            self.db.execute("UPDATE messages SET metadata=? WHERE id=?",
+                            (json.dumps(metadata, ensure_ascii=False), row["id"]))
+            self.db.commit()
+            logger.info("Quiet hours over; pushing a held reminder")
+            await self._push_unless_seen(row["text"], row["created"], row["id"], message_id=row["id"])
 
     async def subscribe(self, request):
         if not self.public_key:
@@ -706,7 +754,7 @@ class Companion:
         marked on its row, and only within the last day, so a device that
         has been away for a week is not buried on its return.
         """
-        if not self.public_key:
+        if not self.public_key or self.quiet_until() is not None:
             return
         now = time.time()
         rows = self.db.execute(
@@ -715,8 +763,10 @@ class Companion:
             (SPACE, now - NUDGE_AFTER_SECONDS, now - NUDGE_WINDOW_SECONDS, self.seen.get(SPACE, 0.0))).fetchall()
         for row in rows:
             push = json.loads(row["metadata"] or "{}").get("push")
-            if push is None or push.get("nudged") or push.get("displayed"):
+            if push is None or push.get("nudged") or push.get("displayed") or "at" not in push:
                 continue
+            if now - push["at"] < NUDGE_AFTER_SECONDS:
+                continue  # a held push released this morning is not stale yet
             self._record_push(row["id"], {"nudged": True})
             logger.info("Reminder still unseen after %d min; pushing again", NUDGE_AFTER_SECONDS // 60)
             await self._push(row["text"], row["id"], message_id=row["id"])
@@ -725,6 +775,7 @@ class Companion:
         while True:
             await asyncio.sleep(NUDGE_POLL_SECONDS)
             try:
+                await self.release_held()
                 await self.nudge_unseen()
             except Exception:
                 logger.exception("Reminder nudge sweep failed")

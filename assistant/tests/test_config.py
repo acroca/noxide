@@ -436,3 +436,19 @@ def test_maintenance_crons_are_whitespace_stripped(state_dir: Path) -> None:
 
     assert cfg.maintenance_compile == "0 3 * * *"
     assert cfg.maintenance_lint == ""
+
+
+def test_quiet_hours_from_toml_and_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('[pwa]\nquiet_hours = "23:00-07:30"\n')
+    assert load_config(cfg_file).pwa_quiet_hours == "23:00-07:30"
+    monkeypatch.setenv("PWA_QUIET_HOURS", "22:00-08:00")
+    assert load_config(cfg_file).pwa_quiet_hours == "22:00-08:00"
+    assert load_config(tmp_path / "missing.toml").pwa_quiet_hours == "22:00-08:00"
+
+
+def test_validate_rejects_malformed_quiet_hours(state_dir: Path) -> None:
+    _write_oauth_token(state_dir)
+    _config(state_dir, pwa_quiet_hours="23:00-07:30").validate_for_run()  # should not raise
+    with pytest.raises(ConfigError, match="pwa.quiet_hours"):
+        _config(state_dir, pwa_quiet_hours="night").validate_for_run()

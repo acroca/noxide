@@ -41,6 +41,7 @@ start one.
 | `pwa.port` | `PWA_PORT` | `8080` | Web listener port |
 | `pwa.origin` | `PWA_ORIGIN` | `http://localhost:8080` | Exact browser origin, without a trailing slash or path. HTTPS required except on localhost; proxy must preserve Host |
 | `pwa.push_contact` | `PWA_PUSH_CONTACT` | unset | `mailto:you@example.com`; enables optional web push. VAPID keys are generated in `state_dir/webpush.pem` |
+| `pwa.quiet_hours` | `PWA_QUIET_HOURS` | unset | `HH:MM-HH:MM` on the local clock, may cross midnight (`23:00-07:30`). A reminder that arrives inside the window is shown in the app at once but its push waits until the window ends, and is skipped if you read it in the app meanwhile. Replies to your own messages and restart notices are never held |
 | `backup.enabled` | `BACKUP_ENABLED` | `false` | Local-only git history of the vault: one commit per interaction that changed it, plus a periodic sweep for edits arriving from outside the assistant. Nothing is ever pushed. See [deployment.md](deployment.md#backups) |
 | `backup.git_dir` | `BACKUP_GIT_DIR` | `<state_dir>/vault.git` | Where the backup repository lives. Must be **outside** the vault — a git dir inside a synced folder (iCloud, Dropbox) gets corrupted by the sync engine |
 | `maintenance.compile` | `MAINTENANCE_COMPILE` | `0 3 * * *` | Cron for the built-in nightly vault compile, on the local clock, weekdays by name. `""` disables it. See [vault.md](vault.md#operations) |

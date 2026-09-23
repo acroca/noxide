@@ -14,6 +14,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import DEFAULT_VENDORS
+from .quiet_hours import parse_window
 
 
 class ConfigError(RuntimeError):
@@ -55,6 +56,10 @@ class Config(BaseSettings):
     pwa_port: int = Field(default=8080, ge=1, le=65535)
     pwa_origin: str = "http://localhost:8080"
     pwa_push_contact: str = ""
+    # Local-time window ("23:00-07:30") in which reminder pushes are held
+    # until the window ends; empty disables. Replies and lifecycle notices
+    # are never held.
+    pwa_quiet_hours: str = ""
 
     # Vault backup (optional) — local-only git history of the vault, kept in a
     # git dir outside it. None means <state_dir>/vault.git.
@@ -148,6 +153,11 @@ class Config(BaseSettings):
                 or origin.password or (origin.scheme == "http"
                 and origin.hostname not in ("localhost", "127.0.0.1", "::1"))):
             problems.append("pwa.origin must be an HTTPS origin without a path (HTTP only on localhost)")
+        if self.pwa_quiet_hours and parse_window(self.pwa_quiet_hours) is None:
+            problems.append(
+                f"pwa.quiet_hours {self.pwa_quiet_hours!r} must be HH:MM-HH:MM on the local "
+                'clock (e.g. "23:00-07:30"), or "" to disable'
+            )
         if self.pwa_push_contact and not self.pwa_push_contact.startswith("mailto:"):
             problems.append("pwa.push_contact must be a mailto: address, or empty to disable push")
 
@@ -173,6 +183,7 @@ _TOML_FIELDS = (
     ("pwa", "port", "pwa_port"),
     ("pwa", "origin", "pwa_origin"),
     ("pwa", "push_contact", "pwa_push_contact"),
+    ("pwa", "quiet_hours", "pwa_quiet_hours"),
     ("backup", "enabled", "backup_enabled"),
     ("backup", "git_dir", "backup_git_dir"),
     ("maintenance", "compile", "maintenance_compile"),
@@ -193,6 +204,7 @@ _ENV_FIELDS = {
     "PWA_PORT": "pwa_port",
     "PWA_ORIGIN": "pwa_origin",
     "PWA_PUSH_CONTACT": "pwa_push_contact",
+    "PWA_QUIET_HOURS": "pwa_quiet_hours",
     "BACKUP_ENABLED": "backup_enabled",
     "BACKUP_GIT_DIR": "backup_git_dir",
     "MAINTENANCE_COMPILE": "maintenance_compile",

@@ -32,6 +32,7 @@ sonnet = "claude-sonnet-5"
 # port = 8080
 # origin = "http://localhost:8080"  # exact browser origin; HTTPS outside localhost
 # push_contact = "mailto:you@example.com"  # enables optional web push
+# quiet_hours = "23:00-07:30"  # local time; reminder pushes wait until the window ends
 
 [backup]
 # Optional: local-only git history of the vault. Every interaction that
