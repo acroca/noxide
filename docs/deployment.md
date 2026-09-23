@@ -382,6 +382,16 @@ reply the Shortcut received is not pushed again, though the app badge still
 counts it until you open the chat. Each run of the Shortcut is a new message:
 running it again after a timeout sends the question twice.
 
+**Voice in any language.** With [voice notes](#voice-notes) set up, the
+same route takes a recording instead of text, transcribed on the server with
+the language detected automatically — so you can speak Spanish or Catalan
+whatever language Siri is set to. Build the shortcut with **Record Audio**
+first, then **Get Contents of URL** with the request body set to **File** and
+the recording as the file, the same `Authorization` header, and `?wait=45` on
+the URL; the answer carries `text`, what was heard, beside `reply`. Recording
+needs the screen, so this variant suits the Action Button, Back Tap or a Home
+Screen button rather than "Hey Siri".
+
 The phone must be able to reach the app, which with Tailscale Serve means it
 is on your tailnet. The token replaces the browser's same-origin headers for
 this one route and grants nothing else: it cannot read history or change

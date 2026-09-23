@@ -1109,3 +1109,38 @@ def test_spoken_flattens_markdown_for_speech():
     assert spoken("- [ ] call my_friend about 2*3*4 and 2 * 3 * 4\n  - see [Foo](https://x.test/Foo_(bar)) now\n"
                   "![alt](img.png) >= 3 and __init__") == (
         "call my_friend about 2*3*4 and 2 * 3 * 4\nsee Foo now\nalt >= 3 and init")
+
+
+async def test_capture_takes_an_audio_body_and_answers_its_transcript(companion):
+    from assistant.transcribe import TranscriptionError
+
+    service, client = companion
+    service.cfg.pwa_capture_token = CAPTURE_TOKEN
+    audio = {**SHORTCUT_HEADERS, "Content-Type": "audio/x-m4a"}
+    # Without a transcriber, audio is refused with a reason the Shortcut can show.
+    response = await client.post("/api/capture?wait=45", data=b"m4a-bytes", headers=audio)
+    assert response.status == 409
+    service.transcriber = MagicMock(transcribe=AsyncMock(return_value="¿Qué comen los niños mañana?"))
+    response = await client.post("/api/capture?wait=45", data=b"m4a-bytes", headers=audio)
+    assert response.status == 200
+    body = await response.json()
+    assert body["status"] == "done" and body["reply"] == "Recorded."
+    assert body["text"] == "¿Qué comen los niños mañana?"
+    service.transcriber.transcribe.assert_awaited_once_with(b"m4a-bytes")
+    rows = flat(await timeline(client))
+    assert rows[0]["text"] == "¿Qué comen los niños mañana?" and json.loads(rows[0]["metadata"])["via"] == "shortcut"
+    # A JSON body still works with a transcriber wired, and reports no transcript.
+    body = await (await client.post("/api/capture", json={"text": "Typed"}, headers=SHORTCUT_HEADERS)).json()
+    assert body["status"] == "done" and "text" not in body
+    # Silence, a failed transcription, a bad wait and an empty body are refused before anything is archived.
+    service.transcriber.transcribe.return_value = "   "
+    assert (await client.post("/api/capture", data=b"m4a-bytes", headers=audio)).status == 400
+    service.transcriber.transcribe.side_effect = TranscriptionError("credits are used up")
+    response = await client.post("/api/capture", data=b"m4a-bytes", headers=audio)
+    assert response.status == 502 and "credits" in (await response.json())["error"]
+    service.transcriber.transcribe.side_effect = None
+    assert (await client.post("/api/capture?wait=soon", data=b"m4a-bytes", headers=audio)).status == 400
+    assert (await client.post("/api/capture", data=b"", headers=audio)).status == 400
+    assert len(flat(await timeline(client))) == 4
+    # The token is still required for audio.
+    assert (await client.post("/api/capture", data=b"m4a-bytes", headers={**audio, "Authorization": "Bearer no"})).status == 403

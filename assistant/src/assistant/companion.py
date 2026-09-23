@@ -466,14 +466,7 @@ class Companion:
             raise web.HTTPForbidden(text="A valid capture token is required")
         if not self.accepting:
             raise web.HTTPServiceUnavailable(text="Service restarting; try again shortly")
-        data = await request.json()
-        if not isinstance(data, dict):
-            raise web.HTTPBadRequest(text="Send a JSON object with a text field")
-        text, wait = data.get("text"), data.get("wait", CAPTURE_WAIT_SECONDS)
-        if not isinstance(text, str) or not text.strip() or len(text) > 20000:
-            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters")
-        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or wait < 0 or math.isnan(wait):
-            raise web.HTTPBadRequest(text="wait must be a number of seconds")
+        text, wait, transcript = await self._capture_input(request)
         if len(self.tasks) >= MAX_IN_FLIGHT:
             raise web.HTTPTooManyRequests(text="Too many messages are in progress. Try again shortly.")
         message_id = uuid.uuid4().hex
@@ -481,7 +474,40 @@ class Companion:
         self._launch(message_id)
         # Never await the task itself: a client that gives up must not cancel the run.
         await asyncio.wait({self.tasks[message_id]}, timeout=min(wait, CAPTURE_WAIT_MAX))
-        return web.json_response({"id": message_id, **self._capture_result(message_id)})
+        return web.json_response({"id": message_id, **({"text": text} if transcript else {}),
+                                  **self._capture_result(message_id)})
+
+    async def _capture_input(self, request):
+        """The message text and wait of a capture request, and whether the text was transcribed.
+
+        A JSON body carries ``text`` and ``wait``; any other body is a
+        recording (a Shortcut's Record Audio, in whatever language), sent
+        through the transcriber, with ``wait`` in the query string.
+        """
+        if request.content_type == "application/json":
+            data = await request.json()
+            if not isinstance(data, dict):
+                raise web.HTTPBadRequest(text="Send a JSON object with a text field")
+            text, wait, transcript = data.get("text"), data.get("wait", CAPTURE_WAIT_SECONDS), False
+        else:
+            if self.transcriber is None:
+                raise web.HTTPConflict(text="Voice messages aren't set up: set ELEVENLABS_API_KEY on the server")
+            try:
+                wait = float(request.query.get("wait", CAPTURE_WAIT_SECONDS))
+            except ValueError:
+                wait = None
+            data = await self._read_upload(request)
+            try:
+                text = await self.transcriber.transcribe(data)
+            except TranscriptionError as exc:
+                raise web.HTTPBadGateway(text=f"Couldn't transcribe that: {exc}") from exc
+            transcript = True
+        if not isinstance(text, str) or not text.strip() or len(text) > 20000:
+            raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters"
+                                     if not transcript else "Nothing was heard in the recording")
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or wait < 0 or math.isnan(wait):
+            raise web.HTTPBadRequest(text="wait must be a number of seconds")
+        return text, wait, transcript
 
     def _capture_result(self, message_id):
         """What a Shortcut says for the row's state once the wait is over."""

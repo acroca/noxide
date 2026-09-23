@@ -53,7 +53,7 @@ the app is you.
 | **Reminders & jobs** | One-off (`"in 10 minutes"`, `"tomorrow at 9am"`) and recurring cron jobs, in a markdown table you can hand-edit; reminders arrive as push notifications you can reply to |
 | **Web research** | Optional, via a self-hosted [4get](https://git.lolcat.ca/lolcat/4get); runs in an isolated sub-agent with no vault access |
 | **Voice notes** | The app's microphone button records and transcribes via ElevenLabs Scribe; optional, needs an API key |
-| **Siri & Shortcuts** | An iOS Shortcut sends a message and gets the reply back in one request, read aloud by Siri; optional, needs a token |
+| **Siri & Shortcuts** | An iOS Shortcut sends a message, typed, dictated or recorded in any language, and gets the reply back in one request, read aloud by Siri; optional, needs a token |
 | **Photos** | Paste, drop or attach images; sent to the vision model and filed in the vault, driven by your caption |
 | **Documents** | Attach a PDF or text file from the app, or drop it in the vault's `attachments/` folder; read on demand — digital PDFs parsed locally, scans and images transcribed via vision |
 | **One conversation** | No rooms or channels to pick: say what happened and the bot works out which project or area it concerns |
