@@ -15,7 +15,7 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .agent import MAX_ITERATIONS_REPLY
+from .agent import JobResult
 from .atomic import atomic_write_text
 
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ def read_inbox(vault_path: Path) -> str | None:
 
 async def ingest(
     vault_path: Path,
-    run_job_fn: Callable[[str], Coroutine[Any, Any, str | None]],
+    run_job_fn: Callable[[str], Coroutine[Any, Any, JobResult]],
     backup: VaultBackup | None = None,
     *,
     state_dir: Path,
@@ -74,9 +74,9 @@ async def ingest(
         snapshot = read_inbox(vault_path) or ""
         content = snapshot[len(processed):] if snapshot.startswith(processed) else snapshot
         if content.strip():
-            reply = await run_job_fn(_PROMPT_TEMPLATE.format(content=content))
-            if reply == MAX_ITERATIONS_REPLY:
-                logger.warning("inbox ingestion abandoned at the iteration cap; checkpoint unchanged")
+            result = await run_job_fn(_PROMPT_TEMPLATE.format(content=content))
+            if result.capped:
+                logger.warning("inbox ingestion hit the iteration cap; checkpoint unchanged")
                 return
             if backup is not None and not await backup.commit_run(
                 [INBOX_FILENAME],

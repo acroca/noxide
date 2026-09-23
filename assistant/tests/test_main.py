@@ -24,7 +24,7 @@ from assistant import (
     schedule,
     usage,
 )
-from assistant.agent import MAX_ITERATIONS_REPLY
+from assistant.agent import MAX_ITERATIONS_REPLY, JobResult
 from assistant.maintenance import COMPILE_ID, COMPILE_PROMPT, STATE_FILENAME, MaintenanceState
 from assistant.models import ModelPicker
 from assistant.retry_queue import PendingItem
@@ -142,7 +142,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     )
     app_factory = MagicMock(return_value=app)
     monkeypatch.setattr(companion, "Companion", app_factory)
-    runner = MagicMock(run_job=AsyncMock(return_value="completed"))
+    runner = MagicMock(run_job=AsyncMock(return_value=JobResult("completed")))
     monkeypatch.setattr(agent, "Agent", MagicMock(return_value=runner))
 
     async def drain_scheduler(*, timeout: float) -> int:
@@ -468,8 +468,11 @@ async def test_scheduler_startup_failure_still_cleans_up(runtime, step) -> None:
 
 
 @pytest.mark.parametrize("source", ["scheduler", "retry"])
-@pytest.mark.parametrize("reply", [MAX_ITERATIONS_REPLY, "completed", ""])
-async def test_job_callbacks_reject_only_iteration_capped_outcomes(runtime, source, reply) -> None:
+@pytest.mark.parametrize("reply", [JobResult(MAX_ITERATIONS_REPLY, capped=True), JobResult("completed"),
+                                   JobResult(""), JobResult("did half; the rest remains", capped=True)])
+async def test_job_callbacks_reject_only_abandoned_outcomes(runtime, source, reply) -> None:
+    """Only a run that ended on the raw sentinel (no closing summary) is rejected;
+    a capped run that summarised what remains counts as completed."""
     await asyncio.wait_for(main._run(None), timeout=2)
     callback = (
         runtime.scheduler_factory.call_args.kwargs["run_job_fn"]
@@ -478,7 +481,7 @@ async def test_job_callbacks_reject_only_iteration_capped_outcomes(runtime, sour
     )
     runtime.agent.run_job.return_value = reply
 
-    if reply == MAX_ITERATIONS_REPLY:
+    if reply.reply == MAX_ITERATIONS_REPLY:
         with pytest.raises(RuntimeError, match="iteration limit"):
             await callback("check the vault")
     else:
@@ -499,7 +502,7 @@ async def test_real_scheduler_records_success_only_for_completed_callback(runtim
     entry = entries[0]
     entry.next = baseline.isoformat()
     scheduler._write_entries(entries, preserved)
-    runtime.agent.run_job.return_value = MAX_ITERATIONS_REPLY if capped else "completed"
+    runtime.agent.run_job.return_value = JobResult(MAX_ITERATIONS_REPLY, capped=True) if capped else JobResult("completed")
 
     await scheduler._fire(COMPILE_ID, COMPILE_PROMPT, recurring=True)
     await scheduler._fire(entry.id, entry.prompt, recurring=True)

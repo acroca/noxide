@@ -503,7 +503,26 @@ async def test_researcher_rejects_overlong_question(web: WebTools) -> None:
     mock_client.chat.assert_not_called()
 
 
-async def test_researcher_iteration_cap(web: WebTools) -> None:
+async def test_researcher_iteration_cap_closes_with_what_it_found(web: WebTools) -> None:
+    """At the cap the researcher gets one tool-less turn to answer from what it
+    has and name the gaps, instead of returning an error string."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("fetch_page", {"url": "file:///x"})] * 8 + [
+        _make_text_response("Go shop, ~40 people (careers page). Remote policy: not found.")])
+    researcher = Researcher(web)
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        out = await researcher.research("loop forever")
+
+    assert out == "Go shop, ~40 people (careers page). Remote policy: not found."
+    assert mock_client.chat.call_count == 9
+    closing = mock_client.chat.call_args_list[8]
+    assert closing.args[1] is None and closing.kwargs.get("initiator") == "agent"
+    assert closing.args[0][-1]["role"] == "user" and "could not verify" in closing.args[0][-1]["content"]
+
+
+async def test_researcher_iteration_cap_without_a_closing_answer_is_an_error(web: WebTools) -> None:
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(
         return_value=_make_tool_call_response("fetch_page", {"url": "file:///x"})
@@ -514,7 +533,7 @@ async def test_researcher_iteration_cap(web: WebTools) -> None:
         out = await researcher.research("loop forever")
 
     assert out.startswith("[tool error:")
-    assert mock_client.chat.call_count == 8
+    assert mock_client.chat.call_count == 9
 
 
 async def test_researcher_truncates_summary(web: WebTools) -> None:

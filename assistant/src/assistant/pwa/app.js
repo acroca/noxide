@@ -169,10 +169,11 @@ function receiptNote(message) {
   // What the run changed, from the reply row's receipt; a confirmation that
   // changed nothing after the guard's second chance says so.
   const meta = metadataOf(message);
-  if (meta.guard === 'unsaved') return '<div class="message-status"><span>Nothing was saved</span></div>';
-  if (!meta.wrote || !meta.wrote.length) return '';
-  const names = meta.wrote.map(path => path.replace(/^wiki\//, ''));
-  return `<div class="message-status"><span>Saved: ${escape(names.join(', '))}</span></div>`;
+  const notes = [];
+  if (meta.capped) notes.push('Stopped at the tool-call limit. Reply to continue.');
+  if (meta.guard === 'unsaved') notes.push('Nothing was saved');
+  else if (meta.wrote && meta.wrote.length) notes.push(`Saved: ${meta.wrote.map(path => path.replace(/^wiki\//, '')).join(', ')}`);
+  return notes.map(text => `<div class="message-status"><span>${escape(text)}</span></div>`).join('');
 }
 function inline(text) {
   return escape(text).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');

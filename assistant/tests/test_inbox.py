@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from assistant import inbox
-from assistant.agent import MAX_ITERATIONS_REPLY
+from assistant.agent import MAX_ITERATIONS_REPLY, JobResult
 from assistant.backup import VaultBackup
 from assistant.inbox import STATE_FILENAME, ingest, read_inbox
 
@@ -44,7 +44,7 @@ async def test_success_retains_raw_inbox_and_skips_it_on_restart(
 ) -> None:
     text = "2026-07-29 18:30 - called the plumber\n"
     (vault / "inbox.md").write_text(text)
-    job = AsyncMock(return_value="done")
+    job = AsyncMock(return_value=JobResult("done"))
     await ingest(vault, job, state_dir=state_dir)
     assert text in job.await_args.args[0]
     assert (vault / "inbox.md").read_text() == text
@@ -67,10 +67,10 @@ async def test_external_writes_survive_and_are_consumed_next_startup(
         (vault / "inbox.md").write_text(later)
         real_write(path, text)
 
-    async def job(prompt: str) -> str:
+    async def job(prompt: str) -> JobResult:
         if when == "during_run":
             path.write_text(later)
-        return "done"
+        return JobResult("done")
 
     with monkeypatch.context() as m:
         if when == "during_checkpoint":
@@ -78,19 +78,20 @@ async def test_external_writes_survive_and_are_consumed_next_startup(
         await ingest(vault, job, state_dir=state_dir)
     assert path.read_text() == later
     assert (state_dir / STATE_FILENAME).read_text() == "entry\n"
-    next_job = AsyncMock(return_value="done")
+    next_job = AsyncMock(return_value=JobResult("done"))
     await ingest(vault, next_job, state_dir=state_dir)
     content = next_job.await_args.args[0].split("--- inbox.md ---\n", 1)[1]
     assert content == later.removeprefix("entry\n")
     assert (state_dir / STATE_FILENAME).read_text() == later
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("down"), MAX_ITERATIONS_REPLY])
+@pytest.mark.parametrize("failure", [RuntimeError("down"), JobResult(MAX_ITERATIONS_REPLY, capped=True),
+                                     JobResult("partial summary", capped=True)])
 async def test_failed_or_capped_run_keeps_old_checkpoint(
-    vault: Path, state_dir: Path, failure: Exception | str,
+    vault: Path, state_dir: Path, failure: Exception | JobResult,
 ) -> None:
     (vault / "inbox.md").write_text("old\n")
-    await ingest(vault, AsyncMock(return_value="done"), state_dir=state_dir)
+    await ingest(vault, AsyncMock(return_value=JobResult("done")), state_dir=state_dir)
     (vault / "inbox.md").write_text("old\nnew\n")
     job = AsyncMock(side_effect=failure) if isinstance(failure, Exception) else AsyncMock(
         return_value=failure
@@ -104,10 +105,10 @@ async def test_cancelled_run_does_not_checkpoint(vault: Path, state_dir: Path) -
     (vault / "inbox.md").write_text("entry\n")
     started = asyncio.Event()
 
-    async def hang(prompt: str) -> str:
+    async def hang(prompt: str) -> JobResult:
         started.set()
         await asyncio.Event().wait()
-        return "done"
+        return JobResult("done")
 
     task = asyncio.create_task(ingest(vault, hang, state_dir=state_dir))
     await started.wait()
@@ -131,7 +132,7 @@ async def test_checkpoint_write_failure_retries_without_touching_inbox(
     vault: Path, state_dir: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (vault / "inbox.md").write_text("entry\n")
-    job = AsyncMock(return_value="done")
+    job = AsyncMock(return_value=JobResult("done"))
     with monkeypatch.context() as m:
         def fail(*args: object) -> None:
             raise OSError("disk full")
@@ -149,7 +150,7 @@ async def test_observed_user_clear_resets_checkpoint(
 ) -> None:
     path = vault / "inbox.md"
     path.write_text("entry\n")
-    job = AsyncMock(return_value="done")
+    job = AsyncMock(return_value=JobResult("done"))
     await ingest(vault, job, state_dir=state_dir)
     if deleted:
         path.unlink()
@@ -170,7 +171,7 @@ async def test_backup_failure_withholds_checkpoint_until_retry(
     (vault / "inbox.md").write_text("entry\n")
     lock = state_dir / "vault.git" / "index.lock"
     lock.write_text("")
-    job = AsyncMock(return_value="done")
+    job = AsyncMock(return_value=JobResult("done"))
     await ingest(vault, job, backup, state_dir=state_dir)
     assert not (state_dir / STATE_FILENAME).exists()
     assert (vault / "inbox.md").read_text() == "entry\n"

@@ -724,7 +724,8 @@ async def test_agent_max_iterations(agent: Agent, vault: VaultTools) -> None:
         reply = await agent.run("List everything")
 
     assert "maximum" in reply.lower() or "iteration" in reply.lower()
-    assert mock_client.chat.call_count == 20
+    # 20 loop turns, then one tool-less closing call that yielded no text.
+    assert mock_client.chat.call_count == 21
 
 
 # ------------------------------------------------------------------
@@ -2280,7 +2281,7 @@ async def test_terminal_chat_error_preserves_failure_tail_and_allows_next_run_co
     assert len(history.messages()) <= 4
 
 
-@pytest.mark.parametrize("ending", ["outage", "cancel", "cap"])
+@pytest.mark.parametrize("ending", ["outage", "cancel"])
 async def test_nonterminal_chat_end_preserves_unbounded_uncompacted_work(
     vault: VaultTools, ending: str,
 ) -> None:
@@ -2321,7 +2322,7 @@ async def test_nonterminal_chat_end_preserves_unbounded_uncompacted_work(
 
 @pytest.mark.asyncio
 async def test_run_job_at_iteration_cap_delivers_plain_notice(vault: VaultTools) -> None:
-    """A job abandoned at the cap tells the user in a sentence, never the raw sentinel."""
+    """A job whose closing call yields no text tells the user in a sentence, never the raw sentinel."""
     from assistant.agent import MAX_ITERATIONS_REPLY
 
     captured: list[str] = []
@@ -2336,13 +2337,69 @@ async def test_run_job_at_iteration_cap_delivers_plain_notice(vault: VaultTools)
         patch("assistant.copilot.get_client", return_value=mock_client),
         patch("assistant.agent._MAX_ITERATIONS", 2),
     ):
-        reply = await agent.run_job("Nightly compile. Run the Compile procedure.")
+        result = await agent.run_job("Nightly compile. Run the Compile procedure.")
 
-    assert reply == MAX_ITERATIONS_REPLY
+    assert result.reply == MAX_ITERATIONS_REPLY and result.capped
     assert len(captured) == 1
     assert MAX_ITERATIONS_REPLY not in captured[0]
     assert "Nightly compile" in captured[0]
     assert "tool-call limit" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_run_job_delivers_the_cap_summary(vault: VaultTools) -> None:
+    """At the cap the model gets one tool-less turn to say what it did and what
+    remains; that text is delivered and the job counts as capped but completed."""
+    captured: list[str] = []
+    agent = _job_agent(vault, captured)
+    vault.write_file("page.md", "hello")
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("read_file", {"path": "page.md"}),
+        _make_tool_call_response("read_file", {"path": "page.md"}, "tc2"),
+        _make_text_response("Compilé now.md; quedan por revisar las rutinas."),
+    ])
+
+    with (
+        patch("assistant.copilot.get_client", return_value=mock_client),
+        patch("assistant.agent._MAX_ITERATIONS", 2),
+    ):
+        result = await agent.run_job("Nightly compile. Run the Compile procedure.")
+
+    assert result.capped and result.reply == "Compilé now.md; quedan por revisar las rutinas."
+    assert captured == ["Compilé now.md; quedan por revisar las rutinas."]
+    closing = mock_client.chat.call_args_list[2]
+    assert closing.args[1] is None, "the closing call offers no tools"
+    assert closing.args[0][-1]["role"] == "user" and "limit" in closing.args[0][-1]["content"]
+    assert closing.kwargs.get("response_format") is None, "the job close schema does not apply to the summary"
+
+
+@pytest.mark.asyncio
+async def test_cap_closes_with_a_tool_less_summary(threaded: Agent, archive: ConversationArchive) -> None:
+    """A web message that hits the cap ends on the model's summary: the run is
+    complete (context saved, thread settled, row done) and the reply row says
+    it was capped, so the app can suggest replying to continue."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("list_files", {"glob": "*.md"}),
+        _make_tool_call_response("list_files", {"glob": "*.md"}, "tc2"),
+        _make_text_response("Revisé dos páginas; faltan las de proyectos."),
+    ])
+    root = archive.insert("general", "user", "revisa todo el vault", "queued")
+    with (
+        patch("assistant.copilot.get_client", return_value=mock_client),
+        patch("assistant.agent._MAX_ITERATIONS", 2),
+    ):
+        reply = await threaded.run("revisa todo el vault", message_id=root)
+    assert reply == "Revisé dos páginas; faltan las de proyectos."
+    assert mock_client.chat.call_count == 3
+    assert archive.get(root)["status"] == "done"
+    assert _reply_meta(archive, root) == {"wrote": [], "capped": True}
+    assert [r["content"] for r in archive.load_context("general") if r["role"] == "assistant"] == [reply]
+    assert root not in threaded._histories, "the thread settled; nothing is left for resume"
+    closing = mock_client.chat.call_args_list[2].args[0]
+    assert [m["role"] for m in closing][-2:] == ["tool", "user"], "the note rides live after the last tool result"
+    assert "not call tools" in closing[-1]["content"]
 
 
 # ------------------------------------------------------------------

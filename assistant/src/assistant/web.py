@@ -265,6 +265,13 @@ Rules:
 """
 
 
+_RESEARCH_CAP_NOTE = (
+    "[You have used all of your research turns. Do not call tools. Answer the question now "
+    "from what you found, citing the source URL for each claim, and state plainly what you "
+    "could not verify.]"
+)
+
+
 class Researcher:
     """Quarantined research loop: fresh context per call, web tools only."""
 
@@ -320,4 +327,17 @@ class Researcher:
                     "content": str(result),
                 })
 
-        return "[tool error: research hit the iteration limit without an answer]"
+        # Out of turns: one tool-less closing call for what was found so far.
+        messages.append({"role": "user", "content": _RESEARCH_CAP_NOTE})
+        try:
+            response = await client.chat(list(messages), None, initiator="agent")
+        except Exception as e:
+            return f"[tool error: research failed: {e}]"
+        usage.record("research", response.get("model", ""), response.get("usage", {}))
+        msg = response["choices"][0]["message"]
+        summary = msg.get("content") or ""
+        if extract_tool_calls(msg) or not summary.strip():
+            return "[tool error: research hit the iteration limit without an answer]"
+        if len(summary) > _MAX_SUMMARY_CHARS:
+            summary = summary[:_MAX_SUMMARY_CHARS] + "\n[truncated]"
+        return summary

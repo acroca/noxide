@@ -82,6 +82,16 @@ _GUARD_NOTE = (
     "already in place, reply again saying so plainly.]"
 )
 _GUARD_DRAFT_CHARS = 300
+# At the iteration cap the model gets one tool-less turn to close: what it
+# completed, what remains, what the user must know. Live-only like the guard
+# note. Before this, a capped run answered with the bare sentinel and the
+# researcher with an error string, so a vault review or a company lookup that
+# ran long delivered nothing of what it had found (three research failures in
+# one day, 2026-09-22).
+_CAP_NOTE = (
+    "[This run has reached its tool-call limit. Do not call tools. In the user's "
+    "language, say what you completed, what remains undone, and anything they must know.]"
+)
 
 # A scheduled run replies with this sentinel (prompts/schedule.md) when it
 # finds its purpose already met; run_job then delivers nothing.
@@ -275,12 +285,28 @@ class RunResult:
     touched: set[str] = field(default_factory=set)
     wrote: set[str] = field(default_factory=set)
     guard: str | None = None
+    capped: bool = False
 
     def metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {"wrote": sorted(self.wrote)}
         if self.guard:
             data["guard"] = self.guard
+        if self.capped:
+            data["capped"] = True
         return data
+
+
+@dataclass(frozen=True)
+class JobResult:
+    """A scheduled run's raw final reply and whether it hit the iteration cap.
+
+    ``reply`` is ``MAX_ITERATIONS_REPLY`` only when the cap was hit *and* the
+    closing summary produced no text; callers that must not mistake an
+    abandoned run for a completed one (inbox ingestion) check ``capped``.
+    """
+
+    reply: str
+    capped: bool = False
 
 
 class Agent:
@@ -637,9 +663,13 @@ class Agent:
         *,
         message_id: str | None = None,
         response_format: dict[str, Any] | None = None,
+        want_capped: bool = False,
         **kwargs: Any,
-    ) -> str:
-        """Run under the thread's lock, keeping the archived row's status in step."""
+    ) -> Any:
+        """Run under the thread's lock, keeping the archived row's status in step.
+
+        Returns the reply, or ``(reply, capped)`` with ``want_capped``.
+        """
         lock = self._run_locks.setdefault(thread, asyncio.Lock())
         async with lock:
             if self.archive and message_id:
@@ -647,7 +677,8 @@ class Agent:
                 if row is None or row["status"] in ("dismissed", "deleted"):
                     return ""
                 if row["status"] == "done":
-                    return self.archive.reply(message_id) or ""
+                    done = self.archive.reply(message_id) or ""
+                    return (done, False) if want_capped else done
                 self.archive.status(message_id, "running")
                 history = self._get_history(thread)
                 history.request_ids.add(message_id)
@@ -673,7 +704,7 @@ class Agent:
         # delayed by git, and the commit message carries the full exchange.
         if self._backup is not None and result.touched:
             self._backup.schedule_commit(result.touched, trigger=user_message, response=reply)
-        return reply
+        return (reply, result.capped) if want_capped else reply
 
     def _mark_unfinished(self, message_id: str, status: str, error: str) -> None:
         """Record why a run stopped, unless the user already dismissed the message.
@@ -899,9 +930,34 @@ class Agent:
                     "content": str(tool_result),
                 })
 
-        # Hit iteration cap
+        # Hit iteration cap: one tool-less closing turn, then the run is
+        # complete. Only when that turn yields no text does the sentinel
+        # remain, leaving the history unfinished for a resume.
         logger.warning("Agent hit max iterations (%d) for thread=%s", _MAX_ITERATIONS, thread)
-        result.reply = MAX_ITERATIONS_REPLY
+        result.capped = True
+        turn_messages = history.messages()
+        if live_entry is not None:
+            turn_messages = [live_entry if m is user_entry else m for m in turn_messages]
+        messages = [{"role": "system", "content": system_prompt}] + turn_messages
+        messages.append({"role": "user", "content": _CAP_NOTE})
+        try:
+            response = await client.chat(messages, None)
+        except copilot.CopilotUnavailableError:
+            if unwind_on_unavailable:
+                history.pop_if_last(user_entry)
+            raise
+        except Exception:
+            history.finish_run(success=False)
+            raise
+        msg = response["choices"][0]["message"]
+        usage.record("agent", response.get("model", ""), response.get("usage", {}))
+        summary = msg.get("content") or ""
+        if extract_tool_calls(msg) or not summary.strip():
+            result.reply = MAX_ITERATIONS_REPLY
+            return result
+        history.append(msg)
+        history.finish_run(timestamp=self._local_stamp())
+        result.reply = summary
         return result
 
     async def resume(
@@ -967,7 +1023,7 @@ class Agent:
             self._backup.schedule_commit(result.touched, trigger=note, response=reply)
         return reply
 
-    async def run_job(self, prompt: str) -> str:
+    async def run_job(self, prompt: str) -> JobResult:
         """Run a scheduled-job prompt on the unthreaded jobs history.
 
         The prompt reaches the model tagged ``[scheduled run]``, and the run
@@ -979,9 +1035,12 @@ class Agent:
         it stands down (models misplace the sentinel), anything else is
         delivered raw so a reminder is never lost.
 
-        Returns the run's raw final reply, so callers that must not mistake
-        an abandoned run for a completed one can check it against
-        ``MAX_ITERATIONS_REPLY`` (inbox ingestion does, before clearing).
+        Returns the run's raw final reply and whether it hit the cap: a capped
+        run closes with the model's summary of what it did and what remains,
+        delivered as the message, and counts as completed for the scheduler
+        (tomorrow's compile covers a capped one); inbox ingestion still
+        refuses to checkpoint it. The raw sentinel is the reply only when the
+        closing turn produced no text.
         """
         base_send = self._send_message_fn
         delivered = 0
@@ -992,29 +1051,36 @@ class Agent:
                 await base_send(text)
             delivered += 1
 
-        reply = await self._run(
+        reply, capped = await self._run(
             None,
             f"[scheduled run] {prompt}",
             transient_context=self._job_state_snapshot(prompt),
             send_message_fn=counting_send,
             response_format=_JOB_CLOSE_RESPONSE_FORMAT,
+            want_capped=True,
         )
         if reply == MAX_ITERATIONS_REPLY:
             if base_send:
                 await counting_send(_JOB_CAP_NOTICE.format(prompt=_clip(prompt, _JOB_CAP_PROMPT_CHARS)))
-            return reply
+            return JobResult(reply, capped=True)
+        if capped:
+            # The closing summary is what happened and what is left: deliver
+            # it as is, the job-close contract does not apply to it.
+            if base_send:
+                await counting_send(reply)
+            return JobResult(reply, capped=True)
         close = _parse_job_close(reply)
         if close is not None:
             if close["silent"] or delivered or not close["message"] or base_send is None:
-                return reply
+                return JobResult(reply)
             await counting_send(close["message"])
-            return reply
+            return JobResult(reply)
         if _SILENT_SENTINEL in reply.lower():
-            return reply
+            return JobResult(reply)
         if not delivered and reply and base_send:
             logger.warning("Scheduled run closed without job-close JSON; delivering raw reply")
             await counting_send(reply)
-        return reply
+        return JobResult(reply)
 
 
 def _failure_status(exc: BaseException) -> str:

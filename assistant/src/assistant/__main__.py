@@ -292,10 +292,12 @@ async def _drain_final(
                 logger.error("Final %s flush failed; pending data may not be persisted", name, exc_info=exc)
 
 
-def _require_completed(reply: str) -> None:
+def _require_completed(result: Any) -> None:
+    """Reject a run abandoned at the cap with no closing summary (a capped run
+    that summarised what remains counts as completed)."""
     from .agent import MAX_ITERATIONS_REPLY
 
-    if reply == MAX_ITERATIONS_REPLY:
+    if result.reply == MAX_ITERATIONS_REPLY:
         raise RuntimeError("Agent reached its iteration limit before completing the run")
 
 
