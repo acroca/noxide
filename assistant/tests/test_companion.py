@@ -490,6 +490,17 @@ async def test_served_worker_carries_the_shell_revision(companion):
     assert "__INSTANCE_VERSION__" not in worker
 
 
+async def test_composer_keeps_spellcheck_but_not_autocorrect(companion):
+    # Safari on macOS rewrites words in any editable field unless the field
+    # opts out: "treminada" became "terminada" as it was typed (2026-09-25).
+    # Chat apps underline the misspelling and leave the word alone.
+    service, client = companion
+    app = await (await client.get("/app.js")).text()
+    composer = re.search(r"<textarea[^>]*>", app).group(0)
+    assert 'autocorrect="off"' in composer
+    assert "spellcheck" not in composer
+
+
 async def test_pwa_assets_and_shutdown_rejection(companion):
     service, client = companion
     for path in ("/", "/app.js", "/theme.js", "/style.css", "/sw.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"):

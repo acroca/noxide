@@ -237,7 +237,7 @@ function renderChat(pageVersion) {
         <div id="composer-images" class="composer-images" hidden></div>
         <button id="attach-image" class="tool-button" type="button" aria-label="Attach image or file">${icon('image')}</button>
         <input id="image-input" type="file" accept="${ACCEPT}" multiple hidden>
-        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" placeholder="Message ${escape(name)}…">${escape(draft())}</textarea>
+        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" autocorrect="off" placeholder="Message ${escape(name)}…">${escape(draft())}</textarea>
         <button id="record-voice" class="tool-button" type="button" aria-label="Record voice message" hidden>${icon('mic')}</button>
         <button class="send-button" type="submit" aria-label="Send message">${icon('send')}</button>
       </form>
