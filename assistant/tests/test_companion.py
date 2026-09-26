@@ -986,8 +986,35 @@ async def test_remind_archives_once_and_repushes_the_same_thread(companion):
     assert [tuple(r) for r in rows] == [(thread, "Tómate las pastillas")]
     assert notify.call_args_list == [
         ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
-        ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
+        ((("Tómate las pastillas",), {"thread": thread, "message_id": thread, "grace": False})),
     ]
+
+
+async def test_remind_repeats_reach_the_phone_after_the_app_was_opened(companion):
+    # A repeat is by definition a re-send of something already displayed: the
+    # seen gate that drops replies shown on a focused device must not drop it
+    # (2026-09-26: the 09:00 and 09:30 pill nags were recorded "displayed" and
+    # never pushed because the app had been opened at 08:38).
+    service, client = companion
+    service.public_key = "configured"
+    with patch.object(service, "_push", new_callable=AsyncMock) as push, \
+            patch("assistant.companion.PUSH_GRACE_SECONDS", 0.05):
+        thread = await service.remind("Tómate las pastillas")
+        await asyncio.gather(*service.push_tasks)
+        push.assert_called_once_with("Tómate las pastillas", thread, message_id=thread)
+
+        # The user opens the app and asks something else; its reply is the newest row and is seen.
+        push.reset_mock()
+        await client.post("/api/messages", json={"id": "d" * 32, "text": "Hi"})
+        await settle(service)
+        reply = service.db.execute("SELECT created FROM messages WHERE id=?", ("reply:" + "d" * 32,)).fetchone()
+        assert (await client.post("/api/seen", json={"through": reply["created"]})).status == 200
+        await asyncio.gather(*service.push_tasks)
+        push.assert_not_called()
+
+        assert await service.remind("Tómate las pastillas", thread) == thread
+        await asyncio.gather(*service.push_tasks)
+        push.assert_called_once_with("Tómate las pastillas", thread, message_id=thread)
 
 
 CAPTURE_TOKEN = "shortcut-token-0123456789"

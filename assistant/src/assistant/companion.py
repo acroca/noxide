@@ -722,11 +722,16 @@ class Companion:
 
         The timeline shows one reminder however many times the phone is
         nudged; a reply to it continues that one thread. Returns the thread.
+        A repeat skips the seen gate: it is by definition a re-send of
+        something already displayed, and the gate compares against the newest
+        assistant row in the space, so once the app had been opened for
+        anything else every nag was dropped as "displayed" (2026-09-26).
+        Quiet hours still hold it.
         """
         if thread is None:
             return await self.deliver(text)
         if self.quiet_until() is None:
-            self.notify_push(text, thread=thread, message_id=thread)
+            self.notify_push(text, thread=thread, message_id=thread, grace=False)
         return thread
 
     def quiet_until(self):
