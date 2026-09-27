@@ -347,6 +347,30 @@ async def main():
             assert await night_page.evaluate(background) == dark
             await night.close()
 
+            # A hardware keyboard opts out of autocorrect, because Safari on
+            # macOS rewrites words as they are typed (2026-09-25); the phone's
+            # keyboard keeps correcting typos as in every other app (2026-09-27).
+            assert await area.get_attribute("autocorrect") == "off"
+            phone = await browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+            phone_page = await phone.new_page()
+            await phone_page.goto(url + "/#chat")
+            phone_area = phone_page.get_by_label(composer)
+            await expect(phone_area).to_be_visible()
+            assert await phone_page.evaluate("() => matchMedia('(pointer: coarse)').matches")
+            assert await phone_area.get_attribute("autocorrect") is None
+            # The same signal keeps Return for newlines on the phone, while a
+            # hardware keyboard's Return sends (an empty field sends nothing).
+            await phone_area.press("Enter")
+            assert await phone_area.input_value() == "\n"
+            await phone.close()
+            desk = await browser.new_context(viewport={"width": 1280, "height": 800})
+            desk_page = await desk.new_page()
+            await desk_page.goto(url + "/#chat")
+            desk_area = desk_page.get_by_label(composer)
+            await desk_area.press("Enter")
+            assert await desk_area.input_value() == ""
+            await desk.close()
+
             # Reset context draws a divider: after the last message when
             # nothing has followed yet, then between generations.
             assert await page.locator(".context-divider").count() == 0
@@ -596,7 +620,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, seen acknowledgements, notification click to chat, reset dividers, pasted images, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()

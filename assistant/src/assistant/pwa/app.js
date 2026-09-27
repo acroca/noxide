@@ -1,5 +1,8 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
+// Touch-first devices keep their keyboard's own behaviour: Return inserts a
+// newline, and typos are corrected as in every other app on the phone.
+const touchFirst = () => window.matchMedia('(pointer: coarse)').matches;
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 const paths = {
   chat: 'M20 11a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 1 1 17-4Z',
@@ -237,7 +240,7 @@ function renderChat(pageVersion) {
         <div id="composer-images" class="composer-images" hidden></div>
         <button id="attach-image" class="tool-button" type="button" aria-label="Attach image or file">${icon('image')}</button>
         <input id="image-input" type="file" accept="${ACCEPT}" multiple hidden>
-        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter" autocorrect="off" placeholder="Message ${escape(name)}…">${escape(draft())}</textarea>
+        <textarea aria-label="Message to ${escape(name)}" rows="1" maxlength="20000" enterkeyhint="enter"${touchFirst() ? '' : ' autocorrect="off"'} placeholder="Message ${escape(name)}…">${escape(draft())}</textarea>
         <button id="record-voice" class="tool-button" type="button" aria-label="Record voice message" hidden>${icon('mic')}</button>
         <button class="send-button" type="submit" aria-label="Send message">${icon('send')}</button>
       </form>
@@ -515,8 +518,7 @@ function renderChat(pageVersion) {
     try { localStorage.setItem(DRAFT_KEY, area.value); } catch { toast('This browser cannot save drafts. Keep this tab open.'); }
   });
   area.addEventListener('keydown', event => {
-    // Touch-first devices keep the keyboard's Return key for newlines.
-    if (window.matchMedia('(pointer: coarse)').matches) return;
+    if (touchFirst()) return;
     // IME confirmation can report Enter, including keyCode 229 in Safari.
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
     event.preventDefault();

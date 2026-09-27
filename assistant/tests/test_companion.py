@@ -493,7 +493,10 @@ async def test_served_worker_carries_the_shell_revision(companion):
 async def test_composer_keeps_spellcheck_but_not_autocorrect(companion):
     # Safari on macOS rewrites words in any editable field unless the field
     # opts out: "treminada" became "terminada" as it was typed (2026-09-25).
-    # Chat apps underline the misspelling and leave the word alone.
+    # Chat apps underline the misspelling and leave the word alone. The opt-out
+    # applies only without a touch-first pointer, since the phone's keyboard
+    # correction is wanted (2026-09-27); tests.browser_pwa_lifecycle checks
+    # that split in a real browser, which this text check cannot.
     service, client = companion
     app = await (await client.get("/app.js")).text()
     composer = re.search(r"<textarea[^>]*>", app).group(0)
