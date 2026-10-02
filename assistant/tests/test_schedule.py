@@ -994,7 +994,7 @@ async def test_routine_done_today_fires_nothing(vault: VaultTools) -> None:
     assert datetime.fromisoformat(s._read_entries()[0].next) > datetime(2026, 9, 23, tzinfo=UTC), "completed: next advanced"
 
 
-async def test_routine_reminds_then_repushes_the_same_thread_until_done(vault: VaultTools) -> None:
+async def test_routine_reminds_again_every_interval_until_done(vault: VaultTools) -> None:
     s, reminded, run_job, clock = _routine_scheduler(vault, "2026-09-22 08:10")
     s.schedule("30 8 * * *", PILL, True)
     job = s._read_entries()[0]
@@ -1011,7 +1011,7 @@ async def test_routine_reminds_then_repushes_the_same_thread_until_done(vault: V
     assert run_job.await_count == 0
 
 
-async def test_routine_stops_repushing_at_until(vault: VaultTools) -> None:
+async def test_routine_stops_reminding_at_until(vault: VaultTools) -> None:
     s, reminded, _, clock = _routine_scheduler(vault, "2026-09-22 08:10")
     s.schedule("30 8 * * *", PILL, True)
     job = s._read_entries()[0]
@@ -1044,6 +1044,34 @@ async def test_catch_up_resumes_a_routine_whose_window_is_in_progress(vault: Vau
     await asyncio.gather(*s._inflight)
     await asyncio.gather(*s._routine_tasks)
     assert reminded[0] == ("Tómate las pastillas", None)
+
+
+async def test_catch_up_resumes_a_routine_cut_short_by_a_restart(vault: VaultTools) -> None:
+    # The 08:30 run fired and advanced `next` to tomorrow, then a restart
+    # (a deploy) cancelled the repeat loop: with the pill still untaken the
+    # day's nagging used to end there (2026-10-02).
+    s, reminded, _, _ = _routine_scheduler(
+        vault, "2026-09-22", now=datetime(2026, 9, 23, 8, 50, tzinfo=ZoneInfo("Europe/Madrid")))
+    s.schedule("30 8 * * *", PILL, True)
+    entries = s._read_entries()
+    entries[0].next = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()  # today's run already fired
+    s._write_entries(entries)
+    assert s.catch_up() == 1
+    await asyncio.gather(*s._inflight)
+    await asyncio.gather(*s._routine_tasks)
+    # A reminder at the restart, then the loop's repeat at 09:20 before the 09:30 bound.
+    assert reminded == [("Tómate las pastillas", None), ("Tómate las pastillas", "thread-1")]
+
+
+async def test_catch_up_does_not_resend_a_single_push_routine_that_fired(vault: VaultTools) -> None:
+    # Without repeats there is no loop to resume; its one push already went out.
+    s, reminded, _, _ = _routine_scheduler(
+        vault, "2026-09-22", now=datetime(2026, 9, 23, 9, 10, tzinfo=ZoneInfo("Europe/Madrid")))
+    s.schedule("30 8 * * *", "[routine: Pastilla] Tómate las pastillas", True)
+    entries = s._read_entries()
+    entries[0].next = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
+    s._write_entries(entries)
+    assert s.catch_up() == 0 and reminded == []
 
 
 async def test_catch_up_leaves_a_routine_whose_window_has_passed(vault: VaultTools) -> None:

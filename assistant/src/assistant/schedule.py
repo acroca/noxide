@@ -507,14 +507,23 @@ class Scheduler:
             if not entry.recurring or entry.id in self._running:
                 continue
             nxt = self._parse_next(entry.next)
-            if nxt is None or nxt > now:
+            if nxt is None:
                 continue
             if is_routine_prompt(entry.prompt):
                 # A routine's late run is its own loop: worth starting only
-                # while its window (cron time … until) is still open today.
-                if self._routine_window_open(entry.when, entry.prompt):
+                # while its window (cron time … until) is still open today,
+                # whether the cron moment was missed (`next` past) or a
+                # restart cut a running loop short after it fired (`next`
+                # already tomorrow): drain() cancels the loops, and a deploy
+                # mid-morning used to end the day's nagging with the pill
+                # still untaken (2026-10-02). A single push has no loop to
+                # resume once it fired.
+                if (nxt <= now or self._routine_repeats(entry.prompt)) and \
+                        self._routine_window_open(entry.when, entry.prompt):
                     self._fire_now(entry.id, entry.prompt)
                     fired += 1
+                continue
+            if nxt > now:
                 continue
             self._fire_late(entry.id, entry.prompt, nxt)
             fired += 1
@@ -573,6 +582,13 @@ class Scheduler:
             return None
         now = self._local_now()
         return datetime.combine(now.date(), spec.until, tzinfo=now.tzinfo)
+
+    @staticmethod
+    def _routine_repeats(prompt: str) -> bool:
+        try:
+            return parse_routine_prompt(prompt).every is not None
+        except ValueError:
+            return False
 
     def _routine_window_open(self, cron: str, prompt: str) -> bool:
         try:
