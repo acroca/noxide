@@ -143,9 +143,10 @@ class ConversationArchive:
         Background for a new message that refers to an earlier exchange
         without replying to it ("done", "pastilla tomada"). Only completed
         rows of the current generation count, so a context reset clears it.
-        An unanswered delivery identical to a newer one is listed once: a
-        routine posts the same reminder every half hour until answered, and
-        the copies would fill the list.
+        An unanswered delivery is left out when a newer identical one is
+        listed, was answered, or is the thread being run: a routine posts
+        the same reminder every half hour until answered, and the copies
+        would fill the list or read as still pending.
         """
         threads, listed_deliveries = [], set()
         rows = self.db.execute(
@@ -153,16 +154,18 @@ class ConversationArchive:
             " AND generation=? AND created>? GROUP BY thread ORDER BY last DESC",
             (space, generation, since))
         for row in rows:
-            if row["thread"] == exclude:
-                continue
             root = self.db.execute("SELECT role, text, created FROM messages WHERE id=? AND status='done'", (row["thread"],)).fetchone()
             if root is None:
+                continue
+            if row["thread"] == exclude:
+                if root["role"] == "assistant":
+                    listed_deliveries.add(root["text"])  # the run already has this reminder
                 continue
             reply = self.db.execute(
                 "SELECT text, created FROM messages WHERE thread=? AND role='assistant' AND status='done'"
                 " AND id!=? ORDER BY created DESC LIMIT 1", (row["thread"], row["thread"])).fetchone()
-            if root["role"] == "assistant" and reply is None:
-                if root["text"] in listed_deliveries:
+            if root["role"] == "assistant":
+                if reply is None and root["text"] in listed_deliveries:
                     continue
                 listed_deliveries.add(root["text"])
             threads.append({"thread": row["thread"], "root_role": root["role"], "root_text": root["text"],

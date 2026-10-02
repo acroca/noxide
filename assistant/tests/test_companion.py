@@ -1004,7 +1004,7 @@ async def test_remind_repeats_reach_the_phone_after_the_app_was_opened(companion
     service, client = companion
     service.public_key = "configured"
     with patch.object(service, "_push", new_callable=AsyncMock) as push, \
-            patch("assistant.companion.PUSH_GRACE_SECONDS", 0.05):
+            patch("assistant.companion.PUSH_GRACE_SECONDS", 0.3):
         thread = await service.remind("Tómate las pastillas")
         await asyncio.gather(*service.push_tasks)
         push.assert_called_once_with("Tómate las pastillas", thread, message_id=thread)
@@ -1030,6 +1030,21 @@ async def test_remind_repeats_reach_the_phone_after_the_app_was_opened(companion
         await asyncio.gather(*service.push_tasks)
         push.assert_not_called()
         assert json.loads(service.archive.get(again)["metadata"])["push"] == {"displayed": True}
+
+
+async def test_remind_skips_a_repeat_while_a_conversation_is_mid_run(companion):
+    # A "Tomadas" still being processed updates wiki/routines.md only when its
+    # run ends; a check-in landing meanwhile would post a reminder right after
+    # the confirmation. The repeat waits for the next tick, which re-checks.
+    service, client = companion
+    first = await service.remind("Tómate las pastillas")
+    service.tasks["in-flight"] = asyncio.get_running_loop().create_future()
+    try:
+        assert await service.remind("Tómate las pastillas", first) == first
+    finally:
+        service.tasks.pop("in-flight").cancel()
+    assert service.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+    assert await service.remind("Tómate las pastillas", first) != first
 
 
 async def test_routine_check_ins_are_not_nudged(companion):

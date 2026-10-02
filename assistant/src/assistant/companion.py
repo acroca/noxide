@@ -728,10 +728,13 @@ class Companion:
         went unanswered and the repeats read as missing (2026-10-02).
         ``thread`` is the previous check-in's thread: a repeat inside quiet
         hours is skipped rather than held, so the window's end does not
-        release a burst. Returns the new thread, or the previous one when
-        skipped.
+        release a burst, and so is a repeat while a web run is in flight: a
+        "Tomadas" being processed updates wiki/routines.md only when its run
+        ends, and a check-in landing meanwhile would post a reminder right
+        after the confirmation. The next tick re-checks. Returns the new
+        thread, or the previous one when skipped.
         """
-        if thread is not None and self.quiet_until() is not None:
+        if thread is not None and (self.quiet_until() is not None or self.tasks):
             return thread
         return await self.deliver(text, routine=True)
 

@@ -171,7 +171,8 @@ or reminder only when something went wrong: no device registered, the push
 refused everywhere, or accepted for only some devices. A reminder that no
 focused device has displayed half an hour after its push is pushed once more,
 once; a reminder older than a day is left alone, so a device returning after
-a week is not buried.
+a week is not buried. Routine check-ins such as the daily pill are not nudged:
+they post a new message every interval until the routine is recorded as done.
 
 **Reminders are threads.** A scheduled run's message is archived as its own
 thread in the chat. Reply to it (or swipe it on a phone) and the assistant

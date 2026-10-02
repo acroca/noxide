@@ -219,8 +219,43 @@ def test_recent_threads_lists_identical_unanswered_deliveries_once(setup):
 
     assert [t["thread"] for t in recent()] == [newest, answered, other, user]
     assert [t["thread"] for t in recent(limit=3)] == [newest, answered, other]
-    # The excluded thread is the new message's own, never a delivery.
-    assert [t["thread"] for t in recent(exclude=user)] == [newest, answered, other]
+    # A reply to the newest check-in runs with the ambient block too: its own
+    # reminder is already in its thread, so older copies add nothing.
+    assert [t["thread"] for t in recent(exclude=newest)] == [answered, other, user]
+
+
+def test_recent_threads_hides_unanswered_copies_older_than_an_answered_one(setup):
+    archive, _, _ = setup
+
+    def insert(role, text, created, **kwargs):
+        message_id = archive.insert(SPACE, role, text, "done", **kwargs)
+        archive.db.execute("UPDATE messages SET created=? WHERE id=?", (created, message_id))
+        archive.db.commit()
+        return message_id
+
+    insert("assistant", "Tómate las pastillas", 20)
+    answered = insert("assistant", "Tómate las pastillas", 30)
+    insert("assistant", "Apuntado.", 31, reply_to=answered)
+    threads = archive.recent_threads(SPACE, generation=archive.generation(SPACE), since=5, limit=5)
+    assert [t["thread"] for t in threads] == [answered]
+
+
+def test_recent_threads_reaches_past_a_morning_of_copies(setup):
+    # Seven unanswered check-ins newer than everything else must not use up
+    # the query: the threads behind them are what a new message may refer to.
+    archive, _, _ = setup
+
+    def insert(role, text, created):
+        message_id = archive.insert(SPACE, role, text, "done")
+        archive.db.execute("UPDATE messages SET created=? WHERE id=?", (created, message_id))
+        archive.db.commit()
+        return message_id
+
+    older = insert("user", "older root", 10)
+    recent_user = insert("user", "recent root", 20)
+    copies = [insert("assistant", "Tómate las pastillas", 30 + i) for i in range(7)]
+    threads = archive.recent_threads(SPACE, generation=archive.generation(SPACE), since=5, limit=5)
+    assert [t["thread"] for t in threads] == [copies[-1], recent_user, older]
 
 
 def test_recent_threads_orders_by_last_activity_and_filters(setup):

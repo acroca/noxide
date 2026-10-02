@@ -961,7 +961,7 @@ def _routine_scheduler(vault: VaultTools, last: str, *, now: datetime | None = N
 
     async def remind(text: str, thread: str | None = None) -> str:
         reminded.append((text, thread))
-        return thread or "thread-1"
+        return f"thread-{len(reminded)}"  # every check-in is a new message, a new thread
 
     async def sleep(seconds: float) -> None:
         clock["now"] += timedelta(seconds=seconds)
@@ -1021,6 +1021,30 @@ async def test_routine_stops_reminding_at_until(vault: VaultTools) -> None:
     # ends at 09:00 rather than waiting out the bound.
     assert [t for t, _ in reminded] == ["Tómate las pastillas"] * 2
     assert clock["now"].strftime("%H:%M") == "09:00"
+
+
+@pytest.mark.parametrize("change", ["cancel", "edit"])
+async def test_routine_loop_stops_when_its_row_is_cancelled_or_edited(vault: VaultTools, change) -> None:
+    # Only drain() cancelled the loops: a row cancelled mid-window kept
+    # nagging, and one re-created the same morning ran a second loop beside
+    # it, two messages per interval.
+    s, reminded, _, clock = _routine_scheduler(vault, "2026-09-22 08:10")
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+
+    async def sleep(seconds: float) -> None:
+        clock["now"] += timedelta(seconds=seconds)
+        if change == "cancel":
+            s.cancel_scheduled(job.id)
+        else:
+            entries = s._read_entries()
+            entries[0].prompt = PILL.replace("every 30 min", "every 20 min")
+            s._write_entries(entries)
+    s._routine_sleep = sleep
+
+    await s._fire(job.id, job.prompt, recurring=True)
+    await asyncio.gather(*s._routine_tasks)
+    assert reminded == [("Tómate las pastillas", None)]
 
 
 async def test_routine_without_a_row_delivers_once_and_warns(vault: VaultTools, caplog) -> None:

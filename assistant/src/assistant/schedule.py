@@ -622,11 +622,21 @@ class Scheduler:
         thread = await self._remind(spec.text, None)
         if spec.every is None:
             return
-        task = asyncio.create_task(self._routine_loop(spec, thread))
+        task = asyncio.create_task(self._routine_loop(job_id, spec, thread))
         self._routine_tasks.add(task)
         task.add_done_callback(self._routine_tasks.discard)
 
-    async def _routine_loop(self, spec: RoutineSpec, thread: str | None) -> None:
+    def _routine_row_live(self, job_id: str, spec: RoutineSpec) -> bool:
+        """Whether the job's row still exists and still describes this routine."""
+        for entry in self._read_entries():
+            if entry.id == job_id:
+                try:
+                    return parse_routine_prompt(entry.prompt) == spec
+                except ValueError:
+                    return False
+        return False
+
+    async def _routine_loop(self, job_id: str, spec: RoutineSpec, thread: str | None) -> None:
         assert spec.every is not None and self._remind is not None
         deadline = self._routine_deadline(spec)
         while True:
@@ -634,6 +644,11 @@ class Scheduler:
             if deadline is not None and next_push >= deadline:
                 return
             await self._routine_sleep(spec.every.total_seconds())
+            # A row cancelled or edited mid-window ends this loop: a
+            # replacement runs on its own schedule, and two loops would post
+            # two messages per interval.
+            if not self._routine_row_live(job_id, spec):
+                return
             if self._routine_done_today(spec) is not False:
                 return
             logger.info("Routine %r still not done; pushing again", spec.name)
