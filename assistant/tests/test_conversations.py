@@ -193,6 +193,36 @@ def test_insert_joins_the_parent_thread_or_starts_one(setup):
         archive.insert(SPACE, "user", "other text", "queued", message_id=deeper)
 
 
+def test_recent_threads_lists_identical_unanswered_deliveries_once(setup):
+    # A routine posts the same reminder every half hour until it is answered;
+    # five copies of "Tómate las pastillas" would fill the ambient block,
+    # crowd out the threads a new message may refer to, and nudge a bare
+    # "hecho" towards the pill.
+    archive, _, _ = setup
+
+    def insert(role, text, created, **kwargs):
+        message_id = archive.insert(SPACE, role, text, "done", **kwargs)
+        archive.db.execute("UPDATE messages SET created=? WHERE id=?", (created, message_id))
+        archive.db.commit()
+        return message_id
+
+    user = insert("user", "c root", 10)
+    insert("assistant", "Tómate las pastillas", 20)
+    other = insert("assistant", "Llama a Marta", 25)
+    insert("assistant", "Tómate las pastillas", 30)
+    answered = insert("assistant", "Tómate las pastillas", 40)
+    insert("assistant", "Apuntado.", 41, reply_to=answered)
+    newest = insert("assistant", "Tómate las pastillas", 50)
+
+    def recent(**kwargs):
+        return archive.recent_threads(SPACE, **{"generation": archive.generation(SPACE), "since": 5, "limit": 5, **kwargs})
+
+    assert [t["thread"] for t in recent()] == [newest, answered, other, user]
+    assert [t["thread"] for t in recent(limit=3)] == [newest, answered, other]
+    # The excluded thread is the new message's own, never a delivery.
+    assert [t["thread"] for t in recent(exclude=user)] == [newest, answered, other]
+
+
 def test_recent_threads_orders_by_last_activity_and_filters(setup):
     archive, _, _ = setup
 

@@ -6,9 +6,9 @@ A ``system/schedule.md`` row whose prompt has the form
 
 is run by the scheduler itself, never by the model: at the cron time it reads
 ``wiki/routines.md``, and unless the named row's *Last done* is today it
-delivers the message, then re-pushes it every N minutes until HH:MM or until
-the row is updated (the user's reply goes through the normal agent, which
-does the ingest). ``every``/``until`` are optional together (a single push);
+delivers the message, then delivers it again as a new message every N minutes
+until HH:MM or until the row is updated (the user's reply goes through the
+normal agent, which does the ingest). ``every``/``until`` are optional together (a single push);
 ``cada``/``hasta`` are accepted for Spanish prompts. The daily medication
 reminder used to be an LLM job that re-scheduled a one-off re-aviso for each
 nag — up to nine Opus runs a morning, wording that drifted daily, and one

@@ -698,14 +698,15 @@ class Companion:
         self.hot.difference_update(row["id"] for row in self.db.execute("SELECT id FROM messages WHERE space=?", (SPACE,)))
         return web.json_response({"ok": True})
 
-    async def deliver(self, text):
+    async def deliver(self, text, *, routine=False):
         """A proactive message (a scheduled run's reminder): archive it as a thread root and notify.
 
         A reply to it continues its thread with the reminder in context; a
-        message typed on its own sees it through the ambient block. Returns
-        the thread id.
+        message typed on its own sees it through the ambient block. A
+        ``routine`` check-in is marked on its row so the unseen nudge leaves
+        it to the routine's own repeats. Returns the thread id.
         """
-        thread = self._insert(SPACE, "assistant", text, "done")
+        thread = self._insert(SPACE, "assistant", text, "done", metadata={"routine": True} if routine else None)
         held_until = self.quiet_until()
         if held_until is not None:
             # Quiet hours: archived now, pushed when the window ends (the
@@ -718,21 +719,21 @@ class Companion:
         return thread
 
     async def remind(self, text, thread=None):
-        """A routine check-in: the first call delivers, later calls push the same row again.
+        """A routine check-in (routines.py): every call posts the reminder as a new message.
 
-        The timeline shows one reminder however many times the phone is
-        nudged; a reply to it continues that one thread. Returns the thread.
-        A repeat skips the seen gate: it is by definition a re-send of
-        something already displayed, and the gate compares against the newest
-        assistant row in the space, so once the app had been opened for
-        anything else every nag was dropped as "displayed" (2026-09-26).
-        Quiet hours still hold it.
+        Each check-in that finds the routine undone is its own message at the
+        end of the chat, pushed like any delivery, as the LLM pill job's
+        re-avisos were. The one-row design (2026-09-23) re-pushed the first
+        message instead, so the chat showed a single reminder however long it
+        went unanswered and the repeats read as missing (2026-10-02).
+        ``thread`` is the previous check-in's thread: a repeat inside quiet
+        hours is skipped rather than held, so the window's end does not
+        release a burst. Returns the new thread, or the previous one when
+        skipped.
         """
-        if thread is None:
-            return await self.deliver(text)
-        if self.quiet_until() is None:
-            self.notify_push(text, thread=thread, message_id=thread, grace=False)
-        return thread
+        if thread is not None and self.quiet_until() is not None:
+            return thread
+        return await self.deliver(text, routine=True)
 
     def quiet_until(self):
         """The end of the current quiet-hours window, or None outside it (or when unset)."""
@@ -902,7 +903,10 @@ class Companion:
 
         Reminders only: threads the assistant started. Each is nudged once,
         marked on its row, and only within the last day, so a device that
-        has been away for a week is not buried on its return.
+        has been away for a week is not buried on its return. Routine
+        check-ins are left out: their own repeats nag, and stop once
+        wiki/routines.md records the routine, which this sweep cannot see
+        (a pill confirmed by Shortcut, app unopened, would be nagged again).
         """
         if not self.public_key or self.quiet_until() is not None:
             return
@@ -912,7 +916,10 @@ class Companion:
             " AND id=thread AND created<? AND created>? AND created>? ORDER BY created",
             (SPACE, now - NUDGE_AFTER_SECONDS, now - NUDGE_WINDOW_SECONDS, self.seen.get(SPACE, 0.0))).fetchall()
         for row in rows:
-            push = json.loads(row["metadata"] or "{}").get("push")
+            metadata = json.loads(row["metadata"] or "{}")
+            if metadata.get("routine"):
+                continue
+            push = metadata.get("push")
             if push is None or push.get("nudged") or push.get("displayed") or "at" not in push:
                 continue
             if now - push["at"] < NUDGE_AFTER_SECONDS:

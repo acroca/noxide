@@ -143,12 +143,15 @@ class ConversationArchive:
         Background for a new message that refers to an earlier exchange
         without replying to it ("done", "pastilla tomada"). Only completed
         rows of the current generation count, so a context reset clears it.
+        An unanswered delivery identical to a newer one is listed once: a
+        routine posts the same reminder every half hour until answered, and
+        the copies would fill the list.
         """
-        threads = []
+        threads, listed_deliveries = [], set()
         rows = self.db.execute(
             "SELECT thread, max(created) AS last FROM messages WHERE space=? AND status='done'"
-            " AND generation=? AND created>? GROUP BY thread ORDER BY last DESC LIMIT ?",
-            (space, generation, since, limit + 1)).fetchall()
+            " AND generation=? AND created>? GROUP BY thread ORDER BY last DESC",
+            (space, generation, since))
         for row in rows:
             if row["thread"] == exclude:
                 continue
@@ -158,6 +161,10 @@ class ConversationArchive:
             reply = self.db.execute(
                 "SELECT text, created FROM messages WHERE thread=? AND role='assistant' AND status='done'"
                 " AND id!=? ORDER BY created DESC LIMIT 1", (row["thread"], row["thread"])).fetchone()
+            if root["role"] == "assistant" and reply is None:
+                if root["text"] in listed_deliveries:
+                    continue
+                listed_deliveries.add(root["text"])
             threads.append({"thread": row["thread"], "root_role": root["role"], "root_text": root["text"],
                             "root_created": root["created"],
                             "reply_text": reply["text"] if reply else None})

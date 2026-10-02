@@ -187,9 +187,10 @@ class Scheduler:
     ) -> None:
         self._vault = vault_tools
         self._run_job = run_job_fn
-        # Routine check-ins ([routine: …] rows, routines.py) push through
+        # Routine check-ins ([routine: …] rows, routines.py) go through
         # this instead of running the model: remind(text, thread) delivers
-        # on the first call and re-pushes the same thread after.
+        # the reminder as a new message on every call, given the previous
+        # check-in's thread on a repeat.
         self._remind = remind_fn
         self._local_now: Callable[[], datetime] = lambda: datetime.now(ZoneInfo(tz_name))
         self._routine_sleep: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep

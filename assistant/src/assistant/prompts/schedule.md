@@ -4,7 +4,7 @@ Always use the `schedule` tool for anything time-based ("remind me in 10 min", "
 
 ### Routine check-ins
 
-A reminder whose only question is "was this routine done today?" — the daily medication, a fixed weekly chore — is a `[routine: …]` job, run by the runner itself without you: it reads `wiki/routines.md` at the cron time and, unless the named row's *Last done* is today, delivers the message and pushes it again every N minutes until HH:MM or until the row is updated. Create it with the `schedule` tool as a recurring job whose cron is a fixed minute and hour and whose prompt has exactly this form:
+A reminder whose only question is "was this routine done today?" — the daily medication, a fixed weekly chore — is a `[routine: …]` job, run by the runner itself without you: it reads `wiki/routines.md` at the cron time and, unless the named row's *Last done* is today, delivers the message, then delivers it again as a new message every N minutes until HH:MM or until the row is updated. Create it with the `schedule` tool as a recurring job whose cron is a fixed minute and hour and whose prompt has exactly this form:
 
 ```
 [routine: <routine name exactly as in wiki/routines.md>; every 30 min; until 12:00] Tómate las pastillas

@@ -980,24 +980,27 @@ async def test_no_nudge_inside_quiet_hours_and_nudges_count_from_the_push(compan
         assert send.call_count == 1
 
 
-async def test_remind_archives_once_and_repushes_the_same_thread(companion):
+async def test_remind_posts_every_check_in_as_its_own_message(companion):
+    # Each check-in that finds the routine undone is a new message at the end
+    # of the chat, as the LLM pill job's re-avisos were. The one-row design
+    # (2026-09-23) re-pushed the 08:30 message, so a forgotten pill showed a
+    # single reminder in the chat all morning (2026-10-02).
     service, client = companion
-    with patch.object(service, "notify_push") as notify:
-        thread = await service.remind("Tómate las pastillas")
-        assert await service.remind("Tómate las pastillas", thread) == thread
-    rows = service.db.execute("SELECT id, text FROM messages").fetchall()
-    assert [tuple(r) for r in rows] == [(thread, "Tómate las pastillas")]
-    assert notify.call_args_list == [
-        ((("Tómate las pastillas",), {"thread": thread, "message_id": thread})),
-        ((("Tómate las pastillas",), {"thread": thread, "message_id": thread, "grace": False})),
-    ]
+    first = await service.remind("Tómate las pastillas")
+    second = await service.remind("Tómate las pastillas", first)
+    assert second != first
+    rows = service.db.execute("SELECT id, thread, text, metadata FROM messages ORDER BY rowid").fetchall()
+    assert [(r["id"], r["thread"], r["text"]) for r in rows] == [
+        (first, first, "Tómate las pastillas"), (second, second, "Tómate las pastillas")]
+    assert all(json.loads(r["metadata"])["routine"] is True for r in rows)
 
 
 async def test_remind_repeats_reach_the_phone_after_the_app_was_opened(companion):
-    # A repeat is by definition a re-send of something already displayed: the
-    # seen gate that drops replies shown on a focused device must not drop it
-    # (2026-09-26: the 09:00 and 09:30 pill nags were recorded "displayed" and
-    # never pushed because the app had been opened at 08:38).
+    # 2026-09-26: the 09:00 and 09:30 pill nags were recorded "displayed" and
+    # never pushed, because the app had been opened at 08:38 and the seen gate
+    # compared against that newer reply. A check-in is now its own, newest
+    # row, so the ordinary gate is the right one: it pushes unless the chat
+    # is on screen through that very message.
     service, client = companion
     service.public_key = "configured"
     with patch.object(service, "_push", new_callable=AsyncMock) as push, \
@@ -1015,9 +1018,57 @@ async def test_remind_repeats_reach_the_phone_after_the_app_was_opened(companion
         await asyncio.gather(*service.push_tasks)
         push.assert_not_called()
 
-        assert await service.remind("Tómate las pastillas", thread) == thread
+        repeat = await service.remind("Tómate las pastillas", thread)
+        assert repeat != thread
         await asyncio.gather(*service.push_tasks)
-        push.assert_called_once_with("Tómate las pastillas", thread, message_id=thread)
+        push.assert_called_once_with("Tómate las pastillas", repeat, message_id=repeat)
+
+        # A check-in the chat already shows on a focused device is seen there, not pushed.
+        push.reset_mock()
+        assert (await client.post("/api/seen", json={"through": time.time() + 60})).status == 200
+        again = await service.remind("Tómate las pastillas", repeat)
+        await asyncio.gather(*service.push_tasks)
+        push.assert_not_called()
+        assert json.loads(service.archive.get(again)["metadata"])["push"] == {"displayed": True}
+
+
+async def test_routine_check_ins_are_not_nudged(companion):
+    # A routine nags on its own schedule and stops when wiki/routines.md says
+    # done. The generic nudge cannot see the table: it would push the last
+    # check-in again after a pill confirmed by Shortcut without opening the
+    # app, and on top of every repeat it would double the pushes.
+    from assistant.companion import NUDGE_AFTER_SECONDS
+
+    service, client = companion
+    service.public_key = "configured"
+    await client.post("/api/push", json={"endpoint": "https://fcm.googleapis.com/fcm/send/phone",
+                                       "keys": {"p256dh": "a" * 87, "auth": "b" * 22}})
+    with patch("pywebpush.webpush") as send, patch("assistant.companion.PUSH_GRACE_SECONDS", 0):
+        await service.remind("Tómate las pastillas")
+        await service.deliver("Take the bins out")
+        await asyncio.gather(*service.push_tasks)
+        assert send.call_count == 2
+        old = time.time() - NUDGE_AFTER_SECONDS - 1
+        service.db.execute("UPDATE messages SET created=?", (old,))
+        service.db.commit()
+        for row in service.db.execute("SELECT id, metadata FROM messages").fetchall():
+            push = json.loads(row["metadata"])["push"]
+            service.archive.merge_metadata(row["id"], {"push": {**push, "at": old}})
+        await service.nudge_unseen()
+        assert send.call_count == 3
+        assert json.loads(send.call_args.kwargs["data"])["body"] == "Take the bins out"
+
+
+async def test_remind_skips_a_repeat_inside_quiet_hours(companion):
+    # Held like a delivery, a night of repeats would all be released at once
+    # when the window ends; a routine's window is daytime anyway.
+    service, client = companion
+    service.cfg.timezone, service.cfg.pwa_quiet_hours = "Europe/Madrid", "23:00-07:30"
+    with patch("assistant.companion._local_now", return_value=_madrid(12, 0)):
+        first = await service.remind("Tómate las pastillas")
+    with patch("assistant.companion._local_now", return_value=_madrid(23, 30)):
+        assert await service.remind("Tómate las pastillas", first) == first
+    assert service.db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
 
 
 CAPTURE_TOKEN = "shortcut-token-0123456789"
