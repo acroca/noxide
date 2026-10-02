@@ -79,7 +79,7 @@ _GUARD_NOTE = (
     "[Your draft reply was: \u201c{draft}\u201d — but this turn made no change to the vault "
     "or the schedule and sent no message. If something should have been saved, updated, "
     "scheduled, closed or cancelled, do it now with the tools and then reply; if it was "
-    "already in place, reply again saying so plainly.]"
+    "already in place, reply again saying so plainly. Reply in the user's language.]"
 )
 _GUARD_DRAFT_CHARS = 300
 # At the iteration cap the model gets one tool-less turn to close: what it
