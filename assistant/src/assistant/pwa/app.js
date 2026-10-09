@@ -752,6 +752,19 @@ $('#clear-local-drafts').addEventListener('click', async () => {
 });
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; $('#install').hidden = false; });
 $('#install').addEventListener('click', async () => { if (installPrompt) { await installPrompt.prompt(); installPrompt = null; $('#install').hidden = true; } });
+// The iOS home-screen app has no browser chrome: a thumbnail's link loaded the
+// raw image into the app's own window with no way back to the chat
+// (2026-10-09). There the image opens in a viewer instead; a browser keeps
+// the new tab.
+document.addEventListener('click', event => {
+  const link = event.target.closest('.message-images a');
+  if (!link || !navigator.standalone) return;
+  event.preventDefault();
+  $('#image-viewer img').src = link.getAttribute('href');
+  $('#image-viewer').showModal();
+});
+$('#image-viewer').addEventListener('click', () => $('#image-viewer').close());
+$('#image-viewer').addEventListener('close', () => $('#image-viewer img').removeAttribute('src'));
 function updateBanner() {
   $('#update-banner').hidden = !waitingWorker && !workerChanged;
   $('#reload-update').disabled = pendingMutations > 0 || reloadRequested;

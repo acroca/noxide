@@ -468,6 +468,40 @@ async def main():
                                      "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png"]})})
             await expect(page.locator(".message-user .message-images img")).to_have_count(1)
             assert await page.locator(".message-user .message-images a").get_attribute("href") == "/api/attachment?path=attachments%2F2026-09-15-000001.png"
+            # A browser opens the image in a new tab. The iOS home-screen app
+            # has no browser chrome: the same link loaded the raw image into
+            # the app's own window with no way back to the chat (2026-10-09),
+            # so there it opens in a viewer the app can close. WebKit, since
+            # that is the engine the home-screen app runs.
+            async with page.expect_popup() as popup:
+                await page.locator(".message-user .message-images a").click()
+            await (await popup.value).close()
+            await expect(page.locator("#image-viewer")).to_be_hidden()
+            webkit = await p.webkit.launch()
+            for engine in (browser, webkit):
+                home = await engine.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
+                await home.add_init_script("Object.defineProperty(navigator, 'standalone', {value: true})")
+                home_page = await home.new_page()
+                await home_page.goto(url + "/#chat")
+                thumbnail = home_page.locator(".message-user .message-images a")
+                await thumbnail.click()
+                viewer = home_page.locator("#image-viewer")
+                await expect(viewer).to_be_visible()
+                assert home_page.url == url + "/#chat" and len(home.pages) == 1, (home_page.url, len(home.pages))
+                image = viewer.locator("img")
+                await expect(image).to_have_attribute("src", "/api/attachment?path=attachments%2F2026-09-15-000001.png")
+                await home_page.wait_for_function("() => document.querySelector('#image-viewer img').naturalWidth > 0")
+                box = await image.bounding_box()
+                assert box["x"] >= 0 and box["y"] >= 0 and box["x"] + box["width"] <= 390 and box["y"] + box["height"] <= 844, box
+                await home_page.get_by_role("button", name="Close image").click()
+                await expect(viewer).to_be_hidden()
+                await thumbnail.click()
+                await expect(viewer).to_be_visible()
+                await image.click()  # a tap anywhere dismisses it, as in a photo viewer
+                await expect(viewer).to_be_hidden()
+                await expect(home_page.get_by_label(composer)).to_be_visible()
+                await home.close()
+            await webkit.close()
             # An end-anchored thread stays at the end while the timeline grows
             # under it: a thumbnail has no reserved height, so it lands after
             # the render pinned the end and pushes the end away. Pinning by
@@ -620,7 +654,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image viewer in the iOS home-screen app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()
