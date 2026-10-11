@@ -272,13 +272,15 @@ function renderChat(pageVersion) {
     const last = latest.filter(m => m.thread === threadId).at(-1);
     if (last) { setReply(last); area.focus(); }
   }
-  // Swipe a box to the right to reply, as chat apps do. Touch only: a mouse
-  // drag is text selection. The box follows the finger up to SWIPE_MAX and
-  // commits past SWIPE_COMMIT; vertical movement hands over to scrolling.
+  // Swipe a box to the left to reply, as in Telegram. Touch only: a mouse
+  // drag is text selection. The box follows the finger to SWIPE_COMMIT, where
+  // it arms (letting go replies), then resists up to SWIPE_MAX; vertical
+  // movement hands over to scrolling. The list clips sideways overflow: the
+  // box used to push it wider than the screen mid-swipe (2026-10-11).
   function swipeToReply(section) {
     let start = null, dx = 0;
     const settle = () => {
-      section.classList.remove('swiping');
+      section.classList.remove('swiping', 'armed');
       section.style.transform = '';
       section.style.setProperty('--swipe', '0');
       start = null; dx = 0;
@@ -289,24 +291,28 @@ function renderChat(pageVersion) {
     });
     section.addEventListener('pointermove', event => {
       if (!start || event.pointerId !== start.id) return;
-      const moveX = event.clientX - start.x, moveY = event.clientY - start.y;
+      const pull = start.x - event.clientX, moveY = event.clientY - start.y;
       if (!section.classList.contains('swiping')) {
-        if (Math.abs(moveY) > Math.abs(moveX) || moveX < SWIPE_START) { if (Math.abs(moveY) > SWIPE_START) start = null; return; }
+        if (Math.abs(moveY) > Math.abs(pull) || pull < SWIPE_START) { if (Math.abs(moveY) > SWIPE_START) start = null; return; }
         section.classList.add('swiping');
         try { section.setPointerCapture(event.pointerId); } catch {}
       }
-      dx = Math.max(0, Math.min(SWIPE_MAX, moveX));
-      section.style.transform = `translateX(${dx}px)`;
+      const eased = pull <= SWIPE_COMMIT ? pull : SWIPE_COMMIT + (pull - SWIPE_COMMIT) / 3;
+      dx = Math.round(Math.max(0, Math.min(SWIPE_MAX, eased)));
+      section.style.transform = `translateX(${-dx}px)`;
       section.style.setProperty('--swipe', String(Math.min(1, dx / SWIPE_COMMIT)));
+      section.classList.toggle('armed', dx >= SWIPE_COMMIT);
     });
-    const end = event => {
+    section.addEventListener('pointerup', event => {
       if (!start || event.pointerId !== start.id) return;
       const commit = section.classList.contains('swiping') && dx >= SWIPE_COMMIT;
       settle();
       if (commit) toggleThread(section.dataset.thread);
-    };
-    section.addEventListener('pointerup', end);
-    section.addEventListener('pointercancel', end);
+    });
+    // The system took the gesture over (a scroll, an OS swipe): snap back, never act.
+    section.addEventListener('pointercancel', event => {
+      if (start && event.pointerId === start.id) settle();
+    });
   }
   function openThread(threadId) {
     const section = $(`[data-thread="${CSS.escape(threadId)}"]`);

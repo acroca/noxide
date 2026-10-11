@@ -584,21 +584,44 @@ async def main():
             await expect(page.locator("#reply-chip")).to_be_hidden()
             await page.locator('section.thread[data-thread="u4"] .message-body').click()
             await expect(page.locator("#reply-chip")).to_be_hidden()
-            # Swiping a box to the right with a finger replies too; a short or a
-            # vertical drag does not.
-            swipe = """([thread, dx, dy]) => { const s = document.querySelector(`section.thread[data-thread="${thread}"]`); const r = s.getBoundingClientRect();
+            # Swiping a box to the left with a finger replies too, as in Telegram;
+            # a short, a vertical or a rightward drag does not. The list never
+            # scrolls sideways, at rest or mid-swipe: a box pushed past its edge
+            # let it scroll sideways under the finger. ``end`` None holds the
+            # swipe until ``window.endSwipe()``.
+            swipe = """([thread, dx, dy, end = 'pointerup']) => { const s = document.querySelector(`section.thread[data-thread="${thread}"]`); const r = s.getBoundingClientRect();
                 const ev = (type, x, y) => s.dispatchEvent(new PointerEvent(type, {bubbles: true, pointerId: 7, pointerType: 'touch', isPrimary: true, clientX: x, clientY: y}));
-                ev('pointerdown', r.left + 20, r.top + 20); ev('pointermove', r.left + 20 + dx / 2, r.top + 20 + dy / 2); ev('pointermove', r.left + 20 + dx, r.top + 20 + dy);
-                const mid = s.style.transform; ev('pointerup', r.left + 20 + dx, r.top + 20 + dy); return mid; }"""
-            assert await page.evaluate(swipe, ["u4", 70, 0]) == "translateX(70px)"
+                const x0 = r.left + r.width / 2, y0 = r.top + 20;
+                ev('pointerdown', x0, y0); ev('pointermove', x0 + dx / 2, y0 + dy / 2); ev('pointermove', x0 + dx, y0 + dy);
+                const mid = s.style.transform; window.endSwipe = () => ev(end || 'pointerup', x0 + dx, y0 + dy); if (end) window.endSwipe(); return mid; }"""
+            list_box = await page.locator("#chat-thread").bounding_box()
+
+            async def scrolls_sideways():
+                """How far a sideways wheel over the list moves it, as a trackpad or a finger would."""
+                await page.mouse.move(list_box["x"] + list_box["width"] / 2, list_box["y"] + list_box["height"] / 2)
+                await page.mouse.wheel(200, 0)
+                await page.evaluate("() => new Promise(r => requestAnimationFrame(() => setTimeout(r)))")
+                return await page.evaluate("() => { const l = document.querySelector('#chat-thread'); const x = l.scrollLeft; l.scrollLeft = 0; return x; }")
+            assert await scrolls_sideways() == 0
+            assert await page.evaluate(swipe, ["u4", -30, 0, None]) == "translateX(-30px)"
+            assert await scrolls_sideways() == 0, "mid-swipe"
+            await page.evaluate("() => window.endSwipe()")
+            await expect(page.locator("#reply-chip")).to_be_hidden()
+            assert (await page.evaluate(swipe, ["u4", -70, 0])).startswith("translateX(-")
             await expect(page.locator("#reply-chip")).to_be_visible()
             await expect(page.locator("#reply-excerpt")).to_have_text("Replying to yourself: A note to myself, still unanswered")
             assert await page.evaluate("() => document.querySelector('section.thread[data-thread=\"u4\"]').style.transform") == ""
-            assert await page.evaluate(swipe, ["u4", 30, 0]) == "translateX(30px)"
+            assert await page.evaluate(swipe, ["u4", -30, 0]) == "translateX(-30px)"
             await expect(page.locator("#reply-chip")).to_be_visible()
-            assert await page.evaluate(swipe, ["u4", 30, 70]) == ""
+            assert await page.evaluate(swipe, ["u4", -30, 70]) == ""
+            assert await page.evaluate(swipe, ["u4", 70, 0]) == ""
             await expect(page.locator("#reply-chip")).to_be_visible()
-            assert await page.evaluate(swipe, ["u4", 70, 0]) == "translateX(70px)"
+            # A gesture the system takes over (pointercancel) snaps back without
+            # acting, however far it went.
+            assert (await page.evaluate(swipe, ["u4", -70, 0, "pointercancel"])).startswith("translateX(-")
+            await expect(page.locator("#reply-chip")).to_be_visible()
+            assert await page.evaluate("() => document.querySelector('section.thread[data-thread=\"u4\"]').style.transform") == ""
+            assert (await page.evaluate(swipe, ["u4", -70, 0])).startswith("translateX(-")
             await expect(page.locator("#reply-chip")).to_be_hidden()
             await page.locator('section.thread[data-thread="u4"] .thread-reply').click()
             await expect(page.locator("#reply-chip")).to_be_visible()
@@ -615,6 +638,26 @@ async def main():
             await page.locator('section.thread[data-thread="u5"] .thread-reply').click()
             await expect(page.locator("#reply-excerpt")).to_have_text("Replying to yourself: " + ("word " * 18).rstrip() + "…")
             await page.get_by_role("button", name="Cancel reply", exact=True).click()
+            # On a phone the Reply link and the chip's Cancel are finger-sized
+            # (an 11px link and a 26px cross were hard to hit), and Cancel sits
+            # at the far end of the chip from Send.
+            phone = await browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+            phone_page = await phone.new_page()
+            await phone_page.goto(url + "/#chat")
+            reply_link = phone_page.locator('section.thread[data-thread="u4"] .thread-reply')
+            link_box = await reply_link.bounding_box()
+            assert link_box["height"] >= 40 and link_box["width"] >= 44, link_box
+            await reply_link.tap()
+            cancel_button = phone_page.get_by_role("button", name="Cancel reply", exact=True)
+            cancel_box = await cancel_button.bounding_box()
+            excerpt_box = await phone_page.locator("#reply-excerpt").bounding_box()
+            send_box = await phone_page.get_by_role("button", name="Send message", exact=True).bounding_box()
+            assert cancel_box["width"] >= 40 and cancel_box["height"] >= 40, cancel_box
+            cancel_right = cancel_box["x"] + cancel_box["width"]
+            assert cancel_right <= excerpt_box["x"] + 1 and send_box["x"] - cancel_right > 150, (cancel_box, excerpt_box, send_box)
+            await cancel_button.tap()
+            await expect(phone_page.locator("#reply-chip")).to_be_hidden()
+            await phone.close()
             # Threads from different days are separated by a day line: Today,
             # Yesterday, then the date.
             state["replies"].append(message("old", "user", "From another day", 1600000000))
@@ -654,7 +697,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image viewer in the iOS home-screen app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, #chat/<thread> and OPEN_CHAT reply mode.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image viewer in the iOS home-screen app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, swipe left to reply without sideways scrolling, finger-sized reply targets on the phone, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()
