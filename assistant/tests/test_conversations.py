@@ -26,7 +26,7 @@ def setup(tmp_path):
 
 async def test_restores_five_exchanges_and_searches_older_text(setup):
     archive, vault, agent = setup
-    client = MagicMock(chat=AsyncMock(return_value=_make_text_response("Recorded")))
+    client = MagicMock(chat=AsyncMock(return_value=_make_text_response("OK")))
     root = archive.insert(SPACE, "user", "message-0", "queued")
     with patch("assistant.copilot.get_client", return_value=client):
         await agent.run("message-0", message_id=root)

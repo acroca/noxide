@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1139,6 +1140,71 @@ async def test_scheduled_delivery_is_ambient_background_for_the_next_root(
 
 def _load_system(sent: list[dict]) -> str:
     return str(sent[0]["content"])
+
+
+def _archiving_job_agent(vault: VaultTools, archive: ConversationArchive) -> Agent:
+    """A job agent whose sender archives deliveries as thread roots, like the app's ``deliver``."""
+
+    async def send(text: str) -> None:
+        archive.insert("general", "assistant", text, "done")
+
+    return Agent(vault_tools=vault, archive=archive, send_message_fn=send)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_run_sees_what_another_run_delivered(
+    vault: VaultTools, archive: ConversationArchive,
+) -> None:
+    """2026-10-04: the stock job's catch-up sent the stock reminder with
+    send_message and the compile's catch-up, seconds later, sent it again. A job
+    sent through the tool leaves only a null close in the shared jobs history,
+    so the next job saw nothing of it; the delivery reaches it as background,
+    live-only like a user run's ambient block."""
+    agent = _archiving_job_agent(vault, archive)
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_tool_call_response("send_message", {"text": "Revisa el stock de pastillas"}),
+        _make_text_response('{"silent": false, "message": null}'),
+        _make_text_response('{"silent": true, "message": null}'),
+        _make_text_response('{"silent": true, "message": null}'),
+    ])
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Recordar revisar el stock de pastillas")
+        await agent.run_job("Compilación nocturna")
+        await agent.run_job("Revisión semanal")
+
+    compile_turn = _live_turn(mock_client.chat.call_args_list[2].args[0])
+    assert "Assistant (sent from a scheduled run): Revisa el stock de pastillas" in compile_turn
+    lint_request = json.dumps(mock_client.chat.call_args_list[3].args[0], ensure_ascii=False)
+    assert lint_request.count("Revisa el stock de pastillas") == 1, "background is never stored in the jobs history"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_run_background_covers_only_the_last_minutes(
+    vault: VaultTools, archive: ConversationArchive,
+) -> None:
+    """The background tells a run not to repeat deliveries. Duplicates come from
+    runs firing together (a catch-up burst, two jobs at one time), so a job sees
+    only what went out just before it: a recurring job must not find its own
+    previous firing there (a stretch reminder every two hours, or yesterday's
+    copy of a daily one) and stand down."""
+    agent = Agent(vault_tools=vault, archive=archive)
+    earlier = archive.insert("general", "assistant", "Estira la espalda", "done")
+    just_sent = archive.insert("general", "assistant", "Revisa el stock de pastillas", "done")
+    now = time.time()
+    archive.db.execute("UPDATE messages SET created=? WHERE id=?", (now - 2 * 3600 + 30, earlier))
+    archive.db.execute("UPDATE messages SET created=? WHERE id=?", (now - 60, just_sent))
+    archive.db.commit()
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(return_value=_make_text_response('{"silent": true, "message": null}'))
+
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        await agent.run_job("Recuérdale que estire la espalda")
+
+    live = _live_turn(mock_client.chat.call_args.args[0])
+    assert "Revisa el stock de pastillas" in live
+    assert "Estira la espalda" not in live, "the job's own previous firing is not background"
 
 
 @pytest.mark.asyncio
@@ -2449,6 +2515,7 @@ async def test_guard_gives_a_claim_that_wrote_nothing_one_more_turn(
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=[
         _make_text_response("Anotado."),
+        _make_text_response('{"claims_change": true}'),
         _make_tool_call_response("create_file", {"path": "wiki/areas/casa.md", "content": "- cisterna"}),
         _make_text_response("Anotado en casa."),
     ])
@@ -2456,8 +2523,8 @@ async def test_guard_gives_a_claim_that_wrote_nothing_one_more_turn(
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await threaded.run("apunta arreglar la cisterna", message_id=root)
     assert reply == "Anotado en casa."
-    assert mock_client.chat.call_count == 3
-    second = mock_client.chat.call_args_list[1].args[0]
+    assert mock_client.chat.call_count == 4, "draft, classification, re-prompt, reply after the write"
+    second = mock_client.chat.call_args_list[2].args[0]
     assert second[-1]["role"] == "user" and "Anotado." in second[-1]["content"]
     assert [m["role"] for m in second] == ["system", "user", "user"], "the draft is withdrawn, not kept"
     assert (vault._root / "wiki/areas/casa.md").exists()
@@ -2471,14 +2538,90 @@ async def test_guard_flags_a_claim_that_still_writes_nothing(threaded: Agent, ar
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(side_effect=[
         _make_text_response("Hecho, tarea cerrada."),
+        _make_text_response('{"claims_change": true}'),
         _make_text_response("Ya estaba cerrada desde ayer."),
+        _make_text_response('{"claims_change": true}'),
     ])
     root = archive.insert("general", "user", "cisterna arreglada", "queued")
     with patch("assistant.copilot.get_client", return_value=mock_client):
         reply = await threaded.run("cisterna arreglada", message_id=root)
     assert reply == "Ya estaba cerrada desde ayer."
-    assert mock_client.chat.call_count == 2
+    assert mock_client.chat.call_count == 4
     assert _reply_meta(archive, root) == {"wrote": [], "guard": "unsaved"}
+
+
+@pytest.mark.asyncio
+async def test_guard_does_not_flag_a_second_reply_that_claims_nothing(
+    threaded: Agent, archive: ConversationArchive,
+) -> None:
+    """The re-prompted reply is classified too: one that only says nothing
+    needed saving is not shown as "Nothing was saved"."""
+    second = "No había nada que guardar: los temas ya estaban apuntados."
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response("Apuntado."),
+        _make_text_response('{"claims_change": true}'),
+        _make_text_response(second),
+        _make_text_response('{"claims_change": false}'),
+    ])
+    root = archive.insert("general", "user", "que mas apunte para el medico?", "queued")
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        assert await threaded.run("que mas apunte para el medico?", message_id=root) == second
+    assert _reply_meta(archive, root) == {"wrote": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", [
+    Exception("classification request rejected"),
+    _make_text_response("No estoy seguro."),
+], ids=["call fails", "unreadable verdict"])
+async def test_guard_treats_a_failed_classification_as_a_claim(
+    threaded: Agent, archive: ConversationArchive, verdict: object,
+) -> None:
+    """A miss costs a lost fact, so without a usable verdict the guard acts as
+    it did before the classification existed."""
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response("Anotado."),
+        verdict,
+        _make_text_response("Ya lo tenías apuntado."),
+        _make_text_response('{"claims_change": true}'),
+    ])
+    root = archive.insert("general", "user", "apunta la cisterna", "queued")
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await threaded.run("apunta la cisterna", message_id=root)
+    assert reply == "Ya lo tenías apuntado."
+    assert "Anotado." in mock_client.chat.call_args_list[2].args[0][-1]["content"], "the guard re-prompted"
+    assert _reply_meta(archive, root) == {"wrote": [], "guard": "unsaved"}
+
+
+@pytest.mark.asyncio
+async def test_guard_accepts_a_claim_word_the_judge_reads_as_no_claim(
+    threaded: Agent, archive: ConversationArchive,
+) -> None:
+    """2026-10-05: "¿Qué más apunté para el hepatólogo?" was answered with the
+    notes "ya estaban apuntados"; the stem matched, the guard re-prompted and the
+    reply went out flagged "Nothing was saved". A claim stem is now only a
+    prefilter: a one-shot classification call reads the reply against the
+    message, and a reply that claims nothing is accepted as drafted."""
+    draft = "Ya estaban apuntados: picores, granos y cansancio."
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(side_effect=[
+        _make_text_response(draft),
+        _make_text_response('{"claims_change": false}'),
+    ])
+    root = archive.insert("general", "user", "Que mas apunte para comentar con el hepatologo?", "queued")
+    with patch("assistant.copilot.get_client", return_value=mock_client):
+        reply = await threaded.run("Que mas apunte para comentar con el hepatologo?", message_id=root)
+
+    assert reply == draft
+    assert mock_client.chat.call_count == 2
+    judge = mock_client.chat.call_args_list[1]
+    judged = json.dumps(judge.args[0], ensure_ascii=False)
+    assert draft in judged and "Que mas apunte para comentar con el hepatologo?" in judged
+    assert not judge.args[1] and judge.kwargs.get("initiator") == "agent", "no tools, no premium request"
+    assert _reply_meta(archive, root) == {"wrote": []}
+    assert [r["content"] for r in archive.load_context("general") if r["role"] == "assistant"] == [draft]
 
 
 @pytest.mark.asyncio

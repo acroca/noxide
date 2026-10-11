@@ -82,6 +82,34 @@ _GUARD_NOTE = (
     "already in place, reply again saying so plainly. Reply in the user's language.]"
 )
 _GUARD_DRAFT_CHARS = 300
+# The stems are a prefilter, not the verdict: every guard flag of
+# 2026-09-10..10-10 was a reply that claimed nothing — notes "ya estaban
+# apuntados" listed in answer to a question, edits suggested ("Quita…",
+# "Añade…") and a proofread's "erratas corregidas". A matching reply that
+# wrote nothing is read against the user's message by a one-shot, tool-less
+# classification call, and only a claim gets the guard. A failed call or an
+# unreadable verdict counts as a claim (the guard as it was): a miss costs a
+# lost fact.
+_CLAIM_JUDGE_PROMPT = (
+    "You check one reply from a personal assistant that keeps the user's notes, tasks and "
+    "reminders. In the turn that produced it, the assistant changed nothing: no note written, "
+    "nothing scheduled or cancelled, no message sent. Decide whether the reply tells the user "
+    "that something they reported or asked for was saved, recorded, updated, scheduled, "
+    "cancelled, closed or removed, including saying it was already recorded. It does not when "
+    "it only answers a question (even about what is already noted), suggests or instructs, or "
+    'shows drafted or corrected text. Answer with JSON only: {"claims_change": true} or '
+    '{"claims_change": false}.'
+)
+_CLAIM_JUDGE_CHARS = 4000
+_CLAIM_JUDGE_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {"name": "claim_check", "strict": True, "schema": {
+        "type": "object",
+        "properties": {"claims_change": {"type": "boolean"}},
+        "required": ["claims_change"],
+        "additionalProperties": False,
+    }},
+}
 # At the iteration cap the model gets one tool-less turn to close: what it
 # completed, what remains, what the user must know. Live-only like the guard
 # note. Before this, a capped run answered with the bare sentinel and the
@@ -131,6 +159,8 @@ _SNAPSHOT_MAX_CHARS = 5000
 # Background for a thread's live turn: the newest threads of the past day.
 _AMBIENT_THREADS = 5
 _AMBIENT_WINDOW_SECONDS = 24 * 3600
+# A scheduled run's background: what went out just before it fired.
+_JOB_AMBIENT_WINDOW_SECONDS = 15 * 60
 _AMBIENT_CHARS = 600
 _AMBIENT_HEADER = (
     "[Recent conversations, background only — the message above may refer to one of them "
@@ -174,6 +204,27 @@ def _parse_job_close(reply: str) -> dict[str, Any] | None:
     Returns None when no conforming object is found; run_job then falls back
     to the legacy sentinel rules.
     """
+    for data in _json_objects(reply):
+        if not isinstance(data.get("silent"), bool):
+            continue
+        message = data.get("message")
+        if message is None or isinstance(message, str):
+            return {"silent": data["silent"], "message": message}
+    return None
+
+
+def _parse_claim_verdict(reply: str) -> bool | None:
+    """The guard classification's ``claims_change``, or None when unreadable."""
+    for data in _json_objects(reply):
+        if isinstance(data.get("claims_change"), bool):
+            return data["claims_change"]
+    return None
+
+
+def _json_objects(reply: str) -> list[dict[str, Any]]:
+    """JSON objects a model reply may hold: the whole text, fenced or not, or
+    the outermost braces inside prose — without API enforcement a structured
+    answer may arrive either way."""
     text = reply.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
@@ -181,17 +232,15 @@ def _parse_job_close(reply: str) -> dict[str, Any] | None:
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         candidates.append(text[start:end + 1])
+    objects = []
     for candidate in candidates:
         try:
             data = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if not isinstance(data, dict) or not isinstance(data.get("silent"), bool):
-            continue
-        message = data.get("message")
-        if message is None or isinstance(message, str):
-            return {"silent": data["silent"], "message": message}
-    return None
+        if isinstance(data, dict):
+            objects.append(data)
+    return objects
 
 # Tools that mutate the vault. Their dispatch holds the backup lock (a commit
 # must not snapshot a file mid-write) and their paths are attributed to the
@@ -373,7 +422,7 @@ class Agent:
     def _local_stamp(self) -> str:
         return datetime.now(tz=UTC).astimezone(self._tz).strftime("%Y-%m-%d %H:%M local")
 
-    def _ambient_context(self, thread: str) -> str | None:
+    def _ambient_context(self, thread: str | None) -> str | None:
         """The last few threads, as background for the live turn only.
 
         A thread's own context is just its messages, so a new root like
@@ -381,11 +430,19 @@ class Agent:
         threads of the past day — root plus latest reply, scheduled-run
         deliveries included — ride the live turn like a job's state snapshot:
         never stored, so replies do not re-pay them.
+
+        Scheduled runs (``thread`` None) get the last minutes only: one job's
+        ``send_message`` delivery leaves just a null close in the jobs history,
+        so a job firing beside it could not see it and sent the same reminder
+        again (stock check and compile catch-ups, 2026-10-04). Duplicates come
+        from runs firing together; a longer look-back would show a recurring
+        job its own previous firing under "do not repeat them".
         """
         assert self.archive is not None
+        window = _AMBIENT_WINDOW_SECONDS if thread is not None else _JOB_AMBIENT_WINDOW_SECONDS
         threads = self.archive.recent_threads(
             SPACE, generation=self.archive.generation(SPACE),
-            since=time.time() - _AMBIENT_WINDOW_SECONDS, limit=_AMBIENT_THREADS, exclude=thread,
+            since=time.time() - window, limit=_AMBIENT_THREADS, exclude=thread,
         )
         if not threads:
             return None
@@ -398,6 +455,30 @@ class Agent:
                 lines.append(f"Assistant: {_clip(item['reply_text'])}")
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks)
+
+    async def _claims_change(self, request: str, reply: str) -> bool:
+        """The empty-write guard's classification: does a reply that wrote
+        nothing tell the user something was saved or changed? Agent-initiated
+        (no premium request); any failure answers yes, the guard's old default."""
+        messages = [
+            {"role": "system", "content": _CLAIM_JUDGE_PROMPT},
+            {"role": "user", "content": (
+                f"User message:\n{request[:_CLAIM_JUDGE_CHARS]}\n\nReply:\n{reply[:_CLAIM_JUDGE_CHARS]}"
+            )},
+        ]
+        try:
+            response = await copilot.get_client().chat(
+                messages, None, initiator="agent", response_format=_CLAIM_JUDGE_RESPONSE_FORMAT,
+            )
+        except Exception:
+            logger.warning("Empty-write guard: classification failed, treating the reply as a claim", exc_info=True)
+            return True
+        usage.record("guard", response.get("model", ""), response.get("usage", {}))
+        verdict = _parse_claim_verdict(response["choices"][0]["message"].get("content") or "")
+        if verdict is None:
+            logger.warning("Empty-write guard: unreadable classification, treating the reply as a claim")
+            return True
+        return verdict
 
     def _job_state_snapshot(self, prompt: str) -> str | None:
         """Current content of the vault pages a job prompt names.
@@ -760,7 +841,7 @@ class Agent:
         guard_note: dict[str, Any] | None = None
         acted = False  # a message sent counts as an action the guard accepts
 
-        if thread is not None:
+        if self.archive is not None:
             ambient = self._ambient_context(thread)
             if ambient:
                 transient_context = f"{transient_context}\n\n{ambient}" if transient_context else ambient
@@ -861,7 +942,10 @@ class Agent:
                         json.dumps(msg, ensure_ascii=False)[:4000],
                     )
                 reply = msg.get("content") or ""
-                if not result.wrote and not acted and _CLAIM_RX.search(reply):
+                if (
+                    not result.wrote and not acted and _CLAIM_RX.search(reply)
+                    and await self._claims_change(user_message, reply)
+                ):
                     if guard_note is None:
                         logger.info("Empty-write guard: re-prompting a confirmation that wrote nothing")
                         history.pop_if_last(msg)

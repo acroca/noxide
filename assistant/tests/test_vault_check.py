@@ -698,6 +698,21 @@ def test_log_entry_kind_is_case_insensitive(tmp_path: Path) -> None:
     assert "2026-07-01" in report
 
 
+def test_log_entry_written_as_a_list_item_still_counts(tmp_path: Path) -> None:
+    """Four compiles in 2026-09 logged their entry as ``- ## [date] compile``;
+    reading only the well-formed ones made a running compile look two days
+    stale, and the 09-18 compile announced that it had not run."""
+    _clean_vault(tmp_path)
+    _log(
+        tmp_path,
+        "## [2026-07-30] compile | rebuilt",
+        "- ## [2026-08-02] compile | rebuilt",
+        "## [2026-07-27] lint | clean",
+    )
+
+    assert _check(tmp_path) == "[no findings]"
+
+
 def test_stale_compile_entry_is_reported(tmp_path: Path) -> None:
     _clean_vault(tmp_path)
     _log(tmp_path, "## [2026-07-31] compile | rebuilt", "## [2026-08-01] lint | clean")

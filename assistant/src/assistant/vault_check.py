@@ -227,8 +227,11 @@ def _mirror_findings(root: Path, wiki_files: list[tuple[str, list[str]]]) -> lis
 _OVERDUE_HEADING = "Overdue tasks (need the user's decision — escalate, never silently fix)"
 
 _LOG_PATH = "wiki/log.md"
+# The model writes these entries, and four compiles in 2026-09 wrote theirs
+# as a list item (``- ## [date] compile``); the log is append-only, so the
+# reader tolerates the marker rather than asking for a fix.
 _LOG_ENTRY_RX = re.compile(
-    r"^## \[(?P<date>\d{4}-\d{2}-\d{2})\] (?P<kind>compile|lint)\b", re.IGNORECASE
+    r"^(?:[-*+]\s+)?## \[(?P<date>\d{4}-\d{2}-\d{2})\] (?P<kind>compile|lint)\b", re.IGNORECASE
 )
 # The due marker's *shape* — one word, then the date: "(due 2026-08-05)",
 # "(para ~2026-08-24)", "(pour 2026-08-05)". Vaults localize the word freely,
