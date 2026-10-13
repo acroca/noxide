@@ -33,6 +33,7 @@ from .atomic import atomic_write_text
 from .config import Config
 from .conversations import SPACE, ConversationArchive
 from .copilot import CopilotUnavailableError
+from .extract import UnreadablePdf, pdf_page_sizes, render_pdf_page
 from .models import ModelPicker
 from .quiet_hours import parse_window, window_end
 from .retry_queue import BACKOFF_INITIAL, next_backoff
@@ -273,6 +274,8 @@ class Companion:
         self.app.router.add_post("/api/model", self.select_model)
         self.app.router.add_post("/api/attachments", self.upload)
         self.app.router.add_get("/api/attachment", self.attachment)
+        self.app.router.add_get("/api/attachment/pages", self.attachment_pages)
+        self.app.router.add_get("/api/attachment/page", self.attachment_page)
         self.app.router.add_post("/api/transcribe", self.transcribe)
         self.app.router.add_get("/api/push", self.push_state)
         self.app.router.add_post("/api/push", self.subscribe)
@@ -849,6 +852,42 @@ class Companion:
             raise web.HTTPNotFound(text="Attachment not found")
         return web.Response(body=await asyncio.to_thread(file.read_bytes), content_type=_mime_of(file.name),
                             headers={"Cache-Control": "private, max-age=86400"})
+
+    # The iOS home-screen app's document viewer. There an attachment link
+    # opened the raw file in the app's own window, with no way back, and iOS
+    # shows only the first page of a PDF embedded in a page; so the viewer
+    # lays the pages out from their sizes and loads each one as an image.
+    def _pdf_attachment(self, request):
+        path = request.query.get("path", "")
+        file = self._attachment_file(path)
+        if not path.endswith(".pdf"):
+            raise web.HTTPBadRequest(text="Not a PDF")
+        if not file.is_file():
+            raise web.HTTPNotFound(text="Attachment not found")
+        return file
+
+    async def attachment_pages(self, request):
+        file = self._pdf_attachment(request)
+        try:
+            sizes = await asyncio.to_thread(pdf_page_sizes, file)
+        except UnreadablePdf:
+            raise web.HTTPUnprocessableEntity(text="This PDF can't be shown") from None
+        return web.json_response({"pages": [{"width": width, "height": height} for width, height in sizes]},
+                                 headers={"Cache-Control": "private, max-age=86400"})
+
+    async def attachment_page(self, request):
+        file = self._pdf_attachment(request)
+        try:
+            index = int(request.query.get("page", "")) - 1
+        except ValueError:
+            raise web.HTTPBadRequest(text="Not a page number") from None
+        try:
+            jpeg = await asyncio.to_thread(render_pdf_page, file, index)
+        except IndexError:
+            raise web.HTTPNotFound(text="No such page") from None
+        except UnreadablePdf:
+            raise web.HTTPUnprocessableEntity(text="This PDF can't be shown") from None
+        return web.Response(body=jpeg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
     async def transcribe(self, request):
         """Turn a browser recording into text; the client sends the text as a normal message."""

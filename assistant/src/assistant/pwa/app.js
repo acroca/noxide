@@ -761,16 +761,54 @@ $('#install').addEventListener('click', async () => { if (installPrompt) { await
 // The iOS home-screen app has no browser chrome: a thumbnail's link loaded the
 // raw image into the app's own window with no way back to the chat
 // (2026-10-09). There the image opens in a viewer instead; a browser keeps
-// the new tab.
+// the new tab. A document's link trapped the app the same way.
 document.addEventListener('click', event => {
-  const link = event.target.closest('.message-images a');
-  if (!link || !navigator.standalone) return;
+  if (!navigator.standalone) return;
+  const image = event.target.closest('.message-images a'), file = event.target.closest('.message-file');
+  if (!image && !file) return;
   event.preventDefault();
-  $('#image-viewer img').src = link.getAttribute('href');
+  if (file) { openDocument(file); return; }
+  $('#image-viewer img').src = image.getAttribute('href');
   $('#image-viewer').showModal();
 });
 $('#image-viewer').addEventListener('click', () => $('#image-viewer').close());
 $('#image-viewer').addEventListener('close', () => $('#image-viewer img').removeAttribute('src'));
+// iOS shows only the first page of a PDF embedded in a page, so the document
+// viewer shows the pages the server draws, one image each, laid out from
+// their sizes so the lazy ones load as they scroll in (2026-10-13). A text
+// file is shown as text. Only the button closes it: a tap there is a scroll.
+const VIEWER_TEXT_CHARS = 200000;
+let documentOpens = 0;
+async function openDocument(link) {
+  const opened = ++documentOpens, path = new URL(link.href).searchParams.get('path');
+  const viewer = $('#document-viewer'), body = viewer.querySelector('.document-body');
+  $('#document-title').textContent = link.querySelector('span').textContent;
+  body.replaceChildren();
+  viewer.showModal();
+  let content;
+  try {
+    if (path.endsWith('.pdf')) {
+      const {pages} = await api('attachment/pages?path=' + encodeURIComponent(path));
+      content = pages.map((size, i) => Object.assign(document.createElement('img'), {
+        loading: 'lazy', width: Math.round(size.width), height: Math.round(size.height), alt: `Page ${i + 1} of ${pages.length}`,
+        src: `/api/attachment/page?path=${encodeURIComponent(path)}&page=${i + 1}`}));
+    } else {
+      const response = await fetch(link.href, {credentials: 'same-origin'});
+      if (!response.ok) throw new Error('This file could not be opened.');
+      const text = await response.text();
+      const pre = document.createElement('pre');
+      pre.textContent = text.length > VIEWER_TEXT_CHARS ? text.slice(0, VIEWER_TEXT_CHARS) + '\n\n[…]' : text;
+      content = [pre];
+    }
+  } catch (e) {
+    content = [Object.assign(document.createElement('p'), {textContent: e.message})];
+  }
+  if (opened === documentOpens && viewer.open) body.replaceChildren(...content);
+}
+$('#document-viewer').addEventListener('close', () => {
+  documentOpens++;
+  $('#document-viewer .document-body').replaceChildren();
+});
 function updateBanner() {
   $('#update-banner').hidden = !waitingWorker && !workerChanged;
   $('#reload-update').disabled = pendingMutations > 0 || reloadRequested;

@@ -13,7 +13,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from assistant.extract import AttachmentExtractor, _render_pdf_pages
+from assistant.extract import (
+    AttachmentExtractor,
+    UnreadablePdf,
+    _render_pdf_pages,
+    pdf_page_sizes,
+    render_pdf_page,
+)
 from assistant.tools import VaultTools
 
 
@@ -229,6 +235,72 @@ async def test_pdfium_serialized_even_when_await_is_cancelled(cancel_first: bool
         assert second is not None
         assert second.result() == []
         assert constructor.call_count == 2
+
+
+def _two_page_pdf() -> bytes:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument.new()
+    pdf.new_page(612, 792)
+    pdf.new_page(300, 200)
+    buf = io.BytesIO()
+    pdf.save(buf)
+    pdf.close()
+    return buf.getvalue()
+
+
+def test_pdf_preview_lists_page_sizes_and_renders_one_page(tmp_path: Path) -> None:
+    """The home-screen app's document viewer: iOS shows only a PDF's first
+    page when it is embedded, so the server draws each page as an image."""
+    from PIL import Image
+
+    path = tmp_path / "doc.pdf"
+    path.write_bytes(_two_page_pdf())
+
+    assert pdf_page_sizes(path) == [(612.0, 792.0), (300.0, 200.0)]
+    image = Image.open(io.BytesIO(render_pdf_page(path, 1)))
+    assert image.format == "JPEG" and image.size == (600, 400)
+    for missing in (2, -1):
+        with pytest.raises(IndexError):
+            render_pdf_page(path, missing)
+
+
+def test_pdf_preview_caps_an_oversized_page(tmp_path: Path) -> None:
+    """A poster-sized or malformed page must not become a gigabyte bitmap."""
+    import pypdfium2 as pdfium
+    from PIL import Image
+
+    pdf = pdfium.PdfDocument.new()
+    pdf.new_page(14400, 7200)
+    buf = io.BytesIO()
+    pdf.save(buf)
+    pdf.close()
+    path = tmp_path / "poster.pdf"
+    path.write_bytes(buf.getvalue())
+
+    assert Image.open(io.BytesIO(render_pdf_page(path, 0))).size == (2400, 1200)
+
+
+@pytest.mark.parametrize("preview", [pdf_page_sizes, lambda path: render_pdf_page(path, 0)])
+def test_pdf_preview_opens_pdfium_under_its_lock_and_names_a_broken_file(tmp_path: Path, preview) -> None:
+    path = tmp_path / "broken.pdf"
+    path.write_bytes(b"%PDF-1.4 garbage")
+    lock = threading.Lock()
+    opened_locked = []
+    import pypdfium2 as pdfium
+
+    real = pdfium.PdfDocument
+
+    def open_document(source):
+        opened_locked.append(lock.locked())
+        return real(source)
+
+    with patch("assistant.extract._PDFIUM_LOCK", lock), \
+         patch("pypdfium2.PdfDocument", side_effect=open_document):
+        with pytest.raises(UnreadablePdf):
+            preview(path)
+
+    assert opened_locked == [True] and not lock.locked()
 
 
 def test_pdfium_closes_native_objects_and_releases_lock_on_error() -> None:

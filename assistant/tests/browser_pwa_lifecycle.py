@@ -7,12 +7,25 @@ Requires Chromium installed through Playwright. No real vault or model calls.
 import asyncio
 import base64
 import hashlib
+import io
 import json
 from pathlib import Path
 
 from aiohttp import web
+from PIL import Image
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright, expect
+
+
+def page_png():
+    """The stub's stand-in for a rendered PDF page: page-shaped, like the real ones."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (306, 396), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+PAGE_PNG = page_png()
+PDF_PATH, NOTE_PATH = "attachments/2026-09-15-00000a.pdf", "attachments/2026-09-15-00000b.md"
 
 
 async def main():
@@ -48,6 +61,14 @@ async def main():
             if request.path == "/api/attachments":
                 uploads.append((request.content_type, await request.read()))
                 return web.json_response({"path": f"attachments/2026-09-15-{len(uploads):06x}.png"})
+            if request.path == "/api/attachment/pages":
+                return web.json_response({"pages": [{"width": 612, "height": 792}, {"width": 612, "height": 792}]})
+            if request.path == "/api/attachment/page":
+                return web.Response(body=PAGE_PNG, content_type="image/png")
+            if request.path == "/api/attachment" and request.query["path"].endswith(".md"):
+                return web.Response(text="# Notas\nHola", content_type="text/markdown")
+            if request.path == "/api/attachment" and request.query["path"].endswith(".pdf"):
+                return web.Response(body=b"%PDF-1.4\n", content_type="application/pdf")
             if request.path == "/api/attachment":
                 if state.get("thumbnail"):  # a late, tall thumbnail for the scroll-pin scenario
                     await asyncio.sleep(0.5)
@@ -465,7 +486,8 @@ async def main():
             assert all("space" not in s for s in submissions), submissions
             state["replies"].append({"id": "u9", "space": "general", "role": "user", "text": "What is this?", "status": "done",
                                      "created": 1700000100, "source": "web", "generation": 1,
-                                     "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png"]})})
+                                     "metadata": json.dumps({"attachments": ["attachments/2026-09-15-000001.png", PDF_PATH, NOTE_PATH],
+                                                             "names": {PDF_PATH: "Factura.pdf", NOTE_PATH: "notas.md"}})})
             await expect(page.locator(".message-user .message-images img")).to_have_count(1)
             assert await page.locator(".message-user .message-images a").get_attribute("href") == "/api/attachment?path=attachments%2F2026-09-15-000001.png"
             # A browser opens the image in a new tab. The iOS home-screen app
@@ -477,6 +499,10 @@ async def main():
                 await page.locator(".message-user .message-images a").click()
             await (await popup.value).close()
             await expect(page.locator("#image-viewer")).to_be_hidden()
+            async with page.expect_popup() as popup:
+                await page.locator(".message-file", has_text="Factura.pdf").click()
+            await (await popup.value).close()
+            await expect(page.locator("#document-viewer")).to_be_hidden()
             webkit = await p.webkit.launch()
             for engine in (browser, webkit):
                 home = await engine.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
@@ -500,6 +526,33 @@ async def main():
                 await image.click()  # a tap anywhere dismisses it, as in a photo viewer
                 await expect(viewer).to_be_hidden()
                 await expect(home_page.get_by_label(composer)).to_be_visible()
+                # Documents trapped the app the same way. iOS shows only the
+                # first page of a PDF embedded in a page, so the viewer shows
+                # the pages the server draws, one image each; a text file is
+                # shown as text. Only the button closes it: a tap is a scroll.
+                documents = home_page.locator("#document-viewer")
+                pages = documents.locator("img")
+                await home_page.locator(".message-file", has_text="Factura.pdf").click()
+                await expect(documents).to_be_visible()
+                assert home_page.url == url + "/#chat" and len(home.pages) == 1, (home_page.url, len(home.pages))
+                await expect(documents.get_by_role("heading")).to_have_text("Factura.pdf")
+                await expect(pages).to_have_count(2)
+                await expect(pages.first).to_have_attribute("src", "/api/attachment/page?path=attachments%2F2026-09-15-00000a.pdf&page=1")
+                await expect(pages.first).to_have_attribute("alt", "Page 1 of 2")
+                await home_page.wait_for_function("() => document.querySelector('#document-viewer img').naturalWidth > 0")
+                box = await pages.first.bounding_box()
+                assert box["x"] >= 0 and box["x"] + box["width"] <= 390 and 1.2 < box["height"] / box["width"] < 1.4, box
+                await pages.first.click()
+                await expect(documents).to_be_visible()
+                await home_page.get_by_role("button", name="Close document").click()
+                await expect(documents).to_be_hidden()
+                await home_page.locator(".message-file", has_text="notas.md").click()
+                await expect(documents.get_by_role("heading")).to_have_text("notas.md")
+                await expect(documents.locator("pre")).to_have_text("# Notas\nHola")
+                await expect(pages).to_have_count(0)
+                await home_page.keyboard.press("Escape")
+                await expect(documents).to_be_hidden()
+                assert home_page.url == url + "/#chat" and len(home.pages) == 1, (home_page.url, len(home.pages))
                 await home.close()
             await webkit.close()
             # An end-anchored thread stays at the end while the timeline grows
@@ -697,7 +750,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image viewer in the iOS home-screen app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, swipe left to reply without sideways scrolling, finger-sized reply targets on the phone, #chat/<thread> and OPEN_CHAT reply mode.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image and document viewers in the iOS home-screen app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, swipe left to reply without sideways scrolling, finger-sized reply targets on the phone, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()

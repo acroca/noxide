@@ -731,6 +731,50 @@ async def test_startup_message_names_an_app_update_once(companion):
 PDF = b"%PDF-1.4\n" + b"\0" * 64
 
 
+def _two_page_pdf():
+    import io
+
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument.new()
+    pdf.new_page(612, 792)
+    pdf.new_page(300, 200)
+    buf = io.BytesIO()
+    pdf.save(buf)
+    pdf.close()
+    return buf.getvalue()
+
+
+async def test_pdf_pages_are_served_as_images_for_the_home_screen_viewer(companion):
+    """iOS shows only the first page of an embedded PDF, and the raw file
+    opened in the home-screen app leaves no way back, so the app's viewer
+    asks for the page sizes and then each page as an image."""
+    service, client = companion
+
+    async def upload(data, mime):
+        response = await client.post("/api/attachments", data=data, headers={"Content-Type": mime})
+        return (await response.json())["path"]
+
+    pdf = await upload(_two_page_pdf(), "application/pdf")
+    pages = await client.get("/api/attachment/pages", params={"path": pdf})
+    assert pages.status == 200
+    assert await pages.json() == {"pages": [{"width": 612.0, "height": 792.0}, {"width": 300.0, "height": 200.0}]}
+    page = await client.get("/api/attachment/page", params={"path": pdf, "page": "2"})
+    assert page.status == 200 and page.content_type == "image/jpeg"
+    assert (await page.read())[:3] == b"\xff\xd8\xff"
+    for number, status in (("3", 404), ("0", 404), ("two", 400), ("", 400)):
+        assert (await client.get("/api/attachment/page", params={"path": pdf, "page": number})).status == status, number
+    # Only stored PDFs: a text attachment, a path outside attachments/, a missing file.
+    note = await upload(b"Hola\n", "text/markdown")
+    for path, status in ((note, 400), ("wiki/now.md", 400), ("attachments/2026-10-13-abcdef.pdf", 404)):
+        assert (await client.get("/api/attachment/pages", params={"path": path})).status == status, path
+        assert (await client.get("/api/attachment/page", params={"path": path, "page": "1"})).status == status, path
+    # A file that starts like a PDF but does not open says so.
+    broken = await upload(PDF, "application/pdf")
+    assert (await client.get("/api/attachment/pages", params={"path": broken})).status == 422
+    assert (await client.get("/api/attachment/page", params={"path": broken, "page": "1"})).status == 422
+
+
 async def test_document_upload_is_sniffed_stored_served_and_named_for_the_model(companion):
     service, client = companion
     response = await client.post("/api/attachments", data=PDF, headers={"Content-Type": "application/pdf"})

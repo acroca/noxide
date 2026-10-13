@@ -13,6 +13,7 @@ import base64
 import io
 import logging
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import copilot, usage
@@ -28,6 +29,9 @@ _MAX_TEXT_PAGES = 20
 _MAX_VISION_PAGES = 8
 _RENDER_SCALE = 2.0  # 72 dpi * 2 ≈ 144 dpi, plenty for text
 _JPEG_QUALITY = 80
+# The app's document viewer: a poster-sized or malformed page must not become a
+# gigabyte bitmap, so its longer side is capped.
+_VIEWER_MAX_SIDE = 2400
 # Below this count on an individual page, the text layer is considered absent
 # (scanned PDFs yield ~nothing; even sparse digital ones clear this easily)
 _MIN_TEXT_CHARS_PER_PAGE = 5
@@ -166,6 +170,22 @@ def _pdf_text_layer(data: bytes) -> tuple[int, list[str]]:
     return len(pages), chunks
 
 
+def _page_jpeg(pdf: Any, index: int, max_side: float | None = None) -> bytes:
+    page = pdf[index]
+    try:
+        scale = _RENDER_SCALE if max_side is None else min(_RENDER_SCALE, max_side / max(1.0, *page.get_size()))
+        bitmap = page.render(scale=scale)
+        try:
+            pil_image = bitmap.to_pil().convert("RGB")
+            buf = io.BytesIO()
+            pil_image.save(buf, format="JPEG", quality=_JPEG_QUALITY)
+            return buf.getvalue()
+        finally:
+            bitmap.close()
+    finally:
+        page.close()
+
+
 def _render_pdf_pages(data: bytes) -> list[bytes]:
     """Render the first _MAX_VISION_PAGES pages to JPEG bytes."""
     import pypdfium2 as pdfium
@@ -175,20 +195,46 @@ def _render_pdf_pages(data: bytes) -> list[bytes]:
     with _PDFIUM_LOCK:
         pdf = pdfium.PdfDocument(data)
         try:
-            images: list[bytes] = []
-            for i in range(min(len(pdf), _MAX_VISION_PAGES)):
-                page = pdf[i]
-                try:
-                    bitmap = page.render(scale=_RENDER_SCALE)
-                    try:
-                        pil_image = bitmap.to_pil().convert("RGB")
-                        buf = io.BytesIO()
-                        pil_image.save(buf, format="JPEG", quality=_JPEG_QUALITY)
-                        images.append(buf.getvalue())
-                    finally:
-                        bitmap.close()
-                finally:
-                    page.close()
-            return images
+            return [_page_jpeg(pdf, i) for i in range(min(len(pdf), _MAX_VISION_PAGES))]
+        finally:
+            pdf.close()
+
+
+class UnreadablePdf(Exception):
+    """A stored PDF that PDFium cannot open or draw."""
+
+
+def pdf_page_sizes(path: Path) -> list[tuple[float, float]]:
+    """Each page's (width, height) in points, for the app's document viewer."""
+    import pypdfium2 as pdfium
+
+    with _PDFIUM_LOCK:
+        try:
+            pdf = pdfium.PdfDocument(path)
+        except pdfium.PdfiumError as exc:
+            raise UnreadablePdf(str(exc)) from exc
+        try:
+            return [pdf.get_page_size(i) for i in range(len(pdf))]
+        finally:
+            pdf.close()
+
+
+def render_pdf_page(path: Path, index: int) -> bytes:
+    """One page as JPEG for the app's document viewer: iOS shows only the
+    first page of a PDF embedded in a page, so the viewer shows these.
+    IndexError past either end."""
+    import pypdfium2 as pdfium
+
+    with _PDFIUM_LOCK:
+        try:
+            pdf = pdfium.PdfDocument(path)
+        except pdfium.PdfiumError as exc:
+            raise UnreadablePdf(str(exc)) from exc
+        try:
+            if not 0 <= index < len(pdf):
+                raise IndexError(f"no page {index + 1} in a {len(pdf)}-page PDF")
+            return _page_jpeg(pdf, index, _VIEWER_MAX_SIDE)
+        except pdfium.PdfiumError as exc:
+            raise UnreadablePdf(str(exc)) from exc
         finally:
             pdf.close()
