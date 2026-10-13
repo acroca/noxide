@@ -43,7 +43,7 @@ from .routines import (
     fixed_time,
     is_routine_prompt,
     parse_routine_prompt,
-    routine_last_done,
+    routine_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -569,13 +569,25 @@ class Scheduler:
     # Routine check-ins (routines.py): no model, a table lookup and pushes
     # ------------------------------------------------------------------
 
-    def _routine_done_today(self, spec: RoutineSpec) -> bool | None:
-        """True/False from the routines table; None when the routine has no row."""
+    def _routine_status(self, spec: RoutineSpec) -> str | None:
+        """"done" (Last done is today), "not due" (Next due is after today) or
+        "due"; None when the routine has no row.
+
+        Next due is how a skipped occurrence reaches the runner: "Iré el jueves
+        solamente" moved the gym's to Thursday and the Tuesday check-in asked
+        anyway, reading Last done alone (2026-10-13). Only a readable future
+        date stands a check-in down; a blank, prose or past one keeps it.
+        """
         try:
-            last = routine_last_done(self._vault.read_file_full("wiki/routines.md"), spec.name)
+            last, next_due = routine_dates(self._vault.read_file_full("wiki/routines.md"), spec.name)
         except LookupError:
             return None
-        return last == self._local_now().date()
+        today = self._local_now().date()
+        if last == today:
+            return "done"
+        if next_due is not None and next_due > today:
+            return "not due"
+        return "due"
 
     def _routine_deadline(self, spec: RoutineSpec) -> datetime | None:
         if spec.until is None:
@@ -608,16 +620,16 @@ class Scheduler:
         if self._remind is None:
             logger.warning("Routine check-in %s has no remind function wired; skipped", job_id)
             return
-        done = self._routine_done_today(spec)
-        if done is None:
+        status = self._routine_status(spec)
+        if status is None:
             logger.warning(
                 "Routine check-in %s names %r, which is not a row of wiki/routines.md; "
                 "delivering its text once without checking", job_id, spec.name,
             )
             await self._remind(spec.text, None)
             return
-        if done:
-            logger.info("Routine %r already done today; nothing to send", spec.name)
+        if status != "due":
+            logger.info("Routine %r is %s today; nothing to send", spec.name, status)
             return
         thread = await self._remind(spec.text, None)
         if spec.every is None:
@@ -649,7 +661,7 @@ class Scheduler:
             # two messages per interval.
             if not self._routine_row_live(job_id, spec):
                 return
-            if self._routine_done_today(spec) is not False:
+            if self._routine_status(spec) != "due":
                 return
             logger.info("Routine %r still not done; pushing again", spec.name)
             thread = await self._remind(spec.text, thread) or thread

@@ -88,10 +88,20 @@ def _normalize(name: str) -> str:
     return " ".join(name.split()).casefold()
 
 
-def routine_last_done(routines_text: str, name: str) -> date | None:
-    """The *Last done* date of the routines-table row named *name*.
+def _cell_date(cell: str) -> date | None:
+    m = _CELL_DATE_RX.match(cell)
+    if not m:
+        return None
+    try:
+        return date(*(int(g) for g in m.groups()))
+    except ValueError:
+        return None
 
-    None when the row exists but has no parseable date; LookupError when no
+
+def routine_dates(routines_text: str, name: str) -> tuple[date | None, date | None]:
+    """The *Last done* and *Next due* dates of the routines-table row named *name*.
+
+    Each is None when its cell holds no parseable date; LookupError when no
     row matches (or the file is missing), so a typo in a job is not mistaken
     for a routine never done.
     """
@@ -102,11 +112,10 @@ def routine_last_done(routines_text: str, name: str) -> date | None:
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 3 or _normalize(cells[0]) != wanted:
             continue
-        m = _CELL_DATE_RX.match(cells[2])
-        if not m:
-            return None
-        try:
-            return date(*(int(g) for g in m.groups()))
-        except ValueError:
-            return None
+        return _cell_date(cells[2]), _cell_date(cells[3]) if len(cells) > 3 else None
     raise LookupError(f"no routine named {name!r} in wiki/routines.md")
+
+
+def routine_last_done(routines_text: str, name: str) -> date | None:
+    """The *Last done* date of the row named *name* (see ``routine_dates``)."""
+    return routine_dates(routines_text, name)[0]

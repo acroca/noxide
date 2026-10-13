@@ -947,14 +947,16 @@ def test_schedule_accepts_digits_in_other_cron_fields(tmp_path: Path) -> None:
 
 ROUTINES = """| Rutina | Frecuencia | Última vez | Próxima | Notas |
 | --- | --- | --- | --- | --- |
-| Pastilla | Diaria | {last} | 2026-09-24 | |
+| Pastilla | Diaria | {last} | {next} | |
 """
 PILL = "[routine: Pastilla; every 30 min; until 09:30] Tómate las pastillas"
 
 
-def _routine_scheduler(vault: VaultTools, last: str, *, now: datetime | None = None):
-    """A scheduler with a fake clock that sleep() advances and a remind double that returns a thread."""
-    vault.write_file("wiki/routines.md", ROUTINES.format(last=last))
+def _routine_scheduler(vault: VaultTools, last: str, *, next_due: str = "2026-09-23", now: datetime | None = None):
+    """A scheduler with a fake clock that sleep() advances and a remind double that returns a thread.
+
+    The routine is due on the clock's day (2026-09-23) unless ``next_due`` says otherwise."""
+    vault.write_file("wiki/routines.md", ROUTINES.format(last=last, next=next_due))
     reminded: list[tuple[str, str | None]] = []
     clock = {"now": now or datetime(2026, 9, 23, 8, 30, tzinfo=ZoneInfo("Europe/Madrid"))}
     run_job = AsyncMock()
@@ -994,6 +996,46 @@ async def test_routine_done_today_fires_nothing(vault: VaultTools) -> None:
     assert datetime.fromisoformat(s._read_entries()[0].next) > datetime(2026, 9, 23, tzinfo=UTC), "completed: next advanced"
 
 
+@pytest.mark.parametrize("next_due", ["2026-09-24", "2026-09-25 09:00"])
+async def test_routine_not_due_today_fires_nothing(vault: VaultTools, next_due: str) -> None:
+    """2026-10-13: "Iré el jueves solamente" moved the gym's Next due to
+    Thursday, and the Tuesday check-in asked "¿Has ido?" anyway — it read only
+    Last done. A routine whose Next due is after today is not asked about."""
+    s, reminded, run_job, _ = _routine_scheduler(vault, "2026-09-21", next_due=next_due)
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+    await s._fire(job.id, job.prompt, recurring=True)
+    assert reminded == [] and not s._routine_tasks and run_job.await_count == 0
+    assert datetime.fromisoformat(s._read_entries()[0].next) > datetime(2026, 9, 23, tzinfo=UTC), "completed: next advanced"
+
+
+@pytest.mark.parametrize("next_due", ["", "pronto", "2026-09-22"])
+async def test_routine_due_or_without_a_readable_next_due_reminds(vault: VaultTools, next_due: str) -> None:
+    """Only a readable future date stands a check-in down: blank, prose and
+    overdue Next due cells keep reminding, as before Next due was read."""
+    s, reminded, _, _ = _routine_scheduler(vault, "2026-09-21", next_due=next_due)
+    s.schedule("30 8 * * *", "[routine: Pastilla] Tómate las pastillas", True)
+    job = s._read_entries()[0]
+    await s._fire(job.id, job.prompt, recurring=True)
+    assert reminded == [("Tómate las pastillas", None)]
+
+
+async def test_routine_reminders_stop_when_the_occurrence_is_skipped(vault: VaultTools) -> None:
+    """"Hoy no voy" mid-window moves Next due to a later day; the repeats stop."""
+    s, reminded, _, clock = _routine_scheduler(vault, "2026-09-22 08:10")
+    s.schedule("30 8 * * *", PILL, True)
+    job = s._read_entries()[0]
+
+    async def sleep(seconds: float) -> None:
+        clock["now"] += timedelta(seconds=seconds)
+        vault.write_file("wiki/routines.md", ROUTINES.format(last="2026-09-22 08:10", next="2026-09-24"))
+    s._routine_sleep = sleep
+
+    await s._fire(job.id, job.prompt, recurring=True)
+    await asyncio.gather(*s._routine_tasks)
+    assert reminded == [("Tómate las pastillas", None)]
+
+
 async def test_routine_reminds_again_every_interval_until_done(vault: VaultTools) -> None:
     s, reminded, run_job, clock = _routine_scheduler(vault, "2026-09-22 08:10")
     s.schedule("30 8 * * *", PILL, True)
@@ -1002,7 +1044,7 @@ async def test_routine_reminds_again_every_interval_until_done(vault: VaultTools
     async def sleep(seconds: float) -> None:
         clock["now"] += timedelta(seconds=seconds)
         if len(reminded) == 2:  # the user registers the pill after the second push
-            vault.write_file("wiki/routines.md", ROUTINES.format(last="2026-09-23 09:05"))
+            vault.write_file("wiki/routines.md", ROUTINES.format(last="2026-09-23 09:05", next="2026-09-24"))
     s._routine_sleep = sleep
 
     await s._fire(job.id, job.prompt, recurring=True)

@@ -9,6 +9,7 @@ from assistant.routines import (
     fixed_time,
     is_routine_prompt,
     parse_routine_prompt,
+    routine_dates,
     routine_last_done,
 )
 
@@ -64,6 +65,15 @@ def test_last_done_distinguishes_blank_from_missing() -> None:
         routine_last_done(TABLE, "Piano")
     with pytest.raises(LookupError):
         routine_last_done("[file not found: wiki/routines.md]", "Gym")
+
+
+def test_routine_dates_read_last_done_and_next_due() -> None:
+    assert routine_dates(TABLE, "gym") == (date(2026, 9, 22), date(2026, 9, 24))
+    assert routine_dates(TABLE, "Hormigas — semillas") == (None, date(2026, 9, 25))
+    assert routine_dates("| Gym | 2x | 2026-09-22 | el jueves | |", "Gym") == (date(2026, 9, 22), None)
+    assert routine_dates("| Gym | 2x | 2026-09-22 |", "Gym") == (date(2026, 9, 22), None)
+    with pytest.raises(LookupError):
+        routine_dates(TABLE, "Piano")
 
 
 def test_fixed_time_reads_a_cron_with_numeric_minute_and_hour() -> None:

@@ -76,6 +76,7 @@ Where a weekday genuinely is required (the `now.md` header, and its **Upcoming**
 One table of recurring activities: `| Routine | Frequency | Last done | Next due | Notes |`
 
 - When the user confirms doing a routine, run a **full ingest** (see Ingest): journal the event, update **Last done**, recompute **Next due** right away (last done + frequency), and patch the routine's now-stale lines in `now.md`. Editing `routines.md` alone leaves the dashboard showing the routine as still pending.
+- When the user says they will skip an occurrence ("this week only Thursday", "not going today"), set **Next due** to the next one they plan, note the skip in **Notes**, and leave **Last done** alone — nothing was done. Routine check-ins read **Next due**: a routine whose Next due is a later day is not asked about.
 - The nightly compile re-verifies **Next due** for every routine.
 - "How long since I last…?" is answered from this file. Full history lives in the journal.
 
@@ -137,7 +138,7 @@ Archived pages stay readable and searchable but are never listed as live work. R
 ### Compile (nightly built-in job)
 
 1. Read today's and yesterday's journal; verify the wiki reflects every event (apply anything ingest missed).
-2. Recompute **Next due** for every routine.
+2. Recompute **Next due** for every routine, except one moved for a skipped occurrence that **Notes** record — keep that date until it passes.
 3. Rebuild `wiki/now.md` in full — its **Tasks** section by sweeping every wiki page's `## Tasks`, its **Someday** section from the `(someday)` tasks among them, and its **Upcoming** section by sweeping every live page's dated event bullets for the next 14 days, so a task or event ingest failed to mirror still reaches the dashboard within a day.
 4. Reconcile `wiki/index.md` against the pages on disk — pages under `wiki/archive/` belong in its `## Archived` section, everything else in the live list.
 5. Run `check_vault` and fix every finding, except those under **Overdue tasks** and **Maintenance**, which are for step 6. Apply all the fixes in one turn — the edits are independent, so issue them as parallel `edit_file` calls — and run the check once more to confirm. Never fix one finding and re-check: each fix-then-check round costs two of the run's twenty turns, and a heavy day's rebuild once produced eight findings and ran out of turns before step 6 (2026-09-22). It re-verifies the rebuild mechanically — the task and event mirrors by enumeration, weekday labels against the calendar, dead links, empty sections, placeholder Status paragraphs — so a page the sweep in step 3 missed surfaces tonight instead of at the next lint. A clean report is the expected outcome, not a wasted call.
