@@ -29,11 +29,13 @@ let session, poll, installPrompt, toastTimer, version = 0;
 let pendingThread = null;
 const REPLY_EXCERPT = 90;
 const SWIPE_START = 8, SWIPE_COMMIT = 56, SWIPE_MAX = 80;
+// A refresh this quick needs no word; a slower one says Updating….
+const UPDATING_DELAY_MS = 400;
 let agentName = $('meta[name="agent-name"]').content;
 let serverUnavailable = false, booting = false, pendingMutations = 0;
 let waitingWorker = null, reloadRequested = false, workerChanged = false;
 let hadController = Boolean(navigator.serviceWorker?.controller);
-let ackVisible = () => {};
+let ackVisible = () => {}, refreshVisible = () => {};
 // Presence: acknowledging a reply as seen silences the push on every device,
 // so it needs a person, not just a focused window — a desktop left open on the
 // chat overnight swallowed a reminder's notification (2026-09-19). Recent
@@ -234,6 +236,7 @@ function renderChat(pageVersion) {
   $('#main').className = 'chat-main';
   $('#main').innerHTML = `
     <section class="chat-panel" aria-label="Chat">
+      <p id="chat-updating" class="chat-updating" role="status" hidden>Updating…</p>
       <div id="chat-thread" class="chat-thread" role="log" aria-label="Messages"><div class="loading">Loading messages…</div></div>
       <form id="chat-form" class="chat-composer">
         <div id="reply-chip" class="reply-chip" hidden><span id="reply-excerpt"></span><button id="cancel-reply" type="button" aria-label="Cancel reply">×</button></div>
@@ -358,6 +361,22 @@ function renderChat(pageVersion) {
     api('seen', { through: newest }, undefined, true).catch(() => { if (acked === newest) acked = previous; });
   }
   ackVisible = markSeen;
+  // Coming back to the app, the timeline on screen may be hours old: fetch at
+  // once instead of at the next poll, and say so if that takes a while (a
+  // phone's VPN can take seconds to wake). Only a request asked after the
+  // return can end it; one already in flight says nothing about now.
+  let returnedAt = 0, updatingTimer;
+  function settleUpdating(asked) {
+    if (!returnedAt || asked < returnedAt) return;
+    returnedAt = 0; clearTimeout(updatingTimer);
+    if (active()) $('#chat-updating').hidden = true;
+  }
+  refreshVisible = () => {
+    if (!active() || !navigator.onLine) return;
+    returnedAt = performance.now(); clearTimeout(updatingTimer);
+    updatingTimer = setTimeout(() => { if (returnedAt && active()) $('#chat-updating').hidden = false; }, UPDATING_DELAY_MS);
+    loadMessages().catch(() => {});
+  };
   // Closing the keyboard restores the bottom nav's home-indicator inset, which
   // shrinks the thread; a shrinking scroller keeps its offset and hides the
   // end. Stay anchored to the end across resizes unless the reader scrolled up.
@@ -465,7 +484,8 @@ function renderChat(pageVersion) {
   $('#record-voice').addEventListener('click', () => { if (recorder) stopRecording(); else startRecording().catch(e => toast(e.message)); });
   $('#discard-recording').addEventListener('click', () => stopRecording(true));
   async function loadMessages(loadOlder = false) {
-    const data = await api('messages' + (loadOlder ? `?before=${cursor}` : ''));
+    const asked = performance.now();
+    const data = await api('messages' + (loadOlder ? `?before=${cursor}` : '')).finally(() => settleUpdating(asked));
     if (!active()) return;
     if (loadOlder) { older = [...data.threads, ...older]; cursor = data.before; await loadMessages(); return; }
     if (!older.length) cursor = data.before;
@@ -662,7 +682,7 @@ if (window.visualViewport) {
   }
 }
 window.addEventListener('focus', () => ackVisible());
-document.addEventListener('visibilitychange', () => ackVisible());
+document.addEventListener('visibilitychange', () => { ackVisible(); if (!document.hidden) refreshVisible(); });
 function connectivity() {
   const offline = !navigator.onLine || serverUnavailable;
   $('#offline-banner').hidden = !offline;

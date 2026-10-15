@@ -32,7 +32,8 @@ async def main():
     assets = Path(__file__).parents[1] / "src/assistant/pwa"
     agent_name = 'Juniper'
     instance_version = hashlib.sha256(agent_name.encode()).hexdigest()[:12]
-    state = {"revision": 1, "available": True, "authorized": True, "replies": [], "generation": 0, "voice": False, "unread": 0, "before": None}
+    state = {"revision": 1, "available": True, "authorized": True, "replies": [], "generation": 0, "voice": False, "unread": 0, "before": None,
+             "session_delay": 0, "messages_delay": 0}
     seen, uploads, submissions = [], [], []
     release = asyncio.Event()
     release.set()
@@ -57,6 +58,7 @@ async def main():
             if not state["authorized"]:
                 return web.json_response({"error": "Sign in to continue"}, status=401)
             if request.path == "/api/session":
+                await asyncio.sleep(state["session_delay"])
                 return web.json_response({"timezone": "UTC", "push_key": "", "agent_name": agent_name, "voice": state["voice"]})
             if request.path == "/api/attachments":
                 uploads.append((request.content_type, await request.read()))
@@ -89,6 +91,7 @@ async def main():
                     {"alias": "sonnet", "label": "Claude Sonnet 5", "id": "claude-sonnet-5"}]})
             if request.path != "/api/messages" or "space" in request.query:
                 raise web.HTTPNotFound()  # one chat: no topic routes, no space parameter
+            await asyncio.sleep(state["messages_delay"])
             return web.json_response({"threads": thread_page(), "before": state["before"],
                                       "generation": state["generation"], "unread": state["unread"]})
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
@@ -211,6 +214,16 @@ async def main():
                 pass
             await expect(area).to_have_value("Preserve this draft")
 
+            # A cold start shows the app at once rather than a blank screen
+            # while the session request waits on the network: on the phone a
+            # waking VPN can hold it for seconds (2026-10-15).
+            state["session_delay"] = 1.5
+            await page.reload()
+            await expect(page.get_by_text("Opening chat…")).to_be_visible(timeout=1000)
+            await expect(page.locator("#unavailable")).to_be_hidden()
+            state["session_delay"] = 0
+            await expect(area).to_have_value("Preserve this draft")
+
             # Proxy failures, including access denial, remain recoverable.
             state["available"] = False
             await page.reload()
@@ -327,6 +340,28 @@ async def main():
             await page.wait_for_function("() => window.__badges.at(-1) === 2")
             state["unread"] = 0
             await page.wait_for_function("() => window.__badges.at(-1) === 'clear'")
+
+            # Coming back to the app fetches at once, without waiting for the
+            # next poll, and says so while the fetch is slow: the timeline on
+            # screen may be hours old. A quick fetch shows nothing, so a tab
+            # switch on the desktop does not flash it.
+            updating = page.locator("#chat-updating")
+            await page.evaluate("""() => { window.__updatingShown = false;
+              new MutationObserver(() => { if (!document.querySelector('#chat-updating').hidden) window.__updatingShown = true; })
+                .observe(document.querySelector('#chat-updating'), { attributes: true }); }""")
+            await page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+            await page.wait_for_timeout(800)
+            assert not await page.evaluate("() => window.__updatingShown"), "a quick refresh showed Updating…"
+            state["messages_delay"] = 1.5
+            state["replies"].append({**reply, "id": "r3", "text": "Fresh news", "created": 1700000002.5})
+            await page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+            await expect(updating).to_be_visible(timeout=1000)
+            await expect(updating).to_have_text("Updating…")
+            await expect(page.get_by_text("Fresh news")).to_be_visible()
+            await expect(updating).to_be_hidden()
+            state["messages_delay"] = 0
+            state["replies"].pop()
+            await expect(page.get_by_text("Fresh news")).to_have_count(0)
 
             # The composer starts one line tall and grows with the text.
             height = "() => document.querySelector('#chat-form textarea').offsetHeight"
@@ -750,7 +785,7 @@ async def main():
             assert keys == [f"noxide-shell-{instance_version}-test2"], keys
             assert not errors, errors
             await browser.close()
-            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image and document viewers in the iOS home-screen app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, swipe left to reply without sideways scrolling, finger-sized reply targets on the phone, #chat/<thread> and OPEN_CHAT reply mode.")
+            print("Passed: password-free startup, single chat without topics, offline/proxy failure recovery, waiting update, mutation guard, draft-safe multi-tab reload, local draft clearing, mobile overflow, autocorrect off only without touch, seen acknowledgements, notification click to chat, reset dividers, pasted images, image and document viewers in the iOS home-screen app, a visible shell on a slow cold start, Updating… on a slow return to the app, end-pinned timeline across late thumbnails, voice button, thread sections, reply chip and reply_to, cancel reply, swipe left to reply without sideways scrolling, finger-sized reply targets on the phone, #chat/<thread> and OPEN_CHAT reply mode.")
     finally:
         release.set()
         await runner.cleanup()
