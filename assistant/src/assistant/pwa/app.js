@@ -3,6 +3,12 @@ const $$ = selector => [...document.querySelectorAll(selector)];
 // Touch-first devices keep their keyboard's own behaviour: Return inserts a
 // newline, and typos are corrected as in every other app on the phone.
 const touchFirst = () => window.matchMedia('(pointer: coarse)').matches;
+// On the phone a focused composer stands for a raised keyboard: the layout
+// drops the home-indicator inset and holds off the shell's relayout while the
+// field has focus. iOS raises the keyboard only for a tap, so outside one the
+// app leaves focus alone there; a focused field with no keyboard kept the
+// inset dropped and the keyboard's band in place (2026-10-15).
+const focusComposer = area => { if (!touchFirst()) area.focus(); };
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 const paths = {
   chat: 'M20 11a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 1 1 17-4Z',
@@ -324,7 +330,7 @@ function renderChat(pageVersion) {
     if (last) setReply(last);
     section.scrollIntoView({ block: 'center' });
     stickToEnd = atEnd(thread);  // the app moved the reader; do not pull them back to the end
-    area.focus();
+    focusComposer(area);  // a notification click, never a tap on the page
     return true;
   }
   const button = $('#chat-form .send-button'), area = $('#chat-form textarea'), form = $('#chat-form');
@@ -468,7 +474,7 @@ function renderChat(pageVersion) {
         if (!active()) return;
         area.value = area.value.trim() ? area.value.replace(/\s*$/, ' ') + text : text;
         area.dispatchEvent(new Event('input'));
-        area.focus();
+        focusComposer(area);  // after an upload, long past the tap
       } catch (e) { toast(e.message); } finally { setActivity(''); }
     });
     recorder.start(1000);
@@ -682,7 +688,13 @@ if (window.visualViewport) {
   }
 }
 window.addEventListener('focus', () => ackVisible());
-document.addEventListener('visibilitychange', () => { ackVisible(); if (!document.hidden) refreshVisible(); });
+document.addEventListener('visibilitychange', () => {
+  ackVisible();
+  if (!document.hidden) refreshVisible();
+  // iOS can bring the app back with the composer still focused and its
+  // keyboard gone; let go of the field on the way out instead.
+  else if (touchFirst()) $('#chat-form textarea')?.blur();
+});
 function connectivity() {
   const offline = !navigator.onLine || serverUnavailable;
   $('#offline-banner').hidden = !offline;

@@ -745,6 +745,26 @@ async def main():
             assert cancel_right <= excerpt_box["x"] + 1 and send_box["x"] - cancel_right > 150, (cancel_box, excerpt_box, send_box)
             await cancel_button.tap()
             await expect(phone_page.locator("#reply-chip")).to_be_hidden()
+            # On the phone a focused composer means the keyboard is up: the
+            # composer drops its home-indicator inset and the shell's relayout
+            # (the cure for the band a keyboard leaves) waits for the blur. iOS
+            # raises the keyboard only for a tap, so the app never focuses the
+            # field on its own there, and lets go of it when the app goes to the
+            # background, since it can come back focused with no keyboard; both
+            # left the inset dropped and the band in place (2026-10-15). A
+            # thread opened from a notification shows reply mode, unfocused.
+            phone_area = phone_page.get_by_label(composer)
+            await phone_page.goto(url + "/#chat/u1")
+            await expect(phone_page.locator("#reply-chip")).to_be_visible()
+            await expect(phone_area).not_to_be_focused()
+            await phone_area.tap()
+            await expect(phone_area).to_be_focused()
+            await phone_page.evaluate("""() => {
+              Object.defineProperty(document, 'hidden', { value: true, configurable: true });
+              document.dispatchEvent(new Event('visibilitychange'));
+              delete document.hidden;
+            }""")
+            await expect(phone_area).not_to_be_focused()
             await phone.close()
             # Threads from different days are separated by a day line: Today,
             # Yesterday, then the date.
