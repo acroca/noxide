@@ -1,7 +1,7 @@
 [project]
 name = "assistant"
 version = "0.1.0"
-description = "Personal assistant: web app → Copilot → markdown vault"
+description = "Notes and agenda assistant: web app → Copilot → markdown vault"
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.12",

@@ -1,12 +1,17 @@
-# Noxide — Personal Assistant
+# Noxide — Notes & Agenda Assistant
 
-A self-hosted personal assistant: **private web app → GitHub Copilot → markdown vault**.
+A self-hosted assistant that keeps your notes and your agenda. Tell it what
+happened and it files it as plain markdown, keeps today's picture current and
+reminds you when things are due.
+**Private web app → GitHub Copilot → markdown vault.**
+
+It remembers and reminds; it doesn't run errands. It won't book, buy or send
+email for you: what it writes is your notes and its messages to you. It does
+look things up on the web and read the documents you give it, to answer you
+and to file what matters.
 
 You talk to it in a small web app on your own network, installed on your phone
-like any other app. It remembers what you tell it by writing plain markdown
-files, sets reminders, does the web research you'd otherwise open ten tabs
-for, reads the PDF you dropped in the vault, and helps you see what today
-looks like.
+like any other app.
 
 ```
 you  ›  had a great catch-up with Marco, he's moving to Lisbon in March
