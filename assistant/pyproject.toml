@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Notes and agenda assistant: web app → Copilot → markdown vault"
 requires-python = ">=3.12"
 dependencies = [
-    "aiohttp>=3.12",
+    "aiohttp>=3.14.4",
     "pywebpush>=2.0",
     "httpx>=0.27",
     "apscheduler>=3.10",
