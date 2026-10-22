@@ -38,52 +38,13 @@ from .vault_check_pages import (
     page_findings,
     resolve_link,
 )
+from .vault_check_weekdays import _WEEKDAY_LOOKUP, weekday_findings
 
 _MAX_FINDINGS = 100
 
 MAINTENANCE_KINDS = ("compile", "lint")
 
-# Weekday names per language, Monday-first to match date.weekday(). The
-# canonical spelling (used in corrections) comes first; extra lookup-only
-# spellings (unaccented) follow in _EXTRA_SPELLINGS.
-_WEEKDAY_NAMES: dict[str, tuple[str, ...]] = {
-    "en": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
-    "ca": ("dilluns", "dimarts", "dimecres", "dijous", "divendres", "dissabte", "diumenge"),
-    "es": ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"),
-}
-_EXTRA_SPELLINGS: dict[str, tuple[str, int]] = {
-    "miercoles": ("es", 2),
-    "sabado": ("es", 5),
-}
-
-# name (lowercased) → (language, Monday-first index)
-_WEEKDAY_LOOKUP: dict[str, tuple[str, int]] = {
-    name.lower(): (lang, i)
-    for lang, names in _WEEKDAY_NAMES.items()
-    for i, name in enumerate(names)
-} | _EXTRA_SPELLINGS
-
-_NAMES_ALT = "|".join(sorted(_WEEKDAY_LOOKUP, key=len, reverse=True))
-# Punctuation/whitespace only — intervening words ("Monday standup notes,
-# due 2026-08-01") mean the weekday does not label that date.
-_SEP = r"[ \t,.:;()\[\]—–\-→]{1,10}"
-_DATE = r"\d{4}-\d{2}-\d{2}"
-_WEEKDAY_THEN_DATE = re.compile(
-    rf"\b(?P<wd>{_NAMES_ALT})\b{_SEP}(?P<date>{_DATE})", re.IGNORECASE
-)
-_DATE_THEN_WEEKDAY = re.compile(
-    rf"(?P<date>{_DATE}){_SEP}\b(?P<wd>{_NAMES_ALT})\b", re.IGNORECASE
-)
-
 _OPEN_TASK = re.compile(r"^\s*- \[ \]\s+(?P<text>.+?)\s*$")
-# now.md's Upcoming form — "- Tuesday — text (2026-09-08) [reminder:…]": the
-# weekday opens the bullet and the date closes it, with the event text in
-# between. Paired only on now.md, where the prompt mandates this shape;
-# elsewhere a leading weekday is prose ("Monday notes (2026-08-01)").
-_LABELLED_LINE = re.compile(
-    rf"^\s*- (?P<wd>{_NAMES_ALT})\b.*\((?P<date>{_DATE})\)(?:\s*\[reminder:[0-9a-f]{{8}}\])*\s*$",
-    re.IGNORECASE,
-)
 
 
 def run_checks(
@@ -108,7 +69,7 @@ def run_checks(
         + _overdue_findings(wiki_files, today, (log_dates or {}).get("compile"))
         + _someday_findings(wiki_files)
         + _maintenance_findings(log_dates, today, maintenance)
-        + _weekday_findings(wiki_files)
+        + weekday_findings(wiki_files, today)
         + _reminder_findings(root, wiki_files)
         + _schedule_hygiene_findings(root)
         + _routine_findings(root)
@@ -409,36 +370,6 @@ def _maintenance_findings(
 
 
 # ---------------------------------------------------------------------------
-# Weekday labels: a weekday name written beside an ISO date must match it.
-# ---------------------------------------------------------------------------
-
-_WEEKDAY_HEADING = "Weekday labels"
-
-
-def _weekday_pairs(rel: str, line: str) -> list[tuple[str, str]]:
-    """(weekday, ISO date) pairs the line claims — adjacent anywhere, or, on
-    now.md, a bullet opening with the weekday and closing with the date."""
-    pairs = [
-        (m.group("wd"), m.group("date"))
-        for rx in (_WEEKDAY_THEN_DATE, _DATE_THEN_WEEKDAY)
-        for m in rx.finditer(line)
-    ]
-    if not pairs and rel == _NOW_PATH and (m := _LABELLED_LINE.match(line)):
-        pairs.append((m.group("wd"), m.group("date")))
-    return pairs
-
-
-def _weekday_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tuple[str, str]]:
-    findings = []
-    for rel, lines in wiki_files:
-        for i, line in _content_lines(lines):
-            for weekday, iso in _weekday_pairs(rel, line):
-                if issue := _check_pair(weekday, iso):
-                    findings.append((_WEEKDAY_HEADING, f"{rel}:{i}: {issue}"))
-    return findings
-
-
-# ---------------------------------------------------------------------------
 # Reminder markers: every pending one-off scheduled job leaves a
 # [reminder:<id>] marker on a wiki page (so ingest trips over it right where
 # it edits), and every marker references a still-pending job (a fired or
@@ -725,16 +656,3 @@ def _version_token_findings(wiki_files: list[tuple[str, list[str]]]) -> list[tup
         for i, line in _content_lines(lines)
         if _VERSION_TOKEN_LINE.match(line)
     ]
-
-
-def _check_pair(weekday: str, iso: str) -> str | None:
-    lang, claimed = _WEEKDAY_LOOKUP[weekday.lower()]
-    year, month, day = (int(part) for part in iso.split("-"))
-    try:
-        actual = date(year, month, day).weekday()
-    except ValueError:
-        return f'"{weekday}" beside {iso} — not a valid calendar date'
-    if claimed == actual:
-        return None
-    correct = _WEEKDAY_NAMES[lang][actual]
-    return f'"{weekday}" beside {iso} — that date is a {correct}'

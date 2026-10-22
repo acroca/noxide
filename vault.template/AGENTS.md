@@ -22,6 +22,7 @@ The raw-journal + compiled-wiki design and its operations (ingest/query/compile/
      - Routines table header: `| Rutina | Frecuencia | Última vez | Próxima | Notas |`
        (= Routine / Frequency / Last done / Next due / Notes)
      - `now.md` sections: **Hoy** (= Today), **Próximo** (= Upcoming), **Sin prisa** (= Someday), …
+     - **Upcoming** day labels: **Mañana — viernes** (= Tomorrow — Friday), **Sábado** (= Saturday)
      - Status label: `**Estado:**`; tasks: `(para …)` / `(hecho …)` / `(esperando: X)` / `(sin prisa)` (= someday)
      Localize the words, never the date format: the argument of a task marker stays
      ISO (`(para 2026-08-12)`), and so does every other date in the vault. Weekday

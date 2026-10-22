@@ -1374,3 +1374,201 @@ def test_localized_someday_marker_and_heading(tmp_path: Path) -> None:
     assert _check(tmp_path) == "[no findings]"
     _write(tmp_path, "wiki/now.md", "# Now\n\n## Tareas\n- [ ] ordenar los cables (sin prisa)\n\n## Algún día\n")
     assert "casa.md:4" in _check(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Day groups in now.md's Upcoming section: the next 7 days are grouped under
+# a bold weekday line, the weekday labelling every item nested below it
+# ---------------------------------------------------------------------------
+
+
+def _upcoming(root: Path, body: str) -> None:
+    _now_with(root, f"## Upcoming\n{body}")
+
+
+def test_grouped_and_flat_upcoming_items_pair_with_their_page_events(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-04 17:30 — Hockey", "2026-08-08 09:00 — Match", "2026-08-14 — Castanyada")
+    _upcoming(
+        tmp_path,
+        "- **Tomorrow — Tuesday**\n"
+        "  - 17:30 — Hockey (2026-08-04)\n"
+        "- **Saturday**\n"
+        "  - 09:00 — Match (2026-08-08)\n"
+        "- 2026-08-14 — Castanyada",
+    )
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_group_weekday_that_does_not_match_its_items_is_reported_on_the_group(
+    tmp_path: Path,
+) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-04 17:30 — Hockey", "2026-08-08 09:00 — Match")
+    _upcoming(
+        tmp_path,
+        "- **Tomorrow — Tuesday**\n"
+        "  - 17:30 — Hockey (2026-08-04)\n"
+        "- **Sunday**\n"
+        "  - 09:00 — Match (2026-08-08)",
+    )
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:6" in report
+    assert "Saturday" in report
+    assert "wiki/now.md:4" not in report
+    assert "wiki/now.md:7" not in report
+
+
+def test_item_filed_under_the_wrong_day_is_reported_on_the_item(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-08 09:00 — Match", "2026-08-09 11:00 — Birthday party")
+    _upcoming(
+        tmp_path,
+        "- **Saturday**\n"
+        "  - 09:00 — Match (2026-08-08)\n"
+        "  - 11:00 — Birthday party (2026-08-09)",
+    )
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:6" in report
+    assert "Sunday" in report
+    assert "wiki/now.md:4" not in report
+
+
+def test_tomorrow_group_is_validated_against_today_plus_one(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-05 — Dentist")
+    _upcoming(tmp_path, "- **Tomorrow — Wednesday**\n  - Dentist (2026-08-05)")
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:4" in report
+    assert "2026-08-04" in report
+    assert "Tuesday" in report
+
+
+def test_tomorrows_group_without_the_tomorrow_label_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-04 17:30 — Hockey")
+    _upcoming(tmp_path, "- **Tuesday**\n  - 17:30 — Hockey (2026-08-04)")
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:4" in report
+    assert "tomorrow" in report.lower()
+
+
+def test_localized_group_labels_are_checked(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-04 17:30 — Hockey", "2026-08-08 09:00 — Partido")
+    _upcoming(
+        tmp_path,
+        "- **Mañana — martes**\n"
+        "  - 17:30 — Hockey (2026-08-04)\n"
+        "- **Domingo**\n"
+        "  - 09:00 — Partido (2026-08-08)",
+    )
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:6" in report
+    assert "sábado" in report
+    assert "wiki/now.md:4" not in report
+
+
+def test_catalan_tomorrow_label_is_recognized(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-04 17:30 — Hoquei")
+    _upcoming(tmp_path, "- **Demà — dimarts**\n  - 17:30 — Hoquei (2026-08-04)")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_item_beyond_seven_days_under_a_day_group_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-08 — Match", "2026-08-15 — Tournament")
+    _upcoming(
+        tmp_path,
+        "- **Saturday**\n"
+        "  - Match (2026-08-08)\n"
+        "  - Tournament (2026-08-15)",
+    )
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:6" in report
+    assert "7 days" in report
+
+
+def test_range_is_grouped_under_its_start_day(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-07 → 2026-08-09 — Camping trip")
+    _upcoming(tmp_path, "- **Friday**\n  - Camping trip (2026-08-07 → 2026-08-09)")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_range_grouped_under_a_day_other_than_its_start_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-07 → 2026-08-09 — Camping trip")
+    _upcoming(tmp_path, "- **Saturday**\n  - Camping trip (2026-08-07 → 2026-08-09)")
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:4" in report
+    assert "Friday" in report
+
+
+def test_approximate_item_in_a_day_group_keeps_its_date(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "~2026-08-08 — Plumber visit")
+    _upcoming(tmp_path, "- **Saturday**\n  - Plumber visit (~2026-08-08)")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_grouped_item_without_its_iso_date_is_reported(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _upcoming(tmp_path, "- **Saturday**\n  - 09:00 — Match")
+
+    report = _check(tmp_path)
+
+    assert "wiki/now.md:5" in report
+    assert "YYYY-MM-DD" in report
+
+
+def test_notes_nested_below_a_grouped_item_are_not_items(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-08 09:00 — Match")
+    _upcoming(
+        tmp_path,
+        "- **Saturday**\n"
+        "  - 09:00 — Match (2026-08-08)\n"
+        "    - bring the boots",
+    )
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_dated_task_in_a_day_group_still_pairs_with_the_task_mirror(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _upcoming(tmp_path, "- **Wednesday**\n  - [ ] buy compost (due 2026-08-05)")
+
+    assert _check(tmp_path) == "[no findings]"
+
+
+def test_group_ends_at_the_next_flat_line(tmp_path: Path) -> None:
+    _clean_vault(tmp_path)
+    _family(tmp_path, "2026-08-08 — Match", "2026-08-14 — Castanyada")
+    _upcoming(
+        tmp_path,
+        "- **Saturday**\n"
+        "  - Match (2026-08-08)\n"
+        "- 2026-08-14 — Castanyada",
+    )
+
+    assert _check(tmp_path) == "[no findings]"

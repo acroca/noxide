@@ -19,12 +19,13 @@ the pairing.
 
 A ``now.md`` line mirrors an event when it carries the event's text and the
 event's date *as a label* — leading (``- 2026-09-08 — …``) or parenthesized
-(``- Tuesday — … (2026-09-08)``) — never a date mentioned mid-sentence in a
-**Last 7 days** bullet or a task's ``(due …)`` marker. An event dated today
-is instead matched by text against the section whose ``##`` heading carries
-today's date (**Today**, whose lines have no date of their own); without
-such a heading, against any line that carries no date at all. Lines inside
-fenced code blocks are skipped on both sides.
+(``  - 17:30 — … (2026-09-08)`` under a day group, ``(~2026-09-08)``, or a
+range's start in ``(2026-09-08 → 2026-09-10)``) — never a date mentioned
+mid-sentence in a **Last 7 days** bullet or a task's ``(due …)`` marker. An
+event dated today is instead matched by text against the section whose ``##``
+heading carries today's date (**Today**, whose lines have no date of their
+own); without such a heading, against any line that carries no date at all.
+Lines inside fenced code blocks are skipped on both sides.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ _EVENT_RX = re.compile(
 )
 _DATE_RX = re.compile(_DATE)
 _LEADING_DATE_RX = re.compile(rf"^\s*- ~?(?P<date>{_DATE})")
-_PAREN_DATE_RX = re.compile(rf"\((?P<date>{_DATE})\)")
+_PAREN_DATE_RX = re.compile(rf"\(~?(?P<date>{_DATE})(?:\s*→\s*~?{_DATE})?\)")
 _REMINDER_RX = re.compile(r"\[reminder:[0-9a-f]{8}\]")
 _MD_LINK_RX = re.compile(r"\[([^\]]+)\]\([^)\s]+\)")
 

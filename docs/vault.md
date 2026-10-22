@@ -57,9 +57,10 @@ vault/
   will not match a search for `2026-08-12`. A weekday label is also a second
   fact that can be wrong on its own. The bot says dates naturally in chat —
   that is where they are meant to read well. `now.md`'s **Upcoming** section is
-  the sole exception: within-7-days items are labelled by weekday, with the
-  ISO date kept in parentheses at the end, since that file is always read
-  whole and rebuilt nightly.
+  the sole exception: the next 7 days are grouped under one weekday line per
+  day (tomorrow's reads `Tomorrow — Friday`), each item keeping its ISO date
+  in parentheses at the end, since that file is always read whole and rebuilt
+  nightly.
 - **Journal entries** are `- HH:MM prose` in local time, under a `# YYYY-MM-DD`
   heading. Prose only — no checkboxes, no `TODO:` markers. The filename carries
   the date, so entries need no date in the text; being append-only, old entries
@@ -143,7 +144,8 @@ into the bot: pure code, no model involved. It enumerates every open task on
 every live wiki page against the `now.md` mirror (in both directions), pairs
 every dated event within the next two weeks with a dashboard line carrying
 its date and text,
-verifies weekday names written beside ISO dates against the calendar, checks
+verifies weekday names written beside ISO dates against the calendar, and
+each **Upcoming** day group against the dates of the items under it, checks
 each routine's next-due date against last-done + frequency, reconciles every
 page against the index (orphan pages, dead index links), cross-checks reminder
 markers with the pending schedule, flags schedule rows carrying hand-written
