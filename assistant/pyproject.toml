@@ -4,18 +4,18 @@ version = "0.1.0"
 description = "Notes and agenda assistant: web app → Copilot → markdown vault"
 requires-python = ">=3.12"
 dependencies = [
-    "aiohttp>=3.12",
+    "aiohttp>=3.14.5",
     "pywebpush>=2.0",
     "httpx>=0.27",
     "apscheduler>=3.10",
-    "pydantic>=2.13.5",
-    "pydantic-settings>=2.15.0",
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.16.1",
     "dateparser>=1.4.3",
-    "trafilatura>=2.2.0",
-    "watchfiles>=0.21",
+    "trafilatura>=2.3.1",
+    "watchfiles>=1.3.0",
     "tomli>=2.0; python_version < '3.11'",
-    "pypdf>=6.18.0",
-    "pypdfium2>=5.13.0",
+    "pypdf>=6.21.2",
+    "pypdfium2>=5.14.0",
     "pillow>=12.3.0",
 ]
 
@@ -36,7 +36,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
-    "ruff>=0.16.7",
+    "ruff>=0.17.2",
 ]
 
 [tool.ruff]
