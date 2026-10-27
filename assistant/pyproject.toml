@@ -16,7 +16,7 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
     "pypdf>=6.21.2",
     "pypdfium2>=5.14.0",
-    "pillow>=12.3.0",
+    "pillow>=13.0.0",
 ]
 
 [project.scripts]
