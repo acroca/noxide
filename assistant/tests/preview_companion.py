@@ -23,17 +23,48 @@ async def main():
         root = Path(directory)
         vault = VaultTools(root / "vault")
         vault.write_file("wiki/now.md", """# Now
-## Today · Monday, September 14
+
+_Updated: 2026-09-14 (nightly compile)._
+
+## Today — Monday 2026-09-14
+
+- 16:00 — A walk with Alex, by the river (2026-09-14)
 - [ ] Send the studio proposal (due 2026-09-14)
-- 16:00 — A walk with Alex, by the river
-- [ ] Give the balcony plants a little water
 
 ## Upcoming
-- Tuesday — Book club at Nora’s (2026-09-15)
-- Friday — Weekend in the mountains (2026-09-18)
+
+- **Tomorrow — Tuesday**
+  - 19:00 — Book club at Nora’s (2026-09-15)
+- **Friday**
+  - Weekend in the mountains (2026-09-18 → 2026-09-20) [reminder:3f9a1c2e]
+- 2026-09-24 — Dentist, 10:30
 
 ## Waiting
-- The studio team is reviewing the moodboard.
+
+- The studio team is reviewing the moodboard — [A new studio](projects/studio.md)
+
+## Tasks
+
+[A new studio](projects/studio.md)
+- [ ] Send the studio proposal (due 2026-09-14)
+
+[The balcony garden](projects/garden.md)
+- [ ] Water the plants
+
+[A weekend away](projects/mountains.md)
+- [ ] Plan the walking route (due 2026-09-17)
+
+[Between the pages](projects/reading.md)
+- [ ] Finish the last chapter (someday)
+
+## Someday
+
+- [ ] Finish the last chapter (someday) — [Between the pages](projects/reading.md)
+
+## Last 7 days
+
+- **2026-09-13** — Watered the balcony plants; booked the cabin.
+- **2026-09-12** — ~~Lunch with Sam~~ moved to next week. Saved https://example.com/slow-reading for later.
 """)
         projects = [
             ("studio", "A new studio", "Shaping a calmer place to do good work. The first proposal is nearly ready.", "Send the studio proposal"),

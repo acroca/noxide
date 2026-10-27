@@ -57,10 +57,10 @@ mise exec uv -- uv run pytest tests/test_companion.py -v
 mise exec node -- node --check src/assistant/pwa/app.js
 ```
 
-Service-worker regression tests and real Chromium lifecycle checks:
+Service-worker and Markdown renderer tests, and real Chromium lifecycle checks:
 
 ```bash
-mise exec node -- node --test tests/test_pwa_push.mjs
+mise exec node -- node --test tests/test_pwa_push.mjs tests/test_markdown.mjs
 mise exec uv -- uv run --with playwright playwright install chromium
 mise exec uv -- uv run --with playwright python -m tests.browser_pwa_lifecycle
 ```

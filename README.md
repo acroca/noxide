@@ -127,7 +127,7 @@ past discussion, not a substitute for current vault knowledge.
 ## The app
 
 Chat is the home screen: one conversation, organised in threads. A separate
-Now tab shows `wiki/now.md` as read-only text. Preferences holds the theme,
+Now tab shows `wiki/now.md` rendered, read-only. Preferences holds the theme,
 notifications, the model picker, Reset context and the install hint. It takes
 pasted or attached images and documents and voice notes, keeps drafts on the
 device, retries messages that hit a Copilot outage by itself, and supports

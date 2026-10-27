@@ -65,7 +65,7 @@ Entry point `__main__.py:_run()` wires everything together. The agent needs a se
 
 ### The web app
 
-`companion.py` serves the packaged `pwa/` assets and the JSON API in the bot's own process (aiohttp, `pwa.host`/`pwa.port`, always on). Chat is home and the only conversation; Now shows `wiki/now.md` as read-only raw text without LLM calls or actions. The shared `ConversationArchive` is passed in (the app never opens its own) and also stores push subscriptions and seen marks, never authentication sessions.
+`companion.py` serves the packaged `pwa/` assets and the JSON API in the bot's own process (aiohttp, `pwa.host`/`pwa.port`, always on). Chat is home and the only conversation; Now shows `wiki/now.md` read-only, rendered by `pwa/markdown.js` (the same renderer as assistant replies, tested by `tests/test_markdown.mjs`), without LLM calls or actions: vault-relative links render as their text since the app cannot open a page, only `http(s):`/`mailto:` links get an href, and the file's own leading `# ` heading becomes the view's title. The shared `ConversationArchive` is passed in (the app never opens its own) and also stores push subscriptions and seen marks, never authentication sessions.
 
 Instance identity: `assistant.name` / `AGENT_NAME` (default `Noxide`) controls model identity, app labels, installation manifest, app name and fallback text, not the push title. Never hard-code a user's instance name. HTML and worker templates receive safely escaped configuration; a name-derived worker cache suffix makes renames update the offline shell. Technical namespaces and app IDs remain stable across renames.
 

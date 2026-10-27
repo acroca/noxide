@@ -97,7 +97,7 @@ async def main():
         name = "index.html" if request.path == "/" else request.path.lstrip("/")
         if name in ("icon-192.png", "icon-512.png"):
             name = "icon.svg"
-        if name not in {"index.html", "app.js", "theme.js", "sw.js", "style.css", "icon.svg", "manifest.webmanifest"}:
+        if name not in {"index.html", "app.js", "markdown.js", "theme.js", "sw.js", "style.css", "icon.svg", "manifest.webmanifest"}:
             raise web.HTTPNotFound()
         text = (assets / name).read_text()
         if name == 'index.html':
@@ -194,6 +194,11 @@ async def main():
             await page.goto(url + '/#now')
             await expect(page.locator('#now-content')).to_be_visible()
             await expect(page.locator('#breadcrumb')).to_have_text('Now')
+            # The page is rendered, not shown as source; its own "# Now" titles the view.
+            await expect(page.locator('#now-title')).to_have_text('Now')
+            await expect(page.locator('#now-content h2')).to_have_text('Today')
+            await expect(page.locator('#now-content .md-task')).to_have_text('A read-only page')
+            assert '#' not in await page.locator('#now-content').inner_text()
             await page.goto(url + '/#chat/anything')
             await expect(area).to_have_value('Preserve this draft')
             await page.goto(url + '/#chat')

@@ -135,8 +135,9 @@ Next: set up your vault — see [vault.md](vault.md#starting-a-vault).
 ## The app
 
 Chat is the home screen: one conversation, organised in threads. Now is a
-read-only, plain-text display of `wiki/now.md`, preserving all sections and
-Markdown as written. Opening Now never calls the model. There are no
+read-only display of `wiki/now.md` with its Markdown rendered: headings, the
+day groups, task boxes and web links; links to vault pages show as their
+text, since the app has no page to open. Opening Now never calls the model. There are no
 dashboard cards, project navigation, or task/reminder buttons; make changes
 through chat.
 

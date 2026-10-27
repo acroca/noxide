@@ -113,8 +113,8 @@ HELD_WINDOW_SECONDS = 24 * 3600
 def _local_now(tz_name):
     """The user's wall clock (patched in tests)."""
     return datetime.now(ZoneInfo(tz_name))
-_ASSETS = {"/": "index.html", "/app.js": "app.js", "/theme.js": "theme.js", "/style.css": "style.css",
-           "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
+_ASSETS = {"/": "index.html", "/app.js": "app.js", "/markdown.js": "markdown.js", "/theme.js": "theme.js",
+           "/style.css": "style.css", "/sw.js": "sw.js", "/manifest.webmanifest": "manifest.webmanifest",
            "/icon.svg": "icon.svg"}
 
 

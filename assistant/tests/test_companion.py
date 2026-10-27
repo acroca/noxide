@@ -506,7 +506,7 @@ async def test_composer_keeps_spellcheck_but_not_autocorrect(companion):
 
 async def test_pwa_assets_and_shutdown_rejection(companion):
     service, client = companion
-    for path in ("/", "/app.js", "/theme.js", "/style.css", "/sw.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"):
+    for path in ("/", "/app.js", "/markdown.js", "/theme.js", "/style.css", "/sw.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"):
         response = await client.get(path)
         assert response.status == 200
         assert await response.read()

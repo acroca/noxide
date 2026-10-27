@@ -1,3 +1,5 @@
+import { escape, markdown } from './markdown.js';
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 // Touch-first devices keep their keyboard's own behaviour: Return inserts a
@@ -9,7 +11,6 @@ const touchFirst = () => window.matchMedia('(pointer: coarse)').matches;
 // app leaves focus alone there; a focused field with no keyboard kept the
 // inset dropped and the keyboard's band in place (2026-10-15).
 const focusComposer = area => { if (!touchFirst()) area.focus(); };
-const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 const paths = {
   chat: 'M20 11a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 1 1 17-4Z',
   page: 'M6 3h9l4 4v14H6zM14 3v5h5M9 12h7M9 16h7',
@@ -185,36 +186,6 @@ function receiptNote(message) {
   if (meta.guard === 'unsaved') notes.push('Nothing was saved');
   else if (meta.wrote && meta.wrote.length) notes.push(`Saved: ${meta.wrote.map(path => path.replace(/^wiki\//, '')).join(', ')}`);
   return notes.map(text => `<div class="message-status"><span>${escape(text)}</span></div>`).join('');
-}
-function inline(text) {
-  return escape(text).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-}
-function markdown(text) {
-  const out = [];
-  let list = false, fence = false, code = [], table = false;
-  const closeList = () => { if (list) { out.push('</ul>'); list = false; } };
-  const closeTable = () => { if (table) { out.push('</tbody></table>'); table = false; } };
-  for (const line of String(text || '').split('\n')) {
-    if (/^\s*```/.test(line)) {
-      closeList(); closeTable();
-      if (fence) { out.push(`<pre>${escape(code.join('\n'))}</pre>`); code = []; }
-      fence = !fence; continue;
-    }
-    if (fence) { code.push(line); continue; }
-    const heading = line.match(/^(#{1,4})\s+(.+)/);
-    const bullet = line.match(/^\s*(?:[-*]|\d+\.)\s+(.+)/);
-    if (heading) { closeList(); closeTable(); out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); }
-    else if (bullet) {
-      closeTable(); if (!list) { out.push('<ul>'); list = true; }
-      out.push(`<li>${inline(bullet[1])}</li>`);
-    } else if (/^\s*\|/.test(line)) {
-      closeList(); if (/^\s*\|[\s:|-]+$/.test(line)) continue;
-      if (!table) { out.push('<table><tbody>'); table = true; }
-      out.push('<tr>' + line.trim().replace(/^\||\|$/g, '').split('|').map(cell => `<td>${inline(cell.trim())}</td>`).join('') + '</tr>');
-    } else { closeList(); closeTable(); if (line.trim()) out.push(`<p>${inline(line)}</p>`); }
-  }
-  closeList(); closeTable(); if (fence) out.push(`<pre>${escape(code.join('\n'))}</pre>`);
-  return `<div class="markdown">${out.join('')}</div>`;
 }
 // Calendar day of a timestamp in the assistant's timezone, as YYYY-MM-DD.
 function dayOf(seconds) {
@@ -591,6 +562,13 @@ function renderChat(pageVersion) {
   loadMessages().catch(e => { if (active()) { $('#chat-thread').textContent = e.message; toast(e.message); } });
   poll = setInterval(() => { if (!document.hidden && navigator.onLine) loadMessages().catch(() => {}); }, 2200);
 }
+// The page's own leading heading becomes the view's title, so "Now" is not shown twice.
+function renderNow(content) {
+  if (!content?.trim()) { $('#now-content').textContent = 'wiki/now.md is empty or has not been created yet.'; return; }
+  const title = content.match(/^\s*#[ \t]+(.+)/);
+  if (title) $('#now-title').textContent = title[1].trim();
+  $('#now-content').innerHTML = markdown(title ? content.slice(title[0].length) : content);
+}
 async function route() {
   if (!session) return;
   clearInterval(poll);
@@ -604,9 +582,9 @@ async function route() {
     if (view === 'now') {
       $('#breadcrumb').textContent = 'Now'; document.title = `${agentName} · Now`;
       $('#main').className = 'now-main';
-      $('#main').innerHTML = '<header class="now-header"><h1>Now</h1><span>wiki/now.md · Read only</span></header><pre id="now-content" class="now-content">Loading…</pre>';
+      $('#main').innerHTML = '<header class="now-header"><h1 id="now-title">Now</h1><span>wiki/now.md · Read only</span></header><div id="now-content" class="now-content">Loading…</div>';
       const page = await api('now');
-      if (pageVersion === version) $('#now-content').textContent = page.content || 'wiki/now.md is empty or has not been created yet.';
+      if (pageVersion === version) renderNow(page.content);
     } else {
       $('#breadcrumb').textContent = 'Chat'; document.title = agentName + ' · Chat';
       renderChat(pageVersion);
