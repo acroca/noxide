@@ -58,9 +58,10 @@ vault/
   fact that can be wrong on its own. The bot says dates naturally in chat —
   that is where they are meant to read well. `now.md`'s **Upcoming** section is
   the sole exception: the next 7 days are grouped under one weekday line per
-  day (tomorrow's reads `Tomorrow — Friday`), each item keeping its ISO date
-  in parentheses at the end, since that file is always read whole and rebuilt
-  nightly.
+  day (tomorrow's reads `Tomorrow — Friday`). Every entry for that day is a
+  separate bullet and keeps its ISO date in parentheses at the end; complex
+  entries may add nested bullets beneath that dated parent. This file is always
+  read whole and rebuilt nightly.
 - **Journal entries** are `- HH:MM prose` in local time, under a `# YYYY-MM-DD`
   heading. Prose only — no checkboxes, no `TODO:` markers. The filename carries
   the date, so entries need no date in the text; being append-only, old entries
@@ -91,7 +92,10 @@ vault/
   Today, with their original due date, until done or rescheduled — a deadline
   must not fall off the dashboard by passing. A user-declared **Focus** block (current
   priority plus its next actions) may open Today; it survives the nightly
-  rebuild and only the user creates or clears it.
+  rebuild and only the user creates or clears it. Simple entries stay on one
+  line, but complex entries may put supporting context in nested bullets rather
+  than one long line. The parent line still keeps the complete task checkbox and
+  markers, or the event text and date, so mirror checks can identify it.
 
 Everything user-visible can be localized — column headers, section titles, task
 markers. Declare the localized terms in `AGENTS.md` and the bot will match your
