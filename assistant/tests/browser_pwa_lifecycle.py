@@ -85,7 +85,17 @@ async def main():
                 seen.append(await request.json())
                 return web.json_response({"ok": True})
             if request.path == "/api/now":
-                return web.json_response({"content": "# Now\n\n## Today\n- [ ] A read-only page"})
+                return web.json_response({"content": (
+                    "# Now\n\n## Today\n- [ ] A read-only page\n"
+                    "- **Tomorrow**\n"
+                    "  - An event with enough detail to wrap onto another line on a phone\n"
+                    "    - Bring the notes\n"
+                    "  - [ ] A nested task\n"
+                    "    - Supporting detail\n"
+                    "  - [x] A completed task\n"
+                    "  1. First step\n"
+                    "  2. Second step"
+                )})
             if request.path == "/api/models":
                 return web.json_response({"current": "sonnet", "default": "sonnet", "models": [
                     {"alias": "sonnet", "label": "Claude Sonnet 5", "id": "claude-sonnet-5"}]})
@@ -197,8 +207,31 @@ async def main():
             # The page is rendered, not shown as source; its own "# Now" titles the view.
             await expect(page.locator('#now-title')).to_have_text('Now')
             await expect(page.locator('#now-content h2')).to_have_text('Today')
-            await expect(page.locator('#now-content .md-task')).to_have_text('A read-only page')
+            await expect(page.locator('#now-content .md-task').first).to_have_text('A read-only page')
             assert '#' not in await page.locator('#now-content').inner_text()
+            for width in (390, 1280):
+                await page.set_viewport_size({"width": width, "height": 844})
+                for scheme in ("light", "dark"):
+                    await page.emulate_media(color_scheme=scheme)
+                    nested = page.locator('#now-content li > ul')
+                    assert await nested.count() == 3
+                    for listing in await nested.all():
+                        await expect(listing).to_have_css('border-left-width', '0px')
+                        await expect(listing).to_have_css('padding-left', '20px')
+                    for item in await page.locator('#now-content ul > li:not(.md-task)').all():
+                        assert await item.evaluate("el => getComputedStyle(el).listStyleType") in (
+                            "disc", "circle", "square",
+                        )
+                        await expect(item).to_have_css('display', 'list-item')
+                    for task in await page.locator('#now-content .md-task').all():
+                        await expect(task).to_have_css('list-style-type', 'none')
+                        await expect(task.locator(':scope > .md-box')).to_be_visible()
+                    await expect(page.locator('#now-content ol')).to_have_css('list-style-type', 'decimal')
+                    assert await page.locator('#now-content').evaluate(
+                        "el => el.scrollWidth <= el.clientWidth"
+                    )
+            await page.set_viewport_size({"width": 390, "height": 844})
+            await page.emulate_media(color_scheme="light")
             await page.goto(url + '/#chat/anything')
             await expect(area).to_have_value('Preserve this draft')
             await page.goto(url + '/#chat')
