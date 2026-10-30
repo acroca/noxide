@@ -70,8 +70,9 @@ calls. It covers password-free startup, offline launches and proxy failures,
 update waiting/activation, in-flight submission protection, multi-tab draft
 preservation, the seen acknowledgements that suppress push for a reply
 already displayed on a focused device, reset dividers and the thread staying
-anchored to its end when the composer blurs, pasted images and the voice
-button. The worker's cache version is a server-stamped hash of every shell
+anchored to its end when the composer blurs, pasted images, the voice
+button, and nested Now lists (bullets, numbering and task boxes at phone and
+desktop widths in both themes). The worker's cache version is a server-stamped hash of every shell
 file, so any asset change is a new version without a manual bump; the
 installed version serves its own cached bundle until an update activates.
 
