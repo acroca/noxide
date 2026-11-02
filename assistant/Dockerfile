@@ -1,7 +1,7 @@
 # Named stages keep copied tool images visible to Dependabot.
 FROM ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff AS uv
 
-FROM python:3.14-slim AS builder
+FROM python:3.15-slim AS builder
 
 # uv is only needed to build the venv; it stays out of the final image
 COPY --from=uv /uv /usr/local/bin/uv
@@ -18,7 +18,7 @@ COPY src/ ./src/
 RUN uv sync --frozen --no-dev --no-editable
 
 
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 # git powers the optional vault backup (local-only commit history)
 RUN apt-get update \
