@@ -79,9 +79,12 @@ class VaultTools:
 
     def _safe_path(self, rel: str) -> Path:
         """Resolve *rel* against vault root; raise if it escapes."""
+        rel_path = Path(rel)
+        if not rel or rel_path.is_absolute() or ".." in rel_path.parts:
+            raise PermissionError(f"Path {rel!r} escapes the vault")
         # Resolve with the root as base; Path.resolve() requires the path to exist,
         # so we construct absolute path manually first.
-        candidate = (self._root / rel).resolve()
+        candidate = (self._root / rel_path).resolve()
         try:
             candidate.relative_to(self._root)
         except ValueError:
