@@ -503,7 +503,8 @@ class Companion:
             try:
                 text = await self.transcriber.transcribe(data)
             except TranscriptionError as exc:
-                raise web.HTTPBadGateway(text=f"Couldn't transcribe that: {exc}") from exc
+                logger.exception("Transcription failed")
+                raise web.HTTPBadGateway(text="Couldn't transcribe that recording.") from exc
             transcript = True
         if not isinstance(text, str) or not text.strip() or len(text) > 20000:
             raise web.HTTPBadRequest(text="Message must contain 1-20,000 characters"
