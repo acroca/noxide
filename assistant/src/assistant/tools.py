@@ -79,14 +79,15 @@ class VaultTools:
 
     def _safe_path(self, rel: str) -> Path:
         """Resolve *rel* against vault root; raise if it escapes."""
-        rel_path = Path(rel)
-        if not rel or rel_path.is_absolute() or ".." in rel_path.parts:
+        rel_path = Path((rel or "").strip())
+        if not rel_path.parts or rel_path.is_absolute() or ".." in rel_path.parts:
             raise PermissionError(f"Path {rel!r} escapes the vault")
-        # Resolve with the root as base; Path.resolve() requires the path to exist,
-        # so we construct absolute path manually first.
-        candidate = (self._root / rel_path).resolve()
+        # Canonicalize both sides before containment check. strict=False allows
+        # paths for files that do not yet exist.
+        root = self._root.resolve(strict=True)
+        candidate = (root / rel_path).resolve(strict=False)
         try:
-            candidate.relative_to(self._root)
+            candidate.relative_to(root)
         except ValueError:
             # Model-visible via "[permission denied: ...]" — never include
             # self._root: where the vault lives on the host is deployment
