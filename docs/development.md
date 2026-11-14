@@ -123,6 +123,10 @@ anything structural.
   crashing.
 - **Missing files return a sentinel**, `[file not found: ...]`, instead of
   raising. Callers check the prefix.
+- **Vault paths are checked after resolving symlinks**, using `os.path.realpath`
+  and a directory-boundary prefix check that CodeQL recognizes. Preserve both:
+  a sibling such as `vault-other` is not inside `vault`. Attachment routes
+  reject escaping paths with HTTP 400.
 - **Every content tool caps its output** and says so in the returned string.
   An uncapped one can displace the whole conversation.
 - **The assembled system prompt must stay byte-stable** across runs, or the

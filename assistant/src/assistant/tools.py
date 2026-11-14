@@ -7,6 +7,7 @@ outside the vault raises a PermissionError.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import secrets
 from datetime import UTC, datetime
@@ -80,20 +81,18 @@ class VaultTools:
     def _safe_path(self, rel: str) -> Path:
         """Resolve *rel* against vault root; raise if it escapes."""
         rel_path = Path((rel or "").strip())
-        if not rel_path.parts or rel_path.is_absolute() or ".." in rel_path.parts:
+        if not rel_path.parts or rel_path.is_absolute():
             raise PermissionError(f"Path {rel!r} escapes the vault")
-        # Canonicalize both sides before containment check. strict=False allows
-        # paths for files that do not yet exist.
+        # realpath follows symlinks while allowing files that do not yet exist.
+        # Keep the separator: a sibling named vault-other is not inside vault.
         root = self._root.resolve(strict=True)
-        candidate = (root / rel_path).resolve(strict=False)
-        try:
-            candidate.relative_to(root)
-        except ValueError:
+        candidate = os.path.realpath(root / rel_path)
+        if candidate != str(root) and not candidate.startswith(os.path.join(root, "")):
             # Model-visible via "[permission denied: ...]" — never include
             # self._root: where the vault lives on the host is deployment
             # detail that must stay out of runtime error strings.
-            raise PermissionError(f"Path {rel!r} escapes the vault") from None
-        return candidate
+            raise PermissionError(f"Path {rel!r} escapes the vault")
+        return Path(candidate)
 
     def abs_path(self, rel: str) -> Path:
         """Absolute path for a vault-relative path; raises PermissionError on escape."""

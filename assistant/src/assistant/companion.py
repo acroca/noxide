@@ -558,7 +558,10 @@ class Companion:
     def _attachment_file(self, path):
         if not _ATTACHMENT_PATH.fullmatch(path or ""):
             raise web.HTTPBadRequest(text="Not an attachment path")
-        return self.vault.abs_path(path)
+        try:
+            return self.vault.abs_path(path)
+        except PermissionError:
+            raise web.HTTPBadRequest(text="Attachment path escapes the vault") from None
 
     def _attachment_turn(self, row):
         """The model-facing text and vision input for a stored web message.
