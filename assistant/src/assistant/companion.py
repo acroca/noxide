@@ -864,7 +864,7 @@ class Companion:
     def _pdf_attachment(self, request):
         path = request.query.get("path", "")
         file = self._attachment_file(path)
-        if not path.endswith(".pdf"):
+        if not file.name.endswith(".pdf"):
             raise web.HTTPBadRequest(text="Not a PDF")
         if not file.is_file():
             raise web.HTTPNotFound(text="Attachment not found")
