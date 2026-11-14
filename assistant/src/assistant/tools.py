@@ -7,6 +7,7 @@ outside the vault raises a PermissionError.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import secrets
 from datetime import UTC, datetime
@@ -82,17 +83,24 @@ class VaultTools:
         rel_path = Path((rel or "").strip())
         if not rel_path.parts or rel_path.is_absolute():
             raise PermissionError(f"Path {rel!r} escapes the vault")
-        # resolve follows symlinks while allowing files that do not yet exist.
-        root = self._root.resolve(strict=True)
-        candidate = (root / rel_path).resolve(strict=False)
-        try:
-            candidate.relative_to(root)
-        except ValueError:
+        # realpath follows symlinks while allowing files that do not yet exist.
+        # The jail is a realpath + startswith(root + sep) guard on purpose: it
+        # is the form CodeQL's path-injection query recognizes as a sanitizer
+        # (Path.resolve/relative_to is not), and every caller, including the
+        # app's attachment routes, inherits it. Keep the separator: a sibling
+        # named vault-other is not inside vault.
+        root = os.path.realpath(self._root)
+        candidate = os.path.realpath(os.path.join(root, rel_path))
+        if candidate == root:
+            # The vault root itself (e.g. through a symlink to it): return the
+            # configured root, not the request-derived string.
+            return self._root
+        if not candidate.startswith(os.path.join(root, "")):
             # Model-visible via "[permission denied: ...]" — never include
             # self._root: where the vault lives on the host is deployment
             # detail that must stay out of runtime error strings.
-            raise PermissionError(f"Path {rel!r} escapes the vault") from None
-        return candidate
+            raise PermissionError(f"Path {rel!r} escapes the vault")
+        return Path(candidate)
 
     def abs_path(self, rel: str) -> Path:
         """Absolute path for a vault-relative path; raises PermissionError on escape."""
