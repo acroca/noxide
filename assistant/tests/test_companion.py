@@ -641,6 +641,32 @@ async def test_image_upload_is_sniffed_capped_stored_and_served(companion):
     assert len(list((service.cfg.vault_path / "attachments").iterdir())) == 1
 
 
+@pytest.mark.parametrize("directory_link", [False, True])
+async def test_attachment_routes_reject_symlink_escape(companion, directory_link):
+    service, client = companion
+    root = service.cfg.vault_path
+    outside = root.with_name("vault-other")
+    outside.mkdir()
+    filename = "2026-11-14-abcdef.pdf"
+    (outside / filename).write_bytes(b"outside secret")
+    if directory_link:
+        (root / "attachments").symlink_to(outside, target_is_directory=True)
+    else:
+        (root / "attachments").mkdir()
+        (root / "attachments" / filename).symlink_to(outside / filename)
+    path = f"attachments/{filename}"
+
+    for endpoint in ("/api/attachment", "/api/attachment/pages", "/api/attachment/page"):
+        response = await client.get(endpoint, params={"path": path, "page": "1"})
+        assert response.status == 400
+        assert (await response.json())["error"] == "Attachment path escapes the vault"
+    response = await client.post("/api/messages", json={
+        "id": "f" * 32, "text": "", "attachments": [path],
+    })
+    assert response.status == 400
+    service.agent.run.assert_not_awaited()
+
+
 async def test_message_with_attachments_reaches_the_model_as_vision_input(companion):
     service, client = companion
     paths = [(await (await client.post("/api/attachments", data=PNG, headers={"Content-Type": "image/png"})).json())["path"]

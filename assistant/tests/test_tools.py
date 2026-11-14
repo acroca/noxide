@@ -100,6 +100,39 @@ def test_path_jail_dotdot_append(vault: VaultTools) -> None:
         vault.append_file("../evil.txt", "bad")
 
 
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_path_jail_rejects_symlink_to_sibling_with_same_prefix(tmp_path, target_exists):
+    root = tmp_path / "vault"
+    vault = VaultTools(root)
+    outside = tmp_path / "vault-other"
+    outside.mkdir()
+    target = outside / "secret.md"
+    if target_exists:
+        target.write_text("outside")
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PermissionError):
+        vault.read_file("linked/secret.md")
+    with pytest.raises(PermissionError):
+        vault.write_file("linked/secret.md", "changed")
+    if target_exists:
+        assert target.read_text() == "outside"
+    else:
+        assert not target.exists()
+
+
+def test_path_jail_allows_internal_symlinks(vault, tmp_path):
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "linked").symlink_to(tmp_path / "notes", target_is_directory=True)
+
+    vault.write_file("linked/new.md", "inside")
+
+    assert vault.read_file("notes/new.md") == "inside"
+    assert vault.abs_path("linked/new.md") == tmp_path / "notes/new.md"
+    (tmp_path / "root-link").symlink_to(tmp_path, target_is_directory=True)
+    assert vault.abs_path("root-link") == tmp_path
+
+
 # ------------------------------------------------------------------
 # Write / append
 # ------------------------------------------------------------------
