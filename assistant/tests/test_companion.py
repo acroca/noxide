@@ -704,7 +704,8 @@ async def test_transcribe_endpoint_needs_a_transcriber_and_reports_failures(comp
     service.transcriber.transcribe.assert_awaited_once_with(b"audio")
     service.transcriber.transcribe.side_effect = TranscriptionError("credits are used up")
     response = await client.post("/api/transcribe", data=b"audio", headers={"Content-Type": "audio/mp4"})
-    assert response.status == 502 and "credits" in (await response.json())["error"]
+    assert response.status == 502
+    assert (await response.json())["error"] == "Couldn't transcribe that right now"
     assert (await client.post("/api/transcribe", data=b"", headers={"Content-Type": "audio/mp4"})).status == 400
 
 
@@ -1314,7 +1315,8 @@ async def test_capture_takes_an_audio_body_and_answers_its_transcript(companion)
     assert (await client.post("/api/capture", data=b"m4a-bytes", headers=audio)).status == 400
     service.transcriber.transcribe.side_effect = TranscriptionError("credits are used up")
     response = await client.post("/api/capture", data=b"m4a-bytes", headers=audio)
-    assert response.status == 502 and "credits" in (await response.json())["error"]
+    assert response.status == 502
+    assert (await response.json())["error"] == "Couldn't transcribe that recording."
     service.transcriber.transcribe.side_effect = None
     assert (await client.post("/api/capture?wait=soon", data=b"m4a-bytes", headers=audio)).status == 400
     assert (await client.post("/api/capture", data=b"", headers=audio)).status == 400
