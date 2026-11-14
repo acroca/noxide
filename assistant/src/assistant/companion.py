@@ -898,7 +898,8 @@ class Companion:
         try:
             text = await self.transcriber.transcribe(data)
         except TranscriptionError as exc:
-            raise web.HTTPBadGateway(text=f"Couldn't transcribe that: {exc}") from exc
+            logger.warning("Transcription failed", exc_info=exc)
+            raise web.HTTPBadGateway(text="Couldn't transcribe that right now") from exc
         return web.json_response({"text": text})
 
     async def mark_seen(self, request):
